@@ -11,7 +11,7 @@ from .configuration_qwen3_omni_moe import Qwen3OmniMoeConfig, Qwen3OmniMoeThinke
 
 
 class RMSNorm(nn.Module):
-    """简化版 RMSNorm，方便先跑起来"""
+    """简化版 RMSNorm"""
 
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -25,34 +25,63 @@ class RMSNorm(nn.Module):
 
 
 class RotaryEmbedding(nn.Module):
-    """简化的一维 RoPE，占位用。后续可以换成真正的 TMRoPE 三维实现。"""
+    """
+    一维 RoPE，只针对 head_dim 维度。
+    支持输入形状:
+      - [B, T, D]
+      - [B, num_heads, T, D]
+    """
 
     def __init__(self, dim: int, max_position_embeddings: int, base: float = 10000.0):
         super().__init__()
+        self.dim = dim
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         t = torch.arange(max_position_embeddings, dtype=torch.float)
-        freqs = torch.einsum("i,j->ij", t, inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+        freqs = torch.einsum("i,j->ij", t, inv_freq)  # [T, dim/2]
+        emb = torch.cat((freqs, freqs), dim=-1)       # [T, dim]
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)  # [T, dim]
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)  # [T, dim]
 
     def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
-        # x: [B, T, H]
-        cos = self.cos_cached[position_ids]  # [B, T, H]
-        sin = self.sin_cached[position_ids]
-        x1, x2 = x[..., ::2], x[..., 1::2]
-        x_rotated = torch.stack([-x2, x1], dim=-1).reshape_as(x)
-        return x * cos + x_rotated * sin
+        """
+        x: [B, T, D] 或 [B, num_heads, T, D]
+        position_ids: [B, T]
+        """
+        if x.dim() == 3:
+            # [B, T, D] -> 假装 num_heads=1
+            bsz, seq_len, dim = x.size()
+            assert dim == self.dim
+            cos = self.cos_cached[position_ids]        # [B, T, D]
+            sin = self.sin_cached[position_ids]        # [B, T, D]
+            x1, x2 = x[..., ::2], x[..., 1::2]
+            x_rot = torch.stack([-x2, x1], dim=-1).reshape_as(x)
+            return x * cos + x_rot * sin
+
+        elif x.dim() == 4:
+            # [B, nh, T, D]
+            bsz, nh, seq_len, dim = x.size()
+            assert dim == self.dim
+            # cos/sin: [B, T, D] -> [B, 1, T, D]
+            cos = self.cos_cached[position_ids]        # [B, T, D]
+            sin = self.sin_cached[position_ids]        # [B, T, D]
+            cos = cos.unsqueeze(1)                     # [B, 1, T, D]
+            sin = sin.unsqueeze(1)                     # [B, 1, T, D]
+            x1, x2 = x[..., ::2], x[..., 1::2]
+            x_rot = torch.stack([-x2, x1], dim=-1).reshape_as(x)
+            return x * cos + x_rot * sin
+
+        else:
+            raise ValueError(f"Unsupported x.dim() for RoPE: {x.dim()}")
 
 
 class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, num_kv_heads: int):
+    def __init__(self, hidden_size: int, num_heads: int, num_kv_heads: int, head_dim: int):
         super().__init__()
         assert hidden_size % num_heads == 0
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
-        self.head_dim = hidden_size // num_heads
+        self.head_dim = head_dim
 
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
@@ -78,10 +107,8 @@ class MultiHeadSelfAttention(nn.Module):
 
         if rotary_emb is not None and position_ids is not None:
             # position_ids: [B, T]
-            # 展开为 [B, 1, T, 1] 再广播
-            pos = position_ids.unsqueeze(1)
-            q = rotary_emb(q.transpose(1, 2), pos).transpose(1, 2)
-            k = rotary_emb(k.transpose(1, 2), pos).transpose(1, 2)
+            q = rotary_emb(q, position_ids)  # [B, nh, T, hd]
+            k = rotary_emb(k, position_ids)
 
         scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)  # [B, nh, T, T]
 
@@ -112,10 +139,12 @@ class ThinkerDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
 
+        head_dim = config.hidden_size // config.num_attention_heads
         self.self_attn = MultiHeadSelfAttention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
+            head_dim=head_dim,
         )
         self.attn_norm = RMSNorm(config.hidden_size)
 
@@ -166,8 +195,11 @@ class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
         self.embed_tokens = nn.Embedding(
             config.vocab_size, thinker_cfg.hidden_size
         )
+
+        # head_dim 用于 RoPE
+        self.head_dim = thinker_cfg.hidden_size // thinker_cfg.num_attention_heads
         self.rotary_emb = RotaryEmbedding(
-            dim=thinker_cfg.hidden_size,
+            dim=self.head_dim,
             max_position_embeddings=thinker_cfg.max_position_embeddings,
             base=config.rope_theta,
         )
