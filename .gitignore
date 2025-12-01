@@ -1,0 +1,24 @@
+# Cache files
+*.cache
+*.lock
+*.egg-info/
+
+# Temporary files
+*.tmp
+
+# Log files
+*.log
+
+# Compiled files
+*.pyc
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+venv/
+__pycache__/
+
+# Dataset files

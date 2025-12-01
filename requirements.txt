@@ -1,0 +1,15 @@
+# 核心深度学习 & Transformers
+torch>=2.2.0
+transformers>=4.45.0
+
+# 配置 & 工具
+pyyaml>=6.0.0
+tqdm>=4.66.0
+
+# Qwen 系 tokenizer 常用依赖
+sentencepiece>=0.1.99
+tokenizers>=0.15.0
+
+# 可选：以后如果用到加速/分布式，可以再加
+# accelerate>=0.30.0
+# bitsandbytes>=0.43.0

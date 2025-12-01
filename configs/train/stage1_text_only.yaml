@@ -1,0 +1,32 @@
+# 阶段1：文本-only（Thinker-Text）
+
+# configs/train/stage1_text_only.yaml
+
+experiment_name: "qwen3_omni_stage1_text_7b"
+
+model:
+  config_path: "configs/model/qwen3_omni_7b_moe.yaml"
+
+data:
+  train_corpus_path: "data/corpus/train_text.jsonl"
+  val_corpus_path: "data/corpus/val_text.jsonl"
+  max_seq_length: 2048
+  num_workers: 4
+  batch_size: 4           # per-GPU batch size
+  shuffle: true
+
+train:
+  num_epochs: 1
+  max_steps: -1           # -1 表示按 epoch 走
+  gradient_accumulation_steps: 8
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  logging_steps: 20
+  eval_steps: 1000
+  save_steps: 1000
+  output_dir: "outputs/qwen3_omni_stage1_text_7b"
+  fp16: false
+  bf16: true
+  seed: 42
+  ddp: false              # 先做单卡/单机，后面再加 FSDP / DeepSpeed

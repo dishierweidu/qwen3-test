@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen3-omni-pretrain"
+version = "0.1.0"
+description = "A research implementation of Qwen3-Omni pretraining pipeline (Thinker/Talker/Code2Wav)."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Your Name", email = "you@example.com" }
+]
+
+# 这里不再重复列依赖，直接走 requirements.txt 安装；
+# 如果你想全部集成到 pyproject 里也可以把 requirements.txt 里的依赖复制过来。
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["qwen3_omni_pretrain*"]
