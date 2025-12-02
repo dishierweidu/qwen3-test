@@ -207,12 +207,12 @@ def train_thinker_stage1(config_path: str, tokenizer_name_or_path: str = "Qwen/Q
             save_path = os.path.join(cfg.output_dir, f"best_epoch{epoch}")
             os.makedirs(save_path, exist_ok=True)
             print(f"Saving best model to {save_path}")
-            model.save_pretrained(save_path)
+            model.save_pretrained(save_path, safe_serialization=False)
             tokenizer.save_pretrained(save_path)
 
     # 最终再保存一版 latest
     final_path = os.path.join(cfg.output_dir, "latest")
     os.makedirs(final_path, exist_ok=True)
     print(f"Saving final model to {final_path}")
-    model.save_pretrained(final_path)
+    model.save_pretrained(final_path, safe_serialization=False)
     tokenizer.save_pretrained(final_path)

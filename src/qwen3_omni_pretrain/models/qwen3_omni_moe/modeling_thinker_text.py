@@ -8,6 +8,8 @@ import torch.nn as nn
 from transformers import PreTrainedModel
 
 from .configuration_qwen3_omni_moe import Qwen3OmniMoeConfig, Qwen3OmniMoeThinkerConfig
+from .modules.moe import Qwen3OmniMoeMLP
+
 
 
 class RMSNorm(nn.Module):
@@ -138,6 +140,9 @@ class ThinkerDecoderLayer(nn.Module):
     def __init__(self, config: Qwen3OmniMoeThinkerConfig, rotary_emb: RotaryEmbedding):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.use_moe = getattr(config, "use_moe", False)
+        self.num_experts = getattr(config, "num_experts", 0)
+        self.num_experts_per_tok = getattr(config, "num_experts_per_tok", 1)
 
         head_dim = config.hidden_size // config.num_attention_heads
         self.self_attn = MultiHeadSelfAttention(
@@ -148,7 +153,17 @@ class ThinkerDecoderLayer(nn.Module):
         )
         self.attn_norm = RMSNorm(config.hidden_size)
 
-        self.mlp = MLP(config.hidden_size, config.intermediate_size)
+        # FFN：根据 use_moe 选择 Dense MLP 或 MoE MLP
+        if self.use_moe and self.num_experts > 0 and self.num_experts_per_tok > 0:
+            self.mlp = Qwen3OmniMoeMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                num_experts=self.num_experts,
+                num_experts_per_tok=self.num_experts_per_tok,
+            )
+        else:
+            self.mlp = MLP(config.hidden_size, config.intermediate_size)
+
         self.mlp_norm = RMSNorm(config.hidden_size)
 
         self.rotary_emb = rotary_emb
@@ -214,6 +229,11 @@ class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
 
         # LM head
         self.lm_head = nn.Linear(thinker_cfg.hidden_size, config.vocab_size, bias=False)
+        
+        # transformers 要绑词嵌入
+        self.config.tie_word_embeddings = True
+        # 让 lm_head.weight 和 embed_tokens.weight 指向同一个 Tensor
+        self.lm_head.weight = self.embed_tokens.weight
 
         self.post_init()
 
@@ -299,3 +319,17 @@ class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
             output["hidden_states"] = all_hidden_states
 
         return output
+    
+    # ---- 让 transformers 知道怎么 tie 权重 ----
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+    def set_input_embeddings(self, new_embeddings):
+        self.embed_tokens = new_embeddings
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+
