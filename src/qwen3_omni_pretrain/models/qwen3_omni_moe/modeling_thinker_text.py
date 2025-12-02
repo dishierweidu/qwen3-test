@@ -152,17 +152,20 @@ class ThinkerDecoderLayer(nn.Module):
             head_dim=head_dim,
         )
         self.attn_norm = RMSNorm(config.hidden_size)
+        
+        # Shared Dense FFN（所有层都有）
+        self.shared_mlp = MLP(config.hidden_size, config.intermediate_size)
 
-        # FFN：根据 use_moe 选择 Dense MLP 或 MoE MLP
+        # 可选的 MoE FFN：根据 use_moe 选择 Dense MLP 或 MoE MLP
         if self.use_moe and self.num_experts > 0 and self.num_experts_per_tok > 0:
-            self.mlp = Qwen3OmniMoeMLP(
+            self.moe_mlp = Qwen3OmniMoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 num_experts=self.num_experts,
                 num_experts_per_tok=self.num_experts_per_tok,
             )
         else:
-            self.mlp = MLP(config.hidden_size, config.intermediate_size)
+            self.moe_mlp = None
 
         self.mlp_norm = RMSNorm(config.hidden_size)
 
@@ -173,7 +176,7 @@ class ThinkerDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
         position_ids: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         # Self-Attention
         residual = hidden_states
         hidden_states = self.attn_norm(hidden_states)
@@ -185,13 +188,24 @@ class ThinkerDecoderLayer(nn.Module):
         )
         hidden_states = residual + attn_out
 
-        # MLP
+        # FFN: Shared Dense + Optional MoE
         residual = hidden_states
         hidden_states = self.mlp_norm(hidden_states)
-        mlp_out = self.mlp(hidden_states)
+
+        # Shared FFN
+        shared_out = self.shared_mlp(hidden_states)
+
+        aux_loss = None
+        if self.moe_mlp is not None:
+            moe_out, aux_loss = self.moe_mlp(hidden_states)  # aux_loss: scalar tensor
+            mlp_out = shared_out + moe_out
+        else:
+            mlp_out = shared_out
+
         hidden_states = residual + mlp_out
 
-        return hidden_states
+        return hidden_states, aux_loss
+
 
 
 class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
@@ -206,6 +220,7 @@ class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
 
         thinker_cfg = config.thinker_config
         assert isinstance(thinker_cfg, Qwen3OmniMoeThinkerConfig)
+        self.thinker_cfg = thinker_cfg  # 保存一份，forward 里要用 moe_aux_loss_coef
 
         self.embed_tokens = nn.Embedding(
             config.vocab_size, thinker_cfg.hidden_size
@@ -307,37 +322,60 @@ class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
         hidden_states = self.embed_tokens(input_ids)  # [B, T, H]
 
         all_hidden_states = [] if output_hidden_states else None
+        total_aux_loss = None
 
         for layer in self.layers:
             if output_hidden_states:
                 all_hidden_states.append(hidden_states)
-            hidden_states = layer(hidden_states, attention_mask_full, position_ids)
+            hidden_states, layer_aux = layer(
+                hidden_states, attention_mask_full, position_ids
+            )
+            if layer_aux is not None:
+                if total_aux_loss is None:
+                    total_aux_loss = layer_aux
+                else:
+                    total_aux_loss = total_aux_loss + layer_aux
 
         hidden_states = self.norm(hidden_states)
 
+
         logits = self.lm_head(hidden_states)
 
+        ce_loss = None
+        aux_loss = total_aux_loss
         loss = None
+
         if labels is not None:
             # 计算标准自回归交叉熵
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
 
             loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-            loss = loss_fct(
+            ce_loss = loss_fct(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
             )
+
+            if aux_loss is not None:
+                loss = ce_loss + self.thinker_cfg.moe_aux_loss_coef * aux_loss
+            else:
+                loss = ce_loss
 
         output = {
             "logits": logits,
             "loss": loss,
         }
+        if ce_loss is not None:
+            output["ce_loss"] = ce_loss
+        if aux_loss is not None:
+            output["aux_loss"] = aux_loss
+
         if output_hidden_states:
             all_hidden_states.append(hidden_states)
             output["hidden_states"] = all_hidden_states
 
         return output
+
     
     # ---- 让 transformers 知道怎么 tie 权重 ----
     def get_input_embeddings(self):

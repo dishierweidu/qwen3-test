@@ -33,6 +33,8 @@ def train_one_epoch(
             labels=batch["labels"],
         )
         loss = outputs["loss"]
+        aux_loss = outputs.get("aux_loss")
+        print("aux_loss item:", aux_loss.item() if aux_loss is not None else "None")
         loss = loss / gradient_accumulation_steps
         loss.backward()
 

@@ -1,0 +1,30 @@
+experiment_name: "qwen3_omni_stage2_omni_7b"
+
+model:
+  model_config_path: configs/model/qwen3_omni_7b_moe.yaml
+
+data:
+  train_corpus_path: data/corpus/stage2_omni_train.jsonl
+  val_corpus_path: data/corpus/stage2_omni_val.jsonl
+  image_root: data/images
+  audio_root: data/audio
+  max_seq_length: 1024
+  batch_size: 2
+  num_workers: 4
+  shuffle: true
+
+train:
+  num_epochs: 1
+  max_steps: -1
+  gradient_accumulation_steps: 8
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  logging_steps: 10
+  eval_steps: 200
+  save_steps: 200
+  output_dir: outputs/qwen3_omni_stage2_omni_7b
+  fp16: false
+  bf16: false
+  seed: 42
+  ddp: false

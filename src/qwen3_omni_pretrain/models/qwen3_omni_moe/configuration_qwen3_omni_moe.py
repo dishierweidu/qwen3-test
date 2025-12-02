@@ -20,6 +20,9 @@ class Qwen3OmniMoeThinkerConfig:
     
     # 新增：哪些层使用 MoE，字符串形式，例如 "0,2,4,6"
     moe_layer_indices: Optional[str] = None
+    
+    # MoE 负载均衡损失系数（乘到 aux_loss 前）
+    moe_aux_loss_coef: float = 0.01
 
     # 多模态 backbone 占位
     vision_hidden_size: int = 1152
