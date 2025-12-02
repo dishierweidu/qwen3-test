@@ -1,7 +1,7 @@
 # src/qwen3_omni_pretrain/models/qwen3_omni_moe/configuration_qwen3_omni_moe.py
 
-from typing import Optional, Dict, Any
-from dataclasses import dataclass
+from typing import Optional, Dict, Any, List
+from dataclasses import dataclass, field
 from transformers import PretrainedConfig
 
 
@@ -17,6 +17,9 @@ class Qwen3OmniMoeThinkerConfig:
     use_moe: bool = False
     num_experts: int = 8
     num_experts_per_tok: int = 2
+    
+    # 新增：哪些层使用 MoE，字符串形式，例如 "0,2,4,6"
+    moe_layer_indices: Optional[str] = None
 
     # 多模态 backbone 占位
     vision_hidden_size: int = 1152

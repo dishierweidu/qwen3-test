@@ -219,12 +219,31 @@ class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
             base=config.rope_theta,
         )
 
-        self.layers = nn.ModuleList(
-            [
-                ThinkerDecoderLayer(thinker_cfg, self.rotary_emb)
-                for _ in range(thinker_cfg.num_hidden_layers)
-            ]
-        )
+        # 解析 moe_layer_indices: 例如 "0,2,4" -> {0,2,4}
+        moe_layer_set = None
+        if getattr(thinker_cfg, "moe_layer_indices", None) is not None:
+            indices_str = thinker_cfg.moe_layer_indices
+            if isinstance(indices_str, str) and indices_str.strip():
+                moe_layer_set = set(
+                    int(x) for x in indices_str.split(",") if x.strip().isdigit()
+                )
+
+        layers = []
+        for layer_idx in range(thinker_cfg.num_hidden_layers):
+            # 默认按 config.use_moe
+            use_moe_layer = thinker_cfg.use_moe
+            # 如果指定了 moe_layer_indices，则以它为准
+            if moe_layer_set is not None:
+                use_moe_layer = layer_idx in moe_layer_set
+
+            # 为当前层构造一个“局部Config”拷贝，覆盖 use_moe
+            local_cfg = Qwen3OmniMoeThinkerConfig(**thinker_cfg.__dict__)
+            local_cfg.use_moe = use_moe_layer
+
+            layers.append(ThinkerDecoderLayer(local_cfg, self.rotary_emb))
+
+        self.layers = nn.ModuleList(layers)
+
         self.norm = RMSNorm(thinker_cfg.hidden_size)
 
         # LM head
