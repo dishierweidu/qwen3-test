@@ -296,19 +296,29 @@ class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         output_hidden_states: bool = False,
+        inputs_embeds: Optional[torch.Tensor] = None,
     ):
         """
         input_ids: [B, T]
         labels: [B, T] 或 None
+        - Stage1: 纯文本 → 传 input_ids（inputs_embeds=None）
+        - Stage2: 多模态 → 传 inputs_embeds（input_ids 可以为 None，只用于 labels）
         """
 
-        device = input_ids.device
-        bsz, seq_len = input_ids.size()
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+            device = hidden_states.device
+            bsz, seq_len, _ = hidden_states.size()
+        else:
+            assert input_ids is not None, "input_ids or inputs_embeds must be provided"
+            hidden_states = self.embed_tokens(input_ids)  # [B, T, H]
+            device = input_ids.device
+            bsz, seq_len = input_ids.size()
 
         if position_ids is None:
             position_ids = torch.arange(
@@ -318,8 +328,6 @@ class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
         attention_mask_full = self._prepare_attention_mask(
             attention_mask, (bsz, seq_len), device
         )
-
-        hidden_states = self.embed_tokens(input_ids)  # [B, T, H]
 
         all_hidden_states = [] if output_hidden_states else None
         total_aux_loss = None

@@ -1,7 +1,7 @@
 experiment_name: "qwen3_omni_stage2_omni_7b"
 
 model:
-  model_config_path: configs/model/qwen3_omni_7b_moe.yaml
+  model_config_path: configs/model/qwen3_omni_1_3b_moe.yaml
 
 data:
   train_corpus_path: data/corpus/stage2_omni_train.jsonl

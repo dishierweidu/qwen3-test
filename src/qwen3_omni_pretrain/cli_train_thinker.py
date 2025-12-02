@@ -3,6 +3,13 @@
 import argparse
 
 from qwen3_omni_pretrain.training.trainer_thinker import train_thinker_stage1
+from qwen3_omni_pretrain.training.trainer_thinker import (
+    train_thinker_stage1,
+    train_thinker_stage2,
+    Stage2TrainConfig,
+)
+from qwen3_omni_pretrain.utils.config_utils import load_yaml
+
 
 
 def parse_args():
@@ -19,15 +26,29 @@ def parse_args():
         default="Qwen/Qwen2.5-7B",
         help="HF tokenizer name or path",
     )
+    parser.add_argument(
+        "--stage",
+        type=str,
+        choices=["stage1", "stage2"],
+        default="stage1",
+        help="Which training stage to run."
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    train_thinker_stage1(
-        config_path=args.config,
-        tokenizer_name_or_path=args.tokenizer_name_or_path,
-    )
+    if args.stage == "stage1":
+        train_thinker_stage1(
+            args.config,
+            tokenizer_name_or_path=args.tokenizer_name_or_path,
+        )
+    else:
+        cfg = load_yaml(args.config)
+        train_thinker_stage2(
+            cfg=cfg,
+            tokenizer_name_or_path=args.tokenizer_name_or_path,
+        )
 
 
 if __name__ == "__main__":

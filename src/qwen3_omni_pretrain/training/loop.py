@@ -1,86 +1,104 @@
 # src/qwen3_omni_pretrain/training/loop.py
 
-from typing import Dict, Any, Optional
+from typing import Callable, Optional, Dict, Any
 
 import torch
 from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
+from torch.nn.utils import clip_grad_norm_
+
+
+def _move_batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
+    new_batch = {}
+    for k, v in batch.items():
+        if isinstance(v, torch.Tensor):
+            new_batch[k] = v.to(device)
+        else:
+            new_batch[k] = v
+    return new_batch
 
 
 def train_one_epoch(
     model: torch.nn.Module,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
-    scheduler: Optional[Any],
+    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
     device: torch.device,
     gradient_accumulation_steps: int = 1,
-    log_step_fn: Optional[Any] = None,
-    epoch: int = 0,
+    log_step_fn: Optional[Callable[..., None]] = None,
 ) -> float:
+    """
+    通用训练循环：
+    - batch 是一个 dict，直接 **batch 传给 model
+    - 要求 model.forward 返回 dict，至少含 "loss"
+      额外可选 "ce_loss" / "aux_loss" 用于日志
+    """
     model.train()
     total_loss = 0.0
-    step = 0
+    steps = 0
 
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
 
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch}", dynamic_ncols=True)
-    for batch_idx, batch in enumerate(pbar):
-        batch = {k: v.to(device) for k, v in batch.items()}
+    for batch_idx, batch in enumerate(dataloader):
+        batch = _move_batch_to_device(batch, device)
 
-        outputs = model(
-            input_ids=batch["input_ids"],
-            attention_mask=batch.get("attention_mask", None),
-            labels=batch["labels"],
-        )
+        # 通用调用：支持 Stage1(Text) / Stage2(Omni) / 以后 Talker
+        outputs = model(**batch)
+
         loss = outputs["loss"]
-        aux_loss = outputs.get("aux_loss")
-        print("aux_loss item:", aux_loss.item() if aux_loss is not None else "None")
+        ce_loss = outputs.get("ce_loss", None)
+        aux_loss = outputs.get("aux_loss", None)
+
+        # 梯度累积
         loss = loss / gradient_accumulation_steps
         loss.backward()
 
         total_loss += loss.item()
-        step += 1
+        steps += 1
 
-        if step % gradient_accumulation_steps == 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        if steps % gradient_accumulation_steps == 0:
+            clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             if scheduler is not None:
                 scheduler.step()
 
         if log_step_fn is not None:
+            # 这里打印的是“真实 loss”（未除以 GA）
             log_step_fn(
-                step=step,
+                step=steps,
                 loss=loss.item() * gradient_accumulation_steps,
                 batch_idx=batch_idx,
+                ce_loss=ce_loss.item() if ce_loss is not None else None,
+                aux_loss=aux_loss.item() if aux_loss is not None else None,
             )
 
-        avg_loss = total_loss / step
-        pbar.set_postfix({"loss": f"{avg_loss:.4f}"})
-
-    return total_loss / step
+    avg_loss = total_loss / max(1, len(dataloader))
+    return avg_loss
 
 
-@torch.no_grad()
 def evaluate(
     model: torch.nn.Module,
     dataloader: DataLoader,
     device: torch.device,
 ) -> float:
+    """
+    通用评估循环：
+    - 同样直接 **batch 传给 model
+    - 要求模型返回 "loss"
+    """
     model.eval()
     total_loss = 0.0
-    step = 0
+    steps = 0
 
-    for batch in tqdm(dataloader, desc="Eval", dynamic_ncols=True):
-        batch = {k: v.to(device) for k, v in batch.items()}
-        outputs = model(
-            input_ids=batch["input_ids"],
-            attention_mask=batch.get("attention_mask", None),
-            labels=batch["labels"],
-        )
-        loss = outputs["loss"]
+    with torch.no_grad():
+        for batch in dataloader:
+            batch = _move_batch_to_device(batch, device)
 
-        total_loss += loss.item()
-        step += 1
+            outputs = model(**batch)
+            loss = outputs["loss"]
 
-    return total_loss / step
+            total_loss += loss.item()
+            steps += 1
+
+    avg_loss = total_loss / max(1, steps)
+    return avg_loss

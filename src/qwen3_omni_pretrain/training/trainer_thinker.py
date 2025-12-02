@@ -8,6 +8,8 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
+from qwen3_omni_pretrain.data.datasets.omni_webdataset import OmniJsonlDataset
+from qwen3_omni_pretrain.data.collators import OmniStage2Collator
 from qwen3_omni_pretrain.utils.config_utils import load_yaml
 from qwen3_omni_pretrain.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeConfig,
@@ -15,9 +17,13 @@ from qwen3_omni_pretrain.models.qwen3_omni_moe.configuration_qwen3_omni_moe impo
 from qwen3_omni_pretrain.models.qwen3_omni_moe.modeling_thinker_text import (
     Qwen3OmniMoeThinkerTextModel,
 )
+from qwen3_omni_pretrain.models.qwen3_omni_moe.modeling_thinker_vision_audio import (
+    Qwen3OmniMoeThinkerVisionAudioModel,
+)
 from qwen3_omni_pretrain.data.datasets.text_dataset import TextJsonlDataset
 from qwen3_omni_pretrain.data.collators import TextCausalLMCollator
 from qwen3_omni_pretrain.training.loop import train_one_epoch, evaluate
+# from qwen3_omni_pretrain.utils.seed import set_seed
 
 
 @dataclass
@@ -44,6 +50,29 @@ class TrainerThinkerConfig:
     bf16: bool
     seed: int
     ddp: bool
+    
+@dataclass
+class Stage2TrainConfig:
+    model_config_path: str
+    train_corpus_path: str
+    val_corpus_path: str
+    image_root: str
+    audio_root: str
+
+    output_dir: str
+
+    num_epochs: int = 1
+    batch_size: int = 2
+    max_seq_length: int = 1024
+    learning_rate: float = 1e-4
+    weight_decay: float = 0.01
+    warmup_ratio: float = 0.03
+    gradient_accumulation_steps: int = 1
+    logging_steps: int = 10
+    eval_steps: int = 200
+    num_workers: int = 4
+    seed: int = 42
+
 
 
 def build_trainer_config(yaml_path: str) -> TrainerThinkerConfig:
@@ -177,11 +206,18 @@ def train_thinker_stage1(config_path: str, tokenizer_name_or_path: str = "Qwen/Q
     # 6. 训练循环
     global_step = 0
 
-    def log_step_fn(step: int, loss: float, batch_idx: int):
+    def log_step_fn(step: int, loss: float, batch_idx: int, ce_loss=None, aux_loss=None):
         nonlocal global_step
         global_step += 1
         if global_step % cfg.logging_steps == 0:
-            print(f"[step {global_step}] loss={loss:.4f}")
+            msg = f"[step {global_step}] loss={loss:.4f}"
+            # Stage1 没有 ce_loss / aux_loss，也没关系，这里检测一下
+            if ce_loss is not None:
+                msg += f" ce={ce_loss:.4f}"
+            if aux_loss is not None:
+                msg += f" aux={aux_loss:.4f}"
+            print(msg)
+
 
     best_val_loss = float("inf")
 
@@ -193,8 +229,7 @@ def train_thinker_stage1(config_path: str, tokenizer_name_or_path: str = "Qwen/Q
             scheduler=scheduler,
             device=device,
             gradient_accumulation_steps=cfg.gradient_accumulation_steps,
-            log_step_fn=log_step_fn,
-            epoch=epoch,
+            log_step_fn=log_step_fn
         )
         print(f"Epoch {epoch} train_loss={train_loss:.4f}")
 
@@ -216,3 +251,156 @@ def train_thinker_stage1(config_path: str, tokenizer_name_or_path: str = "Qwen/Q
     print(f"Saving final model to {final_path}")
     model.save_pretrained(final_path, safe_serialization=False)
     tokenizer.save_pretrained(final_path)
+
+def train_thinker_stage2(cfg: Stage2TrainConfig, tokenizer_name_or_path: str):
+    """
+    Stage2: Omni 多模态 AuT 训练入口。
+    """
+    import yaml
+
+    # --- 统一把 cfg 变成 dict ---
+    if isinstance(cfg, dict):
+        c = cfg
+    else:
+        # dataclass 或其它对象，转成 dict
+        c = vars(cfg)
+
+    # 安全取配置，给一些默认值
+    seed = c.get("seed", 42)
+    set_seed(seed)
+    
+    model_config_path = c["model"]["model_config_path"]
+    train_corpus_path = c["data"]["train_corpus_path"]
+    val_corpus_path = c["data"]["val_corpus_path"]
+    image_root = c["data"]["image_root"]
+    audio_root = c["data"]["audio_root"]
+    output_dir = c["train"]["output_dir"]
+
+    num_epochs = c.get("num_epochs", 1)
+    batch_size = c.get("batch_size", 2)
+    max_seq_length = c.get("max_seq_length", 1024)
+    learning_rate = c.get("learning_rate", 1e-4)
+    weight_decay = c.get("weight_decay", 0.01)
+    warmup_ratio = c.get("warmup_ratio", 0.03)
+    grad_accum = c.get("gradient_accumulation_steps", 1)
+    logging_steps = c.get("logging_steps", 10)
+    num_workers = c.get("num_workers", 4)
+    # --- 以上 cfg 处理结束 ---
+
+
+    # 1. tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_name_or_path,
+        use_fast=True,
+    )
+
+    # 2. model config
+    with open(model_config_path, "r", encoding="utf-8") as f:
+        model_conf_dict = yaml.safe_load(f)
+    model_config = Qwen3OmniMoeConfig(**model_conf_dict)
+
+    # 3. model
+    model = Qwen3OmniMoeThinkerVisionAudioModel(model_config)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    # 4. dataset & dataloader
+    train_dataset = OmniJsonlDataset(
+        jsonl_path=train_corpus_path,
+        image_root=image_root,
+        audio_root=audio_root,
+    )
+    val_dataset = OmniJsonlDataset(
+        jsonl_path=val_corpus_path,
+        image_root=image_root,
+        audio_root=audio_root,
+    )
+
+    collator = OmniStage2Collator(
+        tokenizer=tokenizer,
+        max_seq_length=max_seq_length,
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=collator,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=collator,
+    )
+
+    # 5. optimizer & scheduler (简单版)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay
+    )
+
+    total_updates_per_epoch = max(
+        1, len(train_loader) // grad_accum
+    )
+    total_updates = total_updates_per_epoch * num_epochs
+    warmup_steps = int(total_updates * warmup_ratio)
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lambda step: min(1.0, step / max(1, warmup_steps))
+    )
+
+    os.makedirs(output_dir, exist_ok=True)
+    best_val_loss = float("inf")
+
+    global_step = 0
+
+    def log_step_fn(step: int, loss: float, batch_idx: int, ce_loss=None, aux_loss=None):
+        nonlocal global_step
+        global_step += 1
+        if global_step % logging_steps == 0:
+            msg = f"[step {global_step}] loss={loss:.4f}"
+            if ce_loss is not None:
+                msg += f" ce={ce_loss:.4f}"
+            if aux_loss is not None:
+                msg += f" aux={aux_loss:.4f}"
+            print(msg)
+
+    for epoch in range(num_epochs):
+        print(f"Epoch {epoch} / {num_epochs - 1}")
+
+        train_loss = train_one_epoch(
+            model=model,
+            dataloader=train_loader,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            device=device,
+            gradient_accumulation_steps=grad_accum,
+            log_step_fn=log_step_fn,
+        )
+        print(f"Epoch {epoch} train_loss={train_loss:.4f}")
+
+        val_loss = evaluate(
+            model=model,
+            dataloader=val_loader,
+            device=device,
+        )
+        print(f"Epoch {epoch} val_loss={val_loss:.4f}")
+
+        # save best
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            save_path = os.path.join(output_dir, f"best_epoch{epoch}")
+            os.makedirs(save_path, exist_ok=True)
+            print(f"Saving best model to {save_path}")
+            model.save_pretrained(save_path, safe_serialization=False)
+            tokenizer.save_pretrained(save_path)
+
+        # save latest
+        latest_path = os.path.join(output_dir, "latest")
+        os.makedirs(latest_path, exist_ok=True)
+        print(f"Saving latest model to {latest_path}")
+        model.save_pretrained(latest_path, safe_serialization=False)
+        tokenizer.save_pretrained(latest_path)

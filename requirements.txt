@@ -1,10 +1,13 @@
 # 核心深度学习 & Transformers
 torch>=2.2.0
+torchvision>=0.15.0
+torchaudio>=2.2.0
 transformers>=4.45.0
 
 # 配置 & 工具
 pyyaml>=6.0.0
 tqdm>=4.66.0
+pyyaml>=6.0.0
 
 # Qwen 系 tokenizer 常用依赖
 sentencepiece>=0.1.99
