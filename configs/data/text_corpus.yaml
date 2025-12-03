@@ -1,1 +1,10 @@
-# 纯文本预训练语料配置
+# configs/data/text_corpus.yaml
+# 纯文本预训练语料配置：支持多个 jsonl 文件
+
+train_corpus_paths:
+  - "data/corpus/train_text.jsonl"
+  - "/hpc2hdd/home/zzhao056/mobv/mobvoi_seq_monkey_general_open_corpus.jsonl"
+  # - data/corpus/train_text_xxx.jsonl  # 以后继续加就行
+
+val_corpus_paths:
+  - "data/corpus/val_text.jsonl"

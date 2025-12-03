@@ -13,7 +13,7 @@ data:
   max_seq_length: 1024
   batch_size: 2
   num_workers: 4
-  shuffle: true
+  shuffle: false
 
 train:
   num_epochs: 1

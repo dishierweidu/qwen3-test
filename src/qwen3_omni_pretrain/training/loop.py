@@ -1,20 +1,49 @@
 # src/qwen3_omni_pretrain/training/loop.py
 
 from typing import Callable, Optional, Dict, Any
+from contextlib import nullcontext
 
 import torch
 from torch.utils.data import DataLoader
 from torch.nn.utils import clip_grad_norm_
+
+try:
+    # 不强依赖 DDP，但如果有就用
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    import torch.distributed as dist
+except Exception:  # 本地单卡时也不报错
+    DDP = None
+    dist = None
 
 
 def _move_batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
     new_batch = {}
     for k, v in batch.items():
         if isinstance(v, torch.Tensor):
-            new_batch[k] = v.to(device)
+            new_batch[k] = v.to(device, non_blocking=True)
         else:
             new_batch[k] = v
     return new_batch
+
+
+def _is_global_bad_loss(loss: torch.Tensor) -> bool:
+    """
+    在 DDP 下做一次 all_reduce，保证：
+    - 只要有一个 rank 出现 NaN/Inf，所有 rank 都一起 skip 这个 batch，
+      避免“有的 rank backward，有的 rank 不 backward”导致的 reduction 错位。
+    """
+    bad_local = (not torch.isfinite(loss))
+
+    if dist is not None and dist.is_available() and dist.is_initialized():
+        flag = torch.tensor(
+            [1 if bad_local else 0],
+            device=loss.device,
+            dtype=torch.int32,
+        )
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+        return flag.item() > 0
+    else:
+        return bad_local
 
 
 def train_one_epoch(
@@ -31,59 +60,92 @@ def train_one_epoch(
     - batch 是一个 dict，直接 **batch 传给 model
     - 要求 model.forward 返回 dict，至少含 "loss"
       额外可选 "ce_loss" / "aux_loss" 用于日志
+
+    支持：
+    - 梯度累积 (gradient_accumulation_steps)
+    - DDP 下 no_sync() 降低通信频率
+    - NaN/Inf 保护（在所有 rank 上一致地跳过有问题的 batch）
     """
     model.train()
-    total_loss = 0.0
-    steps = 0
+    grad_accum = max(1, gradient_accumulation_steps)
+
+    # 判断是否是 DDP 包裹的模型
+    is_ddp = (DDP is not None) and isinstance(model, DDP) or hasattr(model, "no_sync")
 
     optimizer.zero_grad(set_to_none=True)
+
+    total_loss = 0.0          # 累积“真实 loss”总和（未除 grad_accum）
+    total_ce = 0.0
+    total_aux = 0.0
+    num_updates = 0           # 逻辑上的 optimizer.step() 次数
 
     for batch_idx, batch in enumerate(dataloader):
         batch = _move_batch_to_device(batch, device)
 
-        # 通用调用：支持 Stage1(Text) / Stage2(Omni) / 以后 Talker
-        outputs = model(**batch)
+        # 本 micro-step 是否是一个“累计完成点”（要做 optimizer.step）
+        is_update_step = ((batch_idx + 1) % grad_accum == 0) or ((batch_idx + 1) == len(dataloader))
 
-        loss = outputs["loss"]
-        ce_loss = outputs.get("ce_loss", None)
-        aux_loss = outputs.get("aux_loss", None)
-        
-        # ✅ 如果出现 NaN/Inf，打印一次并跳过这个 batch，避免把整个 epoch 平均也搞成 NaN
-        if torch.isnan(loss) or torch.isinf(loss):
-            print(
-                f"[train_one_epoch] NaN/Inf loss at batch {batch_idx} "
-                f"(loss={loss.item()}, "
-                f"ce={ce_loss.item() if ce_loss is not None else 'None'}, "
-                f"aux={aux_loss.item() if aux_loss is not None else 'None'}) — skip this batch."
-            )
-            optimizer.zero_grad(set_to_none=True)
-            continue
+        # DDP 下，只有在“真正 update step”才进行梯度同步；其他 micro-step 用 no_sync 减少 allreduce
+        if is_ddp and not is_update_step:
+            ctx = model.no_sync()
+        else:
+            ctx = nullcontext()
 
-        # 梯度累积
-        loss = loss / gradient_accumulation_steps
-        loss.backward()
+        with ctx:
+            outputs = model(**batch)
 
-        total_loss += loss.item()
-        steps += 1
+            loss = outputs["loss"]
+            ce_loss = outputs.get("ce_loss", None)
+            aux_loss = outputs.get("aux_loss", None)
 
-        if steps % gradient_accumulation_steps == 0:
+            # ✅ NaN/Inf 保护（在所有 rank 上统一判断）
+            if _is_global_bad_loss(loss):
+                print(
+                    f"[train_one_epoch] NaN/Inf loss at batch {batch_idx + 1} "
+                    f"(loss={loss}, "
+                    f"ce={ce_loss if isinstance(ce_loss, torch.Tensor) else ce_loss}, "
+                    f"aux={aux_loss if isinstance(aux_loss, torch.Tensor) else aux_loss}) — skip this batch."
+                )
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
+            # 梯度累积：缩放 loss
+            scaled_loss = loss / grad_accum
+            scaled_loss.backward()
+
+        if is_update_step:
+            # 可选：梯度裁剪
             clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
             if scheduler is not None:
                 scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
 
-        if log_step_fn is not None:
-            # 这里打印的是“真实 loss”（未除以 GA）
-            log_step_fn(
-                step=steps,
-                loss=loss.item() * gradient_accumulation_steps,
-                batch_idx=batch_idx,
-                ce_loss=ce_loss.item() if ce_loss is not None else None,
-                aux_loss=aux_loss.item() if aux_loss is not None else None,
-            )
+            num_updates += 1
 
-    avg_loss = total_loss / max(1, len(dataloader))
+            # 统计用“真实 loss”（未除 grad_accum）
+            true_loss = scaled_loss.item() * grad_accum
+            total_loss += true_loss
+
+            if isinstance(ce_loss, torch.Tensor):
+                total_ce += ce_loss.detach().item()
+            if isinstance(aux_loss, torch.Tensor):
+                total_aux += aux_loss.detach().item()
+
+            if log_step_fn is not None:
+                log_step_fn(
+                    step=num_updates,
+                    loss=true_loss,
+                    batch_idx=batch_idx,
+                    ce_loss=ce_loss.detach().item() if isinstance(ce_loss, torch.Tensor) else None,
+                    aux_loss=aux_loss.detach().item() if isinstance(aux_loss, torch.Tensor) else None,
+                )
+
+    if num_updates == 0:
+        return float("nan")
+
+    avg_loss = total_loss / num_updates
     return avg_loss
 
 
@@ -102,14 +164,14 @@ def evaluate(
     steps = 0
 
     with torch.no_grad():
-        for batch in dataloader:
+        for batch_idx, batch in enumerate(dataloader):
             batch = _move_batch_to_device(batch, device)
 
             outputs = model(**batch)
             loss = outputs["loss"]
-            
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"[evaluate] NaN/Inf loss at batch {batch}, skip.")
+
+            if not torch.isfinite(loss):
+                print(f"[evaluate] NaN/Inf loss at batch {batch_idx}, skip.")
                 continue
 
             total_loss += loss.item()

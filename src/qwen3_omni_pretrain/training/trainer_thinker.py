@@ -2,11 +2,20 @@
 
 import os
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Union, List
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
+
+from qwen3_omni_pretrain.training.distributed import (
+    distributed_context,
+    ddp_available,
+    get_local_rank,
+    is_main_process,
+    ddp_wrap_model,
+)
 
 from qwen3_omni_pretrain.data.datasets.omni_webdataset import OmniJsonlDataset
 from qwen3_omni_pretrain.data.collators import OmniStage2Collator
@@ -28,10 +37,11 @@ from qwen3_omni_pretrain.training.loop import train_one_epoch, evaluate
 
 @dataclass
 class TrainerThinkerConfig:
+    train_corpus_paths: Union[str, List[str]]
+    val_corpus_paths: Union[str, List[str]]
+    
     experiment_name: str
     model_config_path: str
-    train_corpus_path: str
-    val_corpus_path: str
     max_seq_length: int
     batch_size: int
     num_workers: int
@@ -75,6 +85,23 @@ class Stage2TrainConfig:
     seed: int = 42
 
 
+def _build_text_dataset(paths, tokenizer, max_seq_length):
+    """
+    支持：
+    - paths 是 str：单一 jsonl
+    - paths 是 [str, ...]：多个 jsonl，用 ConcatDataset 串联
+    """
+    if isinstance(paths, (list, tuple)):
+        datasets = [
+            TextJsonlDataset(p, tokenizer, max_seq_length)
+            for p in paths
+        ]
+        if len(datasets) == 1:
+            return datasets[0]
+        return ConcatDataset(datasets)
+    else:
+        return TextJsonlDataset(paths, tokenizer, max_seq_length)
+
 
 def build_trainer_config(yaml_path: str) -> TrainerThinkerConfig:
     cfg = load_yaml(yaml_path)
@@ -82,12 +109,16 @@ def build_trainer_config(yaml_path: str) -> TrainerThinkerConfig:
     model_cfg = cfg["model"]
     data_cfg = cfg["data"]
     train_cfg = cfg["train"]
+    
+    train_paths = data_cfg.get("train_corpus_paths", data_cfg.get("train_corpus_path"))
+    val_paths = data_cfg.get("val_corpus_paths", data_cfg.get("val_corpus_path"))
+
 
     return TrainerThinkerConfig(
         experiment_name=str(cfg["experiment_name"]),
         model_config_path=str(model_cfg["config_path"]),
-        train_corpus_path=str(data_cfg["train_corpus_path"]),
-        val_corpus_path=str(data_cfg["val_corpus_path"]),
+        train_corpus_paths=train_paths,
+        val_corpus_paths=val_paths,
         max_seq_length=int(data_cfg.get("max_seq_length", 2048)),
         batch_size=int(data_cfg.get("batch_size", 4)),
         num_workers=int(data_cfg.get("num_workers", 4)),
@@ -126,132 +157,185 @@ def train_thinker_stage1(config_path: str, tokenizer_name_or_path: str = "Qwen/Q
 
     set_seed(cfg.seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # 用 cfg.ddp 控制是否开启 DDP（再叠加 ddp_available 判断）
+    use_ddp = cfg.ddp and ddp_available()
 
-    # 2. 构建 tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_name_or_path,
-        trust_remote_code=True,
-    )
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    # 把后面的所有逻辑包进 distributed_context，这样会自动 init/destroy process_group
+    with distributed_context():
+        # 2. 设备 & rank
+        if use_ddp:
+            local_rank = get_local_rank()
+            device = torch.device(f"cuda:{local_rank}")
+        else:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 3. 构建模型配置 & 模型
-    model_cfg_dict = load_yaml(cfg.model_config_path)
-    model_cfg = Qwen3OmniMoeConfig(**model_cfg_dict)
-    model = Qwen3OmniMoeThinkerTextModel(model_cfg)
-
-    model.to(device)
-
-    # 4. 数据
-    train_dataset = TextJsonlDataset(cfg.train_corpus_path, tokenizer, cfg.max_seq_length)
-    val_dataset = TextJsonlDataset(cfg.val_corpus_path, tokenizer, cfg.max_seq_length)
-
-    collator = TextCausalLMCollator(tokenizer, cfg.max_seq_length)
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=cfg.batch_size,
-        shuffle=cfg.shuffle,
-        num_workers=cfg.num_workers,
-        collate_fn=collator,
-        pin_memory=True,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=cfg.batch_size,
-        shuffle=False,
-        num_workers=cfg.num_workers,
-        collate_fn=collator,
-        pin_memory=True,
-    )
-
-    # 5. 优化器 & scheduler
-    no_decay = ["bias", "norm", "layernorm", "ln"]  # 粗略的划分
-    optimizer_grouped_parameters = [
-        {
-            "params": [
-                p for n, p in model.named_parameters()
-                if not any(nd in n.lower() for nd in no_decay)
-            ],
-            "weight_decay": cfg.weight_decay,
-        },
-        {
-            "params": [
-                p for n, p in model.named_parameters()
-                if any(nd in n.lower() for nd in no_decay)
-            ],
-            "weight_decay": 0.0,
-        },
-    ]
-    optimizer = torch.optim.AdamW(
-        optimizer_grouped_parameters,
-        lr=cfg.learning_rate,
-        betas=(0.9, 0.95),
-        eps=1e-8,
-    )
-
-    if cfg.max_steps > 0:
-        num_training_steps = cfg.max_steps
-    else:
-        num_training_steps = len(train_loader) * cfg.num_epochs // cfg.gradient_accumulation_steps
-
-    num_warmup_steps = int(num_training_steps * cfg.warmup_ratio)
-
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=num_warmup_steps,
-        num_training_steps=num_training_steps,
-    )
-
-    # 6. 训练循环
-    global_step = 0
-
-    def log_step_fn(step: int, loss: float, batch_idx: int, ce_loss=None, aux_loss=None):
-        nonlocal global_step
-        global_step += 1
-        if global_step % cfg.logging_steps == 0:
-            msg = f"[step {global_step}] loss={loss:.4f}"
-            # Stage1 没有 ce_loss / aux_loss，也没关系，这里检测一下
-            if ce_loss is not None:
-                msg += f" ce={ce_loss:.4f}"
-            if aux_loss is not None:
-                msg += f" aux={aux_loss:.4f}"
-            print(msg)
-
-
-    best_val_loss = float("inf")
-
-    for epoch in range(cfg.num_epochs):
-        train_loss = train_one_epoch(
-            model=model,
-            dataloader=train_loader,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            device=device,
-            gradient_accumulation_steps=cfg.gradient_accumulation_steps,
-            log_step_fn=log_step_fn
+        # 3. tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name_or_path,
+            trust_remote_code=True,
         )
-        print(f"Epoch {epoch} train_loss={train_loss:.4f}")
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
 
-        val_loss = evaluate(model, val_loader, device)
-        print(f"Epoch {epoch} val_loss={val_loss:.4f}")
+        # 4. 模型配置 & 模型
+        model_cfg_dict = load_yaml(cfg.model_config_path)
+        model_cfg = Qwen3OmniMoeConfig(**model_cfg_dict)
+        model = Qwen3OmniMoeThinkerTextModel(model_cfg)
+        model.to(device)
 
-        # 保存最好的一版
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            save_path = os.path.join(cfg.output_dir, f"best_epoch{epoch}")
-            os.makedirs(save_path, exist_ok=True)
-            print(f"Saving best model to {save_path}")
-            model.save_pretrained(save_path, safe_serialization=False)
-            tokenizer.save_pretrained(save_path)
+        # ✅ DDP 包裹模型
+        model = ddp_wrap_model(model) if use_ddp else model
 
-    # 最终再保存一版 latest
-    final_path = os.path.join(cfg.output_dir, "latest")
-    os.makedirs(final_path, exist_ok=True)
-    print(f"Saving final model to {final_path}")
-    model.save_pretrained(final_path, safe_serialization=False)
-    tokenizer.save_pretrained(final_path)
+        # 5. 数据集
+        train_dataset = _build_text_dataset(cfg.train_corpus_paths, tokenizer, cfg.max_seq_length)
+        val_dataset = _build_text_dataset(cfg.val_corpus_paths, tokenizer, cfg.max_seq_length)
+
+        collator = TextCausalLMCollator(tokenizer, cfg.max_seq_length)
+
+        # ✅ DistributedSampler
+        if use_ddp:
+            train_sampler = DistributedSampler(
+                train_dataset,
+                num_replicas=torch.distributed.get_world_size(),
+                rank=torch.distributed.get_rank(),
+                shuffle=False,
+            )
+            val_sampler = DistributedSampler(
+                val_dataset,
+                num_replicas=torch.distributed.get_world_size(),
+                rank=torch.distributed.get_rank(),
+                shuffle=False,
+            )
+        else:
+            train_sampler = None
+            val_sampler = None
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=cfg.batch_size,
+            sampler=train_sampler,
+            # sampler 存在时必须 shuffle=False
+            shuffle=(train_sampler is None and cfg.shuffle),
+            num_workers=cfg.num_workers,
+            collate_fn=collator,
+            pin_memory=True,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=cfg.batch_size,
+            sampler=val_sampler,
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            collate_fn=collator,
+            pin_memory=True,
+        )
+
+        # 6. 优化器 & scheduler
+        no_decay = ["bias", "norm", "layernorm", "ln"]
+        optimizer_grouped_parameters = [
+            {
+                "params": [
+                    p for n, p in model.named_parameters()
+                    if not any(nd in n.lower() for nd in no_decay)
+                ],
+                "weight_decay": cfg.weight_decay,
+            },
+            {
+                "params": [
+                    p for n, p in model.named_parameters()
+                    if any(nd in n.lower() for nd in no_decay)
+                ],
+                "weight_decay": 0.0,
+            },
+        ]
+        optimizer = torch.optim.AdamW(
+            optimizer_grouped_parameters,
+            lr=cfg.learning_rate,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+        )
+
+        if cfg.max_steps > 0:
+            num_training_steps = cfg.max_steps
+        else:
+            num_training_steps = len(train_loader) * cfg.num_epochs // max(cfg.gradient_accumulation_steps, 1)
+
+        num_warmup_steps = int(num_training_steps * cfg.warmup_ratio)
+
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps,
+        )
+
+        # 7. 训练循环
+        global_step = 0
+
+        def log_step_fn(step: int, loss: float, batch_idx: int, ce_loss=None, aux_loss=None):
+            nonlocal global_step
+            global_step += 1
+            # ✅ 只在主进程打 log
+            if not is_main_process():
+                return
+            if global_step % cfg.logging_steps == 0:
+                msg = f"[step {global_step}] loss={loss:.4f}"
+                if ce_loss is not None:
+                    msg += f" ce={ce_loss:.4f}"
+                if aux_loss is not None:
+                    msg += f" aux={aux_loss:.4f}"
+                print(msg)
+
+        best_val_loss = float("inf")
+        save_interval = 5
+
+        for epoch in range(cfg.num_epochs):
+            # ✅ DDP sampler 每个 epoch 需要设置一下 epoch，保证 shuffle 不同
+            if use_ddp and train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+
+            if is_main_process():
+                print(f"Epoch {epoch} / {cfg.num_epochs - 1}")
+
+            train_loss = train_one_epoch(
+                model=model,
+                dataloader=train_loader,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                device=device,
+                gradient_accumulation_steps=cfg.gradient_accumulation_steps,
+                log_step_fn=log_step_fn
+            )
+            if is_main_process():
+                print(f"Epoch {epoch} train_loss={train_loss:.4f}")
+
+            # ✅ 所有 rank 都跑 evaluate（这样 val_sampler 分片才有意义）
+            val_loss = evaluate(model, val_loader, device)
+
+            # 只在主进程打印 & 保存
+            if is_main_process():
+                print(f"Epoch {epoch} val_loss={val_loss:.4f}")
+
+                # 取出真正的 HF 模型（DDP 包裹时在 model.module 里）
+                model_to_save = model.module if hasattr(model, "module") else model
+
+                if (epoch + 1) % save_interval == 0:
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        save_path = os.path.join(cfg.output_dir, f"best_epoch{epoch}")
+                        os.makedirs(save_path, exist_ok=True)
+                        print(f"Saving best model to {save_path}")
+                        model_to_save.save_pretrained(save_path, safe_serialization=False)
+                        tokenizer.save_pretrained(save_path)
+
+        # 最终再保存一版 latest
+        if is_main_process():
+            final_path = os.path.join(cfg.output_dir, "latest")
+            os.makedirs(final_path, exist_ok=True)
+            print(f"Saving final model to {final_path}")
+            model_to_save = model.module if hasattr(model, "module") else model
+            model_to_save.save_pretrained(final_path, safe_serialization=False)
+            tokenizer.save_pretrained(final_path)
+
 
 def train_thinker_stage2(cfg: Stage2TrainConfig, tokenizer_name_or_path: str):
     """
