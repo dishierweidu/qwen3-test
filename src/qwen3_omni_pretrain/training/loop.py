@@ -47,6 +47,17 @@ def train_one_epoch(
         loss = outputs["loss"]
         ce_loss = outputs.get("ce_loss", None)
         aux_loss = outputs.get("aux_loss", None)
+        
+        # ✅ 如果出现 NaN/Inf，打印一次并跳过这个 batch，避免把整个 epoch 平均也搞成 NaN
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(
+                f"[train_one_epoch] NaN/Inf loss at batch {batch_idx} "
+                f"(loss={loss.item()}, "
+                f"ce={ce_loss.item() if ce_loss is not None else 'None'}, "
+                f"aux={aux_loss.item() if aux_loss is not None else 'None'}) — skip this batch."
+            )
+            optimizer.zero_grad(set_to_none=True)
+            continue
 
         # 梯度累积
         loss = loss / gradient_accumulation_steps
@@ -96,6 +107,10 @@ def evaluate(
 
             outputs = model(**batch)
             loss = outputs["loss"]
+            
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"[evaluate] NaN/Inf loss at batch {batch}, skip.")
+                continue
 
             total_loss += loss.item()
             steps += 1

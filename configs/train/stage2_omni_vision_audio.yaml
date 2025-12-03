@@ -1,7 +1,9 @@
 experiment_name: "qwen3_omni_stage2_omni_7b"
 
+stage1_init_ckpt: outputs/qwen3_omni_stage1_text_7b/best_epoch0
+
 model:
-  model_config_path: configs/model/qwen3_omni_1_3b_moe.yaml
+  model_config_path: configs/model/qwen3_omni_7b_moe.yaml
 
 data:
   train_corpus_path: data/corpus/stage2_omni_train.jsonl
@@ -17,14 +19,14 @@ train:
   num_epochs: 1
   max_steps: -1
   gradient_accumulation_steps: 8
-  learning_rate: 1e-4
+  learning_rate: 1e-5
   weight_decay: 0.01
   warmup_ratio: 0.03
-  logging_steps: 10
+  logging_steps: 1
   eval_steps: 200
   save_steps: 200
   output_dir: outputs/qwen3_omni_stage2_omni_7b
   fp16: false
-  bf16: false
+  bf16: true
   seed: 42
   ddp: false

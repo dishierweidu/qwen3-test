@@ -53,6 +53,7 @@ class TrainerThinkerConfig:
     
 @dataclass
 class Stage2TrainConfig:
+    stage1_init_ckpt: str
     model_config_path: str
     train_corpus_path: str
     val_corpus_path: str
@@ -268,7 +269,7 @@ def train_thinker_stage2(cfg: Stage2TrainConfig, tokenizer_name_or_path: str):
     # 安全取配置，给一些默认值
     seed = c.get("seed", 42)
     set_seed(seed)
-    
+    stage1_init_ckpt = c["stage1_init_ckpt"]
     model_config_path = c["model"]["model_config_path"]
     train_corpus_path = c["data"]["train_corpus_path"]
     val_corpus_path = c["data"]["val_corpus_path"]
@@ -301,6 +302,17 @@ def train_thinker_stage2(cfg: Stage2TrainConfig, tokenizer_name_or_path: str):
 
     # 3. model
     model = Qwen3OmniMoeThinkerVisionAudioModel(model_config)
+    # ✅ 从 Stage1 ckpt 初始化 Thinker 权重
+    if stage1_init_ckpt:
+        print(f"Loading Stage1 checkpoint from {stage1_init_ckpt}")
+        base_thinker = Qwen3OmniMoeThinkerTextModel.from_pretrained(
+            stage1_init_ckpt
+        )
+        missing, unexpected = model.thinker.load_state_dict(
+            base_thinker.state_dict(), strict=False
+        )
+        print(f"Loaded Stage1 weights into Thinker. missing={len(missing)}, unexpected={len(unexpected)}")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 

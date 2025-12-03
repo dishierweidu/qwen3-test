@@ -14,48 +14,56 @@ from .modeling_thinker_text import Qwen3OmniMoeThinkerTextModel
 
 class SimpleVisionEncoder(nn.Module):
     """
-    非常简化的 Vision encoder：
-    - 输入: pixel_values [B, 3, H, W]
-    - 输出: 一个 [B, 1, Hdim] 的“图像 token”
-    后续可以替换成 ViT/CLIP。
+    稳定版 Vision encoder：
+    - 像素拉平 -> Linear -> Tanh -> LayerNorm
+    - 输出 [B, 1, H]
     """
 
     def __init__(self, hidden_size: int, image_size: int = 224):
         super().__init__()
         self.image_size = image_size
-        self.proj = nn.Linear(3 * image_size * image_size, hidden_size)
+        in_dim = 3 * image_size * image_size
+        self.proj = nn.Linear(in_dim, hidden_size)
+        self.act = nn.Tanh()
+        self.norm = nn.LayerNorm(hidden_size)
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        # 简单 resize 到固定大小
+        # [B,3,H,W] -> resize -> flatten
         x = F.interpolate(
             pixel_values,
             size=(self.image_size, self.image_size),
             mode="bilinear",
             align_corners=False,
         )  # [B,3,H,W]
-        x = x.view(x.size(0), -1)  # [B, 3*H*W]
-        x = self.proj(x)           # [B, H]
-        return x.unsqueeze(1)      # [B, 1, H]
+        x = x.reshape(x.size(0), -1)  # [B, 3*H*W]
+        x = self.proj(x)              # [B, H]
+        x = self.act(x)
+        x = self.norm(x)
+        return x.unsqueeze(1)         # [B,1,H]
 
 
 class SimpleAudioEncoder(nn.Module):
     """
-    非常简化的 Audio encoder：
-    - 输入: audio_values [B, max_audio_len]
-    - 输出: 一个 [B, 1, Hdim] 的“音频 token”
-    后续可以替换成 Wav2Vec/Whisper encoder。
+    稳定版 Audio encoder：
+    - wav 向量 -> Linear -> Tanh -> LayerNorm
+    - 输入长度由 collator 保证固定（max_audio_len）
     """
 
     def __init__(self, hidden_size: int, max_audio_len: int = 32000):
         super().__init__()
         self.max_audio_len = max_audio_len
         self.proj = nn.Linear(max_audio_len, hidden_size)
+        self.act = nn.Tanh()
+        self.norm = nn.LayerNorm(hidden_size)
 
     def forward(self, audio_values: torch.Tensor) -> torch.Tensor:
+        # audio_values: [B, max_audio_len] 或 [B,1,max_audio_len]
         if audio_values.dim() == 3:
             audio_values = audio_values.squeeze(1)
-        x = self.proj(audio_values)  # [B, H]
-        return x.unsqueeze(1)        # [B, 1, H]
+        x = self.proj(audio_values)   # [B,H]
+        x = self.act(x)
+        x = self.norm(x)
+        return x.unsqueeze(1)         # [B,1,H]
 
 
 class Qwen3OmniMoeThinkerVisionAudioModel(PreTrainedModel):
@@ -111,6 +119,10 @@ class Qwen3OmniMoeThinkerVisionAudioModel(PreTrainedModel):
         # vision/audio token
         vis_token = self.vision_encoder(pixel_values.to(device))    # [B,1,H]
         aud_token = self.audio_encoder(audio_values.to(device))     # [B,1,H]
+        
+        # 把可能出现的 nan / inf 清理掉
+        vis_token = torch.nan_to_num(vis_token, nan=0.0, posinf=1e4, neginf=-1e4)
+        aud_token = torch.nan_to_num(aud_token, nan=0.0, posinf=1e4, neginf=-1e4)
 
         # 对于没有图像/音频的样本，把对应 token 置 0，并 mask 掉
         has_image_f = has_image.to(device).view(B, 1, 1).float()

@@ -8,6 +8,10 @@ export https_proxy="$ALL_PROXY"
 export HTTP_PROXY="$ALL_PROXY"
 export http_proxy="$ALL_PROXY"
 
+unset http_proxy
+unset https_proxy
+
+
 pip install -e .
 pip install -r requirements.txt
 

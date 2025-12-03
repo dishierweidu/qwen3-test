@@ -344,47 +344,85 @@ class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
                 else:
                     total_aux_loss = total_aux_loss + layer_aux
 
-        hidden_states = self.norm(hidden_states)
+                hidden_states = self.norm(hidden_states)
+                logits = self.lm_head(hidden_states)  # [B, T, V]
 
+                loss = None
+                ce_loss = None
+                aux_loss = None
+                vocab_size = logits.size(-1)
 
-        logits = self.lm_head(hidden_states)
+                if labels is not None:
+                    # 1. 标准自回归 shift
+                    shift_logits = logits[:, :-1, :].contiguous()   # [B, T-1, V]
+                    shift_labels = labels[:, 1:].contiguous()       # [B, T-1]
 
-        ce_loss = None
-        aux_loss = total_aux_loss
-        loss = None
+                    # 2. 统计有效 token 数（剔除 ignore_index）
+                    valid_mask = (shift_labels != -100)             # [B, T-1]
+                    num_tokens = valid_mask.sum()
 
-        if labels is not None:
-            # 计算标准自回归交叉熵
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = labels[:, 1:].contiguous()
+                    # 3. 用 sum，然后手动除，防止 num_tokens=0 时 mean 爆掉
+                    loss_fct = nn.CrossEntropyLoss(
+                        ignore_index=-100,
+                        reduction="sum",
+                    )
+                    ce_loss_raw = loss_fct(
+                        shift_logits.view(-1, vocab_size),
+                        shift_labels.view(-1),
+                    )  # 标量，可能是 0
 
-            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-            ce_loss = loss_fct(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-            )
+                    if num_tokens > 0:
+                        ce_loss = ce_loss_raw / num_tokens
+                    else:
+                        # 整个 batch 没有任何有效 token → 这个 batch 的 CE 贡献记为 0
+                        ce_loss = ce_loss_raw * 0.0  # 保持 dtype/device
 
-            if aux_loss is not None:
-                loss = ce_loss + self.thinker_cfg.moe_aux_loss_coef * aux_loss
-            else:
-                loss = ce_loss
+                    loss = ce_loss
 
-        output = {
-            "logits": logits,
-            "loss": loss,
-        }
-        if ce_loss is not None:
-            output["ce_loss"] = ce_loss
-        if aux_loss is not None:
-            output["aux_loss"] = aux_loss
+                # 4. MoE aux loss 归一化 + 合并
+                if total_aux_loss is not None:
+                    if labels is not None:
+                        # 复用上面的 num_tokens，如果还没算就现算一遍
+                        if "num_tokens" not in locals():
+                            valid_mask = (labels != -100)
+                            num_tokens = valid_mask.sum()
 
-        if output_hidden_states:
-            all_hidden_states.append(hidden_states)
-            output["hidden_states"] = all_hidden_states
+                        if num_tokens > 0:
+                            aux_loss = total_aux_loss / num_tokens
+                        else:
+                            aux_loss = total_aux_loss * 0.0
+                    else:
+                        # 没 labels 的情况，直接用 total_aux_loss（一般 Stage1/2都会有 labels）
+                        aux_loss = total_aux_loss
 
-        return output
+                    if loss is None:
+                        loss = self.thinker_cfg.moe_aux_loss_coef * aux_loss
+                    else:
+                        loss = loss + self.thinker_cfg.moe_aux_loss_coef * aux_loss
 
-    
+                # 5. 最后一层保险，把任何潜在 NaN/Inf 压成有限值
+                if loss is not None:
+                    loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
+                if ce_loss is not None:
+                    ce_loss = torch.nan_to_num(ce_loss, nan=0.0, posinf=1e4, neginf=-1e4)
+                if aux_loss is not None:
+                    aux_loss = torch.nan_to_num(aux_loss, nan=0.0, posinf=1e4, neginf=-1e4)
+
+                output = {
+                    "logits": logits,
+                    "loss": loss,
+                }
+                if ce_loss is not None:
+                    output["ce_loss"] = ce_loss
+                if aux_loss is not None:
+                    output["aux_loss"] = aux_loss
+
+                if output_hidden_states:
+                    all_hidden_states.append(hidden_states)
+                    output["hidden_states"] = all_hidden_states
+
+                return output
+
     # ---- 让 transformers 知道怎么 tie 权重 ----
     def get_input_embeddings(self):
         return self.embed_tokens
