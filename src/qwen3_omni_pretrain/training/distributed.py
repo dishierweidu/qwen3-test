@@ -1,6 +1,5 @@
 import os
 from contextlib import contextmanager
-from typing import Optional
 
 import torch
 import torch.distributed as dist

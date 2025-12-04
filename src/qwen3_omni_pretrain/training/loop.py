@@ -71,6 +71,7 @@ def train_one_epoch(
 
     # 判断是否是 DDP 包裹的模型
     is_ddp = (DDP is not None) and isinstance(model, DDP) or hasattr(model, "no_sync")
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
 
     optimizer.zero_grad(set_to_none=True)
 
@@ -80,6 +81,13 @@ def train_one_epoch(
     num_updates = 0           # 逻辑上的 optimizer.step() 次数
 
     for batch_idx, batch in enumerate(dataloader):
+        if batch_idx == 0:
+            # 确认每个 rank 都拿到数据了
+            if "input_ids" in batch:
+                print(f"[Rank {rank}] got first batch, input_ids={batch['input_ids'].shape}")
+            else:
+                print(f"[Rank {rank}] got first batch, keys={list(batch.keys())}")
+
         batch = _move_batch_to_device(batch, device)
 
         # 本 micro-step 是否是一个“累计完成点”（要做 optimizer.step）

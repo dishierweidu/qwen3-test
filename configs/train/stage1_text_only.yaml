@@ -15,7 +15,7 @@ data:
     - "data/corpus/val_text.jsonl"
   max_seq_length: 2048
   num_workers: 2
-  batch_size: 4           # per-GPU batch size
+  batch_size: 2           # per-GPU batch size
   shuffle: false
 
 train:

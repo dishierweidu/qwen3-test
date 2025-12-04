@@ -27,3 +27,5 @@ torchrun --nproc_per_node=8 -m qwen3_omni_pretrain.cli_train_thinker \
 
 git config --global user.email eliot.zhao@finnox.cn
 git config --global user.name "Eliot Zhao"
+
+netstat -tulnp | grep 29500

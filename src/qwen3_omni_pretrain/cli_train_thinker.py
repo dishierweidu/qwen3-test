@@ -2,18 +2,16 @@
 
 import argparse
 
-from qwen3_omni_pretrain.training.trainer_thinker import train_thinker_stage1
 from qwen3_omni_pretrain.training.trainer_thinker import (
     train_thinker_stage1,
     train_thinker_stage2,
-    Stage2TrainConfig,
 )
 from qwen3_omni_pretrain.utils.config_utils import load_yaml
-
+from qwen3_omni_pretrain.training.distributed import distributed_context
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train Qwen3-Omni Thinker (Stage1 Text Only)")
+    parser = argparse.ArgumentParser(description="Train Qwen3-Omni Thinker")
     parser.add_argument(
         "--config",
         type=str,
@@ -38,17 +36,20 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if args.stage == "stage1":
-        train_thinker_stage1(
-            args.config,
-            tokenizer_name_or_path=args.tokenizer_name_or_path,
-        )
-    else:
-        cfg = load_yaml(args.config)
-        train_thinker_stage2(
-            cfg=cfg,
-            tokenizer_name_or_path=args.tokenizer_name_or_path,
-        )
+
+    # 无论单卡还是多卡，统一在这里 init / destroy 进程组
+    with distributed_context():
+        if args.stage == "stage1":
+            train_thinker_stage1(
+                args.config,
+                tokenizer_name_or_path=args.tokenizer_name_or_path,
+            )
+        else:
+            cfg = load_yaml(args.config)
+            train_thinker_stage2(
+                cfg=cfg,
+                tokenizer_name_or_path=args.tokenizer_name_or_path,
+            )
 
 
 if __name__ == "__main__":
