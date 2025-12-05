@@ -5,17 +5,17 @@
 experiment_name: "qwen3_omni_stage1_text_7b"
 
 model:
-  config_path: "configs/model/qwen3_omni_7b_moe.yaml"
+  config_path: "configs/model/qwen3_omni_1_3b_moe.yaml"
 
 data:
   train_corpus_paths: 
     - "data/corpus/train_text.jsonl"
-    - "/hpc2hdd/home/zzhao056/mobv/mobvoi_seq_monkey_general_open_corpus.jsonl"
+    # - "/ai/finnox/mobvoi_seq_monkey_general_open_corpus.jsonl"
   val_corpus_paths:
     - "data/corpus/val_text.jsonl"
   max_seq_length: 2048
-  num_workers: 2
-  batch_size: 2           # per-GPU batch size
+  num_workers: 1
+  batch_size: 1           # per-GPU batch size
   shuffle: false
 
 train:
@@ -29,7 +29,7 @@ train:
   eval_steps: 1000
   save_steps: 1000
   output_dir: "outputs/qwen3_omni_stage1_text_7b"
-  fp16: true
-  bf16: false
+  fp16: false
+  bf16: true
   seed: 42
   ddp: true              # 先做单卡/单机，后面再加 FSDP / DeepSpeed

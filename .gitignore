@@ -27,3 +27,5 @@ mobvoi_seq_monkey_general_open_corpus.jsonl
 
 outputs/
 
+# TensorBoard files
+runs/

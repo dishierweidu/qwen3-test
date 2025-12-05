@@ -1,13 +1,14 @@
 # src/qwen3_omni_pretrain/cli_train_thinker.py
 
 import argparse
+import sys
 
 from qwen3_omni_pretrain.training.trainer_thinker import (
     train_thinker_stage1,
     train_thinker_stage2,
 )
 from qwen3_omni_pretrain.utils.config_utils import load_yaml
-from qwen3_omni_pretrain.training.distributed import distributed_context
+from qwen3_omni_pretrain.training.distributed import distributed_context, ddp_cleanup
 
 
 def parse_args():
@@ -31,6 +32,17 @@ def parse_args():
         default="stage1",
         help="Which training stage to run."
     )
+    parser.add_argument(
+        "--tensorboard",
+        action="store_true",
+        help="Enable TensorBoard logging (rank 0 only).",
+    )
+    parser.add_argument(
+        "--log_dir",
+        type=str,
+        default="./runs",
+        help="TensorBoard log directory.",
+    )
     return parser.parse_args()
 
 
@@ -43,14 +55,23 @@ def main():
             train_thinker_stage1(
                 args.config,
                 tokenizer_name_or_path=args.tokenizer_name_or_path,
+                enable_tensorboard=args.tensorboard,
+                log_dir=args.log_dir,
             )
         else:
             cfg = load_yaml(args.config)
             train_thinker_stage2(
                 cfg=cfg,
                 tokenizer_name_or_path=args.tokenizer_name_or_path,
+                enable_tensorboard=args.tensorboard,
+                log_dir=args.log_dir,
             )
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("KeyboardInterrupt received, cleaning up DDP...")
+        ddp_cleanup()
+        sys.exit(0)

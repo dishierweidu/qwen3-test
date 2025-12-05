@@ -3,6 +3,7 @@ torch>=2.2.0
 torchvision>=0.15.0
 torchaudio>=2.2.0
 transformers>=4.45.0
+tensorboard>=2.16.0
 
 # 配置 & 工具
 pyyaml>=6.0.0

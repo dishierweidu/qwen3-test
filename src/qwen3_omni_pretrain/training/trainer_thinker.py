@@ -5,8 +5,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, Union, List
 
 import torch
+import torch.distributed as dist
 from torch.utils.data import DataLoader, ConcatDataset
 from torch.utils.data.distributed import DistributedSampler
+from torch.utils.tensorboard.writer import SummaryWriter
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
 from qwen3_omni_pretrain.training.distributed import (
@@ -150,7 +152,12 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
-def train_thinker_stage1(config_path: str, tokenizer_name_or_path: str = "Qwen/Qwen2.5-7B"):
+def train_thinker_stage1(
+    config_path: str,
+    tokenizer_name_or_path: str = "Qwen/Qwen2.5-7B",
+    enable_tensorboard: bool = False,
+    log_dir: str = "./runs",
+):
     # 1. 加载配置
     cfg = build_trainer_config(config_path)
     os.makedirs(cfg.output_dir, exist_ok=True)
@@ -181,7 +188,7 @@ def train_thinker_stage1(config_path: str, tokenizer_name_or_path: str = "Qwen/Q
         model_cfg_dict = load_yaml(cfg.model_config_path)
         model_cfg = Qwen3OmniMoeConfig(**model_cfg_dict)
         model = Qwen3OmniMoeThinkerTextModel(model_cfg)
-        model.to(device)
+        model.to(device)  # type: ignore[arg-type]
 
         # ✅ DDP 包裹模型
         model = ddp_wrap_model(model) if use_ddp else model
@@ -196,14 +203,14 @@ def train_thinker_stage1(config_path: str, tokenizer_name_or_path: str = "Qwen/Q
         if use_ddp:
             train_sampler = DistributedSampler(
                 train_dataset,
-                num_replicas=torch.distributed.get_world_size(),
-                rank=torch.distributed.get_rank(),
+                num_replicas=dist.get_world_size(),
+                rank=dist.get_rank(),
                 shuffle=False,
             )
             val_sampler = DistributedSampler(
                 val_dataset,
-                num_replicas=torch.distributed.get_world_size(),
-                rank=torch.distributed.get_rank(),
+                num_replicas=dist.get_world_size(),
+                rank=dist.get_rank(),
                 shuffle=False,
             )
         else:
@@ -270,8 +277,12 @@ def train_thinker_stage1(config_path: str, tokenizer_name_or_path: str = "Qwen/Q
 
         # 7. 训练循环
         global_step = 0
+        writer = None
+        if enable_tensorboard and is_main_process():
+            run_name = f"{cfg.experiment_name}_stage1"
+            writer = SummaryWriter(log_dir=os.path.join(log_dir, run_name))
 
-        def log_step_fn(step: int, loss: float, batch_idx: int, ce_loss=None, aux_loss=None):
+        def log_step_fn(step: int, loss: float, batch_idx: int, ce_loss=None, aux_loss=None, lr=None):
             nonlocal global_step
             global_step += 1
             # ✅ 只在主进程打 log
@@ -283,14 +294,26 @@ def train_thinker_stage1(config_path: str, tokenizer_name_or_path: str = "Qwen/Q
                     msg += f" ce={ce_loss:.4f}"
                 if aux_loss is not None:
                     msg += f" aux={aux_loss:.4f}"
+                if lr is not None:
+                    msg += f" lr={lr:.6f}"
                 print(msg)
+
+            if writer is not None:
+                writer.add_scalar("train/loss", loss, global_step)
+                if ce_loss is not None:
+                    writer.add_scalar("train/ce_loss", ce_loss, global_step)
+                if aux_loss is not None:
+                    writer.add_scalar("train/aux_loss", aux_loss, global_step)
+                if lr is not None:
+                    writer.add_scalar("train/lr", lr, global_step)
+                writer.flush()
 
         best_val_loss = float("inf")
         save_interval = 5
 
         for epoch in range(cfg.num_epochs):
-            # ✅ DDP sampler 每个 epoch 需要设置一下 epoch，保证 shuffle 不同
-            if use_ddp and train_sampler is not None:
+            # DDP sampler 每个 epoch 需要设置一下 epoch，保证 shuffle 不同
+            if use_ddp and isinstance(train_sampler, DistributedSampler):
                 train_sampler.set_epoch(epoch)
 
             if is_main_process():
@@ -308,12 +331,21 @@ def train_thinker_stage1(config_path: str, tokenizer_name_or_path: str = "Qwen/Q
             if is_main_process():
                 print(f"Epoch {epoch} train_loss={train_loss:.4f}")
 
+                if writer is not None:
+                    writer.add_scalar("epoch/train_loss", train_loss, global_step)
+                    writer.flush()
+
             # ✅ 所有 rank 都跑 evaluate（这样 val_sampler 分片才有意义）
             val_loss = evaluate(model, val_loader, device)
 
             # 只在主进程打印 & 保存
             if is_main_process():
                 print(f"Epoch {epoch} val_loss={val_loss:.4f}")
+
+                if writer is not None:
+                    writer.add_scalar("epoch/val_loss", val_loss, global_step)
+                    writer.add_scalar("epoch/epoch", epoch, global_step)
+                    writer.flush()
 
                 # 取出真正的 HF 模型（DDP 包裹时在 model.module 里）
                 model_to_save = model.module if hasattr(model, "module") else model
@@ -327,6 +359,11 @@ def train_thinker_stage1(config_path: str, tokenizer_name_or_path: str = "Qwen/Q
                         model_to_save.save_pretrained(save_path, safe_serialization=False)
                         tokenizer.save_pretrained(save_path)
 
+                        if writer is not None:
+                            writer.add_scalar("ckpt/best_val_loss", best_val_loss, global_step)
+                            writer.add_text("ckpt/path", save_path, global_step)
+                            writer.flush()
+
         # 最终再保存一版 latest
         if is_main_process():
             final_path = os.path.join(cfg.output_dir, "latest")
@@ -336,8 +373,16 @@ def train_thinker_stage1(config_path: str, tokenizer_name_or_path: str = "Qwen/Q
             model_to_save.save_pretrained(final_path, safe_serialization=False)
             tokenizer.save_pretrained(final_path)
 
+        if writer is not None:
+            writer.close()
 
-def train_thinker_stage2(cfg: Stage2TrainConfig, tokenizer_name_or_path: str):
+
+def train_thinker_stage2(
+    cfg: Stage2TrainConfig,
+    tokenizer_name_or_path: str,
+    enable_tensorboard: bool = False,
+    log_dir: str = "./runs",
+):
     """
     Stage2: Omni 多模态 AuT 训练入口。
     """
@@ -398,7 +443,7 @@ def train_thinker_stage2(cfg: Stage2TrainConfig, tokenizer_name_or_path: str):
         print(f"Loaded Stage1 weights into Thinker. missing={len(missing)}, unexpected={len(unexpected)}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
+    model.to(device)  # type: ignore[arg-type]
 
     # 4. dataset & dataloader
     train_dataset = OmniJsonlDataset(
@@ -452,8 +497,12 @@ def train_thinker_stage2(cfg: Stage2TrainConfig, tokenizer_name_or_path: str):
     best_val_loss = float("inf")
 
     global_step = 0
+    writer = None
+    if enable_tensorboard and is_main_process():
+        run_name = os.path.join(log_dir, f"{c.get('experiment_name', 'thinker_stage2')}_stage2")
+        writer = SummaryWriter(log_dir=run_name)
 
-    def log_step_fn(step: int, loss: float, batch_idx: int, ce_loss=None, aux_loss=None):
+    def log_step_fn(step: int, loss: float, batch_idx: int, ce_loss=None, aux_loss=None, lr=None):
         nonlocal global_step
         global_step += 1
         if global_step % logging_steps == 0:
@@ -462,7 +511,19 @@ def train_thinker_stage2(cfg: Stage2TrainConfig, tokenizer_name_or_path: str):
                 msg += f" ce={ce_loss:.4f}"
             if aux_loss is not None:
                 msg += f" aux={aux_loss:.4f}"
+            if lr is not None:
+                msg += f" lr={lr:.6f}"
             print(msg)
+
+        if writer is not None:
+            writer.add_scalar("train/loss", loss, global_step)
+            if ce_loss is not None:
+                writer.add_scalar("train/ce_loss", ce_loss, global_step)
+            if aux_loss is not None:
+                writer.add_scalar("train/aux_loss", aux_loss, global_step)
+            if lr is not None:
+                writer.add_scalar("train/lr", lr, global_step)
+            writer.flush()
 
     for epoch in range(num_epochs):
         print(f"Epoch {epoch} / {num_epochs - 1}")
@@ -477,6 +538,9 @@ def train_thinker_stage2(cfg: Stage2TrainConfig, tokenizer_name_or_path: str):
             log_step_fn=log_step_fn,
         )
         print(f"Epoch {epoch} train_loss={train_loss:.4f}")
+        if writer is not None:
+            writer.add_scalar("epoch/train_loss", train_loss, global_step)
+            writer.flush()
 
         val_loss = evaluate(
             model=model,
@@ -484,6 +548,10 @@ def train_thinker_stage2(cfg: Stage2TrainConfig, tokenizer_name_or_path: str):
             device=device,
         )
         print(f"Epoch {epoch} val_loss={val_loss:.4f}")
+        if writer is not None:
+            writer.add_scalar("epoch/val_loss", val_loss, global_step)
+            writer.add_scalar("epoch/epoch", epoch, global_step)
+            writer.flush()
 
         # save best
         if val_loss < best_val_loss:
@@ -494,9 +562,17 @@ def train_thinker_stage2(cfg: Stage2TrainConfig, tokenizer_name_or_path: str):
             model.save_pretrained(save_path, safe_serialization=False)
             tokenizer.save_pretrained(save_path)
 
+            if writer is not None:
+                writer.add_scalar("ckpt/best_val_loss", best_val_loss, global_step)
+                writer.add_text("ckpt/path", save_path, global_step)
+                writer.flush()
+
         # save latest
         latest_path = os.path.join(output_dir, "latest")
         os.makedirs(latest_path, exist_ok=True)
         print(f"Saving latest model to {latest_path}")
         model.save_pretrained(latest_path, safe_serialization=False)
         tokenizer.save_pretrained(latest_path)
+
+    if writer is not None:
+        writer.close()

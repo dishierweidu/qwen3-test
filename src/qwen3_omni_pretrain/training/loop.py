@@ -50,7 +50,7 @@ def train_one_epoch(
     model: torch.nn.Module,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
-    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler],
     device: torch.device,
     gradient_accumulation_steps: int = 1,
     log_step_fn: Optional[Callable[..., None]] = None,
@@ -142,12 +142,14 @@ def train_one_epoch(
                 total_aux += aux_loss.detach().item()
 
             if log_step_fn is not None:
+                current_lr = optimizer.param_groups[0].get("lr", None) if optimizer.param_groups else None
                 log_step_fn(
                     step=num_updates,
                     loss=true_loss,
                     batch_idx=batch_idx,
                     ce_loss=ce_loss.detach().item() if isinstance(ce_loss, torch.Tensor) else None,
                     aux_loss=aux_loss.detach().item() if isinstance(aux_loss, torch.Tensor) else None,
+                    lr=current_lr,
                 )
 
     if num_updates == 0:
