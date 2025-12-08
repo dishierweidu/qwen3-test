@@ -20,12 +20,14 @@ pip install -r requirements.txt
 
 python -m qwen3_omni_pretrain.cli_train_thinker  --config configs/train/stage1_text_only.yaml  --tokenizer_name_or_path Qwen/Qwen2.5-7B
 
-python -m qwen3_omni_pretrain.cli_train_thinker   --stage stage1   --config configs/train/stage1_text_only.yaml   --tokenizer_name_or_path Qwen/Qwen2.5-7B
+python -m qwen3_omni_pretrain.cli_train_thinker   --stage stage1   --config configs/train/stage1_text_only.yaml   --tokenizer_name_or_path Qwen/Qwen2.5-7B --tensorboard --log_dir runs/
 
 torchrun --nproc_per_node=8 -m qwen3_omni_pretrain.cli_train_thinker \
     --stage stage1 \
     --config configs/train/stage1_text_only.yaml \
     --tokenizer_name_or_path Qwen/Qwen2.5-7B
+
+tensorboard --logdir runs/
 
 git config --global user.email eliot.zhao@finnox.cn
 git config --global user.name "Eliot Zhao"

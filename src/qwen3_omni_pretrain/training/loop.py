@@ -54,6 +54,8 @@ def train_one_epoch(
     device: torch.device,
     gradient_accumulation_steps: int = 1,
     log_step_fn: Optional[Callable[..., None]] = None,
+    autocast_dtype: Optional[torch.dtype] = None,
+    grad_scaler: Optional[torch.cuda.amp.GradScaler] = None,
 ) -> float:
     """
     通用训练循环：
@@ -99,12 +101,19 @@ def train_one_epoch(
         else:
             ctx = nullcontext()
 
-        with ctx:
-            outputs = model(**batch)
+        amp_ctx = (
+            torch.autocast(device_type=device.type, dtype=autocast_dtype)
+            if autocast_dtype is not None
+            else nullcontext()
+        )
 
-            loss = outputs["loss"]
-            ce_loss = outputs.get("ce_loss", None)
-            aux_loss = outputs.get("aux_loss", None)
+        with ctx:
+            with amp_ctx:
+                outputs = model(**batch)
+
+                loss = outputs["loss"]
+                ce_loss = outputs.get("ce_loss", None)
+                aux_loss = outputs.get("aux_loss", None)
 
             # ✅ NaN/Inf 保护（在所有 rank 上统一判断）
             if _is_global_bad_loss(loss):
@@ -115,17 +124,28 @@ def train_one_epoch(
                     f"aux={aux_loss if isinstance(aux_loss, torch.Tensor) else aux_loss}) — skip this batch."
                 )
                 optimizer.zero_grad(set_to_none=True)
+                if grad_scaler is not None:
+                    grad_scaler.update()
                 continue
 
             # 梯度累积：缩放 loss
             scaled_loss = loss / grad_accum
-            scaled_loss.backward()
+
+            if grad_scaler is not None:
+                grad_scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
 
         if is_update_step:
             # 可选：梯度裁剪
-            clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-            optimizer.step()
+            if grad_scaler is not None:
+                grad_scaler.unscale_(optimizer)
+                clip_grad_norm_(model.parameters(), max_norm=1.0)
+                grad_scaler.step(optimizer)
+                grad_scaler.update()
+            else:
+                clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
             if scheduler is not None:
                 scheduler.step()
             optimizer.zero_grad(set_to_none=True)
@@ -163,6 +183,7 @@ def evaluate(
     model: torch.nn.Module,
     dataloader: DataLoader,
     device: torch.device,
+    autocast_dtype: Optional[torch.dtype] = None,
 ) -> float:
     """
     通用评估循环：
@@ -173,12 +194,19 @@ def evaluate(
     total_loss = 0.0
     steps = 0
 
+    amp_ctx = (
+        torch.autocast(device_type=device.type, dtype=autocast_dtype)
+        if autocast_dtype is not None
+        else nullcontext()
+    )
+
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
             batch = _move_batch_to_device(batch, device)
 
-            outputs = model(**batch)
-            loss = outputs["loss"]
+            with amp_ctx:
+                outputs = model(**batch)
+                loss = outputs["loss"]
 
             if not torch.isfinite(loss):
                 print(f"[evaluate] NaN/Inf loss at batch {batch_idx}, skip.")

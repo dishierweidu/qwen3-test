@@ -43,6 +43,12 @@ def parse_args():
         default="./runs",
         help="TensorBoard log directory.",
     )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Path to a checkpoint directory to resume training.",
+    )
     return parser.parse_args()
 
 
@@ -57,6 +63,7 @@ def main():
                 tokenizer_name_or_path=args.tokenizer_name_or_path,
                 enable_tensorboard=args.tensorboard,
                 log_dir=args.log_dir,
+                resume_from_checkpoint=args.resume_from_checkpoint,
             )
         else:
             cfg = load_yaml(args.config)
@@ -65,6 +72,7 @@ def main():
                 tokenizer_name_or_path=args.tokenizer_name_or_path,
                 enable_tensorboard=args.tensorboard,
                 log_dir=args.log_dir,
+                resume_from_checkpoint=args.resume_from_checkpoint,
             )
 
 

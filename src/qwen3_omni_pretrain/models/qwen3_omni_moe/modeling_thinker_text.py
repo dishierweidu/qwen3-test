@@ -5,6 +5,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import PreTrainedModel
 
 from .configuration_qwen3_omni_moe import Qwen3OmniMoeConfig, Qwen3OmniMoeThinkerConfig
@@ -77,13 +78,14 @@ class RotaryEmbedding(nn.Module):
 
 
 class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, num_kv_heads: int, head_dim: int):
+    def __init__(self, hidden_size: int, num_heads: int, num_kv_heads: int, head_dim: int, use_flash_attention: bool = False):
         super().__init__()
         assert hidden_size % num_heads == 0
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
+        self.use_flash_attention = use_flash_attention
 
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
@@ -112,14 +114,34 @@ class MultiHeadSelfAttention(nn.Module):
             q = rotary_emb(q, position_ids)  # [B, nh, T, hd]
             k = rotary_emb(k, position_ids)
 
-        scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)  # [B, nh, T, T]
+        if self.use_flash_attention:
+            # 使用 PyTorch SDPA/FlashAttention 内核（自动选择最佳实现）
+            attn_mask = attention_mask  # broadcast: [B, 1, 1, T] -> [B, nh, T, T]
+            try:
+                with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True):
+                    out = F.scaled_dot_product_attention(
+                        q, k, v,
+                        attn_mask=attn_mask,
+                        dropout_p=0.0,
+                        is_causal=False,
+                    )
+            except Exception:
+                out = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=attn_mask,
+                    dropout_p=0.0,
+                    is_causal=False,
+                )
+        else:
+            scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)  # [B, nh, T, T]
 
-        if attention_mask is not None:
-            # attention_mask: [B, 1, 1, T] 或 [B, 1, T, T]
-            scores = scores + attention_mask
+            if attention_mask is not None:
+                # attention_mask: [B, 1, 1, T] 或 [B, 1, T, T]
+                scores = scores + attention_mask
 
-        attn = torch.softmax(scores, dim=-1)
-        out = torch.matmul(attn, v)  # [B, nh, T, hd]
+            attn = torch.softmax(scores, dim=-1)
+            out = torch.matmul(attn, v)  # [B, nh, T, hd]
+
         out = out.transpose(1, 2).contiguous().view(B, T, H)
         out = self.o_proj(out)
         return out
@@ -150,6 +172,7 @@ class ThinkerDecoderLayer(nn.Module):
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             head_dim=head_dim,
+            use_flash_attention=getattr(config, "use_flash_attention", False),
         )
         self.attn_norm = RMSNorm(config.hidden_size)
         
@@ -233,6 +256,7 @@ class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
             max_position_embeddings=thinker_cfg.max_position_embeddings,
             base=config.rope_theta,
         )
+        self.use_flash_attention = getattr(thinker_cfg, "use_flash_attention", False)
 
         # 解析 moe_layer_indices: 例如 "0,2,4" -> {0,2,4}
         moe_layer_set = None

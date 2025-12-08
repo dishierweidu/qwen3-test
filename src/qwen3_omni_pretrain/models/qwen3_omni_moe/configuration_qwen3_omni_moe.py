@@ -24,6 +24,9 @@ class Qwen3OmniMoeThinkerConfig:
     # MoE 负载均衡损失系数（乘到 aux_loss 前）
     moe_aux_loss_coef: float = 0.01
 
+    # 注意力加速：使用 PyTorch SDPA/FlashAttention 内核
+    use_flash_attention: bool = True
+
     # 多模态 backbone 占位
     vision_hidden_size: int = 1152
     audio_hidden_size: int = 1024

@@ -1,8 +1,9 @@
 # src/qwen3_omni_pretrain/training/trainer_thinker.py
 
 import os
+import time
 from dataclasses import dataclass
-from typing import Any, Dict, Union, List
+from typing import Any, Dict, Union, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -34,6 +35,7 @@ from qwen3_omni_pretrain.models.qwen3_omni_moe.modeling_thinker_vision_audio imp
 from qwen3_omni_pretrain.data.datasets.text_dataset import TextJsonlDataset
 from qwen3_omni_pretrain.data.collators import TextCausalLMCollator
 from qwen3_omni_pretrain.training.loop import train_one_epoch, evaluate
+from qwen3_omni_pretrain.training.checkpoint import save_checkpoint, load_checkpoint
 # from qwen3_omni_pretrain.utils.seed import set_seed
 
 
@@ -60,8 +62,11 @@ class TrainerThinkerConfig:
     output_dir: str
     fp16: bool
     bf16: bool
-    seed: int
-    ddp: bool
+    seed: int = 42
+    ddp: bool = False
+    fp8: bool = False
+    int8_optimizer: bool = False
+    resume_from_checkpoint: Optional[str] = None
     
 @dataclass
 class Stage2TrainConfig:
@@ -73,6 +78,8 @@ class Stage2TrainConfig:
     audio_root: str
 
     output_dir: str
+
+    resume_from_checkpoint: Optional[str] = None
 
     num_epochs: int = 1
     batch_size: int = 2
@@ -134,11 +141,14 @@ def build_trainer_config(yaml_path: str) -> TrainerThinkerConfig:
         logging_steps=int(train_cfg.get("logging_steps", 20)),
         eval_steps=int(train_cfg.get("eval_steps", 1000)),
         save_steps=int(train_cfg.get("save_steps", 1000)),
-        output_dir=str(train_cfg["output_dir"]),
+        output_dir=str(train_cfg["output_dir"]) + time.strftime("-%Y%m%d-%H%M%S"),
         fp16=bool(train_cfg.get("fp16", False)),
         bf16=bool(train_cfg.get("bf16", False)),
+        fp8=bool(train_cfg.get("fp8", False)),
+        int8_optimizer=bool(train_cfg.get("int8_optimizer", False)),
         seed=int(train_cfg.get("seed", 42)),
         ddp=bool(train_cfg.get("ddp", False)),
+        resume_from_checkpoint=train_cfg.get("resume_from_checkpoint"),
     )
 
 
@@ -157,6 +167,7 @@ def train_thinker_stage1(
     tokenizer_name_or_path: str = "Qwen/Qwen2.5-7B",
     enable_tensorboard: bool = False,
     log_dir: str = "./runs",
+    resume_from_checkpoint: Optional[str] = None,
 ):
     # 1. 加载配置
     cfg = build_trainer_config(config_path)
@@ -183,6 +194,25 @@ def train_thinker_stage1(
         )
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
+
+        # Precision setup
+        precision_flags = [cfg.fp16, cfg.bf16, getattr(cfg, "fp8", False)]
+        if sum(bool(x) for x in precision_flags) > 1:
+            raise ValueError("Only one of fp16/bf16/fp8 can be enabled at the same time.")
+
+        autocast_dtype = None
+        grad_scaler = None
+        if getattr(cfg, "fp8", False):
+            if not hasattr(torch, "float8_e4m3fn"):
+                raise RuntimeError("fp8 requested but torch.float8_e4m3fn is unavailable in this build.")
+            if device.type != "cuda":
+                raise RuntimeError("fp8 training is only supported on CUDA devices.")
+            autocast_dtype = torch.float8_e4m3fn
+        elif cfg.fp16:
+            autocast_dtype = torch.float16 if device.type == "cuda" else None
+            grad_scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
+        elif cfg.bf16:
+            autocast_dtype = torch.bfloat16 if device.type == "cuda" else None
 
         # 4. 模型配置 & 模型
         model_cfg_dict = load_yaml(cfg.model_config_path)
@@ -255,12 +285,27 @@ def train_thinker_stage1(
                 "weight_decay": 0.0,
             },
         ]
-        optimizer = torch.optim.AdamW(
-            optimizer_grouped_parameters,
-            lr=cfg.learning_rate,
-            betas=(0.9, 0.95),
-            eps=1e-8,
-        )
+        if cfg.int8_optimizer:
+            try:
+                import bitsandbytes as bnb
+            except ImportError as exc:
+                raise ImportError(
+                    "int8_optimizer=True requires bitsandbytes to be installed."
+                ) from exc
+
+            optimizer = bnb.optim.AdamW8bit(
+                optimizer_grouped_parameters,
+                lr=cfg.learning_rate,
+                betas=(0.9, 0.95),
+                eps=1e-8,
+            )
+        else:
+            optimizer = torch.optim.AdamW(
+                optimizer_grouped_parameters,
+                lr=cfg.learning_rate,
+                betas=(0.9, 0.95),
+                eps=1e-8,
+            )
 
         if cfg.max_steps > 0:
             num_training_steps = cfg.max_steps
@@ -275,15 +320,45 @@ def train_thinker_stage1(
             num_training_steps=num_training_steps,
         )
 
-        # 7. 训练循环
+        # 如果提供了 resume 路径，加载训练状态
+        start_epoch = 0
         global_step = 0
+        best_val_loss = float("inf")
+        resume_path = resume_from_checkpoint or cfg.resume_from_checkpoint
+        if resume_path:
+            start_epoch, global_step, best_val_loss = load_checkpoint(
+                resume_path,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=grad_scaler,
+                map_location=device,
+            )
+            if is_main_process():
+                print(
+                    f"Resumed from {resume_path}: start_epoch={start_epoch}, "
+                    f"global_step={global_step}, best_val_loss={best_val_loss}"
+                )
+
+        # 7. 训练循环
         writer = None
         if enable_tensorboard and is_main_process():
-            run_name = f"{cfg.experiment_name}_stage1"
+            run_name = f"{cfg.experiment_name}_stage1" + time.strftime("-%Y%m%d-%H%M%S")
             writer = SummaryWriter(log_dir=os.path.join(log_dir, run_name))
+
+        total_updates = num_training_steps
+        train_start_time = time.time()
+        epoch_start_time = time.time()
+
+        def _fmt_secs(seconds: float) -> str:
+            seconds = max(0.0, float(seconds))
+            mins, secs = divmod(seconds, 60)
+            hrs, mins = divmod(mins, 60)
+            return f"{int(hrs):02d}:{int(mins):02d}:{int(secs):02d}"
 
         def log_step_fn(step: int, loss: float, batch_idx: int, ce_loss=None, aux_loss=None, lr=None):
             nonlocal global_step
+            nonlocal epoch_start_time
             global_step += 1
             # ✅ 只在主进程打 log
             if not is_main_process():
@@ -296,6 +371,25 @@ def train_thinker_stage1(
                     msg += f" aux={aux_loss:.4f}"
                 if lr is not None:
                     msg += f" lr={lr:.6f}"
+
+                # ETA 估算
+                elapsed_total = time.time() - train_start_time
+                eta_total = None
+                if total_updates > 0:
+                    remaining = max(total_updates - global_step, 0)
+                    avg_step = elapsed_total / max(global_step, 1)
+                    eta_total = remaining * avg_step
+
+                elapsed_epoch = time.time() - epoch_start_time
+                progress_epoch = (batch_idx + 1) / max(len(train_loader), 1)
+                eta_epoch = None
+                if progress_epoch > 0:
+                    eta_epoch = (elapsed_epoch / progress_epoch) - elapsed_epoch
+
+                if eta_epoch is not None:
+                    msg += f" eta_epoch={_fmt_secs(eta_epoch)}"
+                if eta_total is not None:
+                    msg += f" eta_total={_fmt_secs(eta_total)}"
                 print(msg)
 
             if writer is not None:
@@ -308,16 +402,17 @@ def train_thinker_stage1(
                     writer.add_scalar("train/lr", lr, global_step)
                 writer.flush()
 
-        best_val_loss = float("inf")
         save_interval = 5
 
-        for epoch in range(cfg.num_epochs):
+        for epoch in range(start_epoch, cfg.num_epochs):
             # DDP sampler 每个 epoch 需要设置一下 epoch，保证 shuffle 不同
             if use_ddp and isinstance(train_sampler, DistributedSampler):
                 train_sampler.set_epoch(epoch)
 
             if is_main_process():
                 print(f"Epoch {epoch} / {cfg.num_epochs - 1}")
+
+            epoch_start_time = time.time()
 
             train_loss = train_one_epoch(
                 model=model,
@@ -326,7 +421,9 @@ def train_thinker_stage1(
                 scheduler=scheduler,
                 device=device,
                 gradient_accumulation_steps=cfg.gradient_accumulation_steps,
-                log_step_fn=log_step_fn
+                log_step_fn=log_step_fn,
+                autocast_dtype=autocast_dtype,
+                grad_scaler=grad_scaler,
             )
             if is_main_process():
                 print(f"Epoch {epoch} train_loss={train_loss:.4f}")
@@ -336,7 +433,7 @@ def train_thinker_stage1(
                     writer.flush()
 
             # ✅ 所有 rank 都跑 evaluate（这样 val_sampler 分片才有意义）
-            val_loss = evaluate(model, val_loader, device)
+            val_loss = evaluate(model, val_loader, device, autocast_dtype=autocast_dtype)
 
             # 只在主进程打印 & 保存
             if is_main_process():
@@ -350,38 +447,53 @@ def train_thinker_stage1(
                 # 取出真正的 HF 模型（DDP 包裹时在 model.module 里）
                 model_to_save = model.module if hasattr(model, "module") else model
 
-                if (epoch + 1) % save_interval == 0:
-                    if val_loss < best_val_loss:
-                        best_val_loss = val_loss
-                        save_path = os.path.join(cfg.output_dir, f"best_epoch{epoch}")
-                        os.makedirs(save_path, exist_ok=True)
-                        print(f"Saving best model to {save_path}")
-                        model_to_save.save_pretrained(save_path, safe_serialization=False)
-                        tokenizer.save_pretrained(save_path)
+                # 保存 best
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    save_path = os.path.join(cfg.output_dir, f"best_epoch{epoch}")
+                    print(f"Saving best model to {save_path}")
+                    save_checkpoint(
+                        checkpoint_dir=save_path,
+                        model=model_to_save,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=grad_scaler,
+                        epoch=epoch + 1,
+                        global_step=global_step,
+                        best_val_loss=best_val_loss,
+                    )
+                    tokenizer.save_pretrained(save_path)
 
-                        if writer is not None:
-                            writer.add_scalar("ckpt/best_val_loss", best_val_loss, global_step)
-                            writer.add_text("ckpt/path", save_path, global_step)
-                            writer.flush()
+                    if writer is not None:
+                        writer.add_scalar("ckpt/best_val_loss", best_val_loss, global_step)
+                        writer.add_text("ckpt/path", save_path, global_step)
+                        writer.flush()
 
-        # 最终再保存一版 latest
-        if is_main_process():
-            final_path = os.path.join(cfg.output_dir, "latest")
-            os.makedirs(final_path, exist_ok=True)
-            print(f"Saving final model to {final_path}")
-            model_to_save = model.module if hasattr(model, "module") else model
-            model_to_save.save_pretrained(final_path, safe_serialization=False)
-            tokenizer.save_pretrained(final_path)
+                # 每个 epoch 保存 latest，便于 resume
+                latest_path = os.path.join(cfg.output_dir, "latest")
+                print(f"Saving latest model to {latest_path}")
+                save_checkpoint(
+                    checkpoint_dir=latest_path,
+                    model=model_to_save,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=grad_scaler,
+                    epoch=epoch + 1,
+                    global_step=global_step,
+                    best_val_loss=best_val_loss,
+                )
+                tokenizer.save_pretrained(latest_path)
 
         if writer is not None:
             writer.close()
 
 
 def train_thinker_stage2(
-    cfg: Stage2TrainConfig,
+    cfg: Union[Stage2TrainConfig, Dict[str, Any]],
     tokenizer_name_or_path: str,
     enable_tensorboard: bool = False,
     log_dir: str = "./runs",
+    resume_from_checkpoint: Optional[str] = None,
 ):
     """
     Stage2: Omni 多模态 AuT 训练入口。
@@ -404,25 +516,54 @@ def train_thinker_stage2(
     val_corpus_path = c["data"]["val_corpus_path"]
     image_root = c["data"]["image_root"]
     audio_root = c["data"]["audio_root"]
-    output_dir = c["train"]["output_dir"]
+    output_dir = c["train"]["output_dir"] + time.strftime("-%Y%m%d-%H%M%S")
+    resume_path = resume_from_checkpoint or c.get("resume_from_checkpoint") or c.get("train", {}).get("resume_from_checkpoint")
 
-    num_epochs = c.get("num_epochs", 1)
-    batch_size = c.get("batch_size", 2)
-    max_seq_length = c.get("max_seq_length", 1024)
-    learning_rate = c.get("learning_rate", 1e-4)
-    weight_decay = c.get("weight_decay", 0.01)
-    warmup_ratio = c.get("warmup_ratio", 0.03)
-    grad_accum = c.get("gradient_accumulation_steps", 1)
-    logging_steps = c.get("logging_steps", 10)
-    num_workers = c.get("num_workers", 4)
+    train_cfg = c.get("train", {}) if isinstance(c, dict) else {}
+
+    num_epochs = c.get("num_epochs", train_cfg.get("num_epochs", 1))
+    batch_size = c.get("batch_size", train_cfg.get("batch_size", 2))
+    max_seq_length = c.get("max_seq_length", train_cfg.get("max_seq_length", 1024))
+    learning_rate = c.get("learning_rate", train_cfg.get("learning_rate", 1e-4))
+    weight_decay = c.get("weight_decay", train_cfg.get("weight_decay", 0.01))
+    warmup_ratio = c.get("warmup_ratio", train_cfg.get("warmup_ratio", 0.03))
+    grad_accum = c.get("gradient_accumulation_steps", train_cfg.get("gradient_accumulation_steps", 1))
+    logging_steps = c.get("logging_steps", train_cfg.get("logging_steps", 10))
+    num_workers = c.get("num_workers", train_cfg.get("num_workers", 4))
+    fp16 = bool(c.get("fp16", train_cfg.get("fp16", False)))
+    bf16 = bool(c.get("bf16", train_cfg.get("bf16", False)))
+    fp8 = bool(c.get("fp8", train_cfg.get("fp8", False)))
+    int8_optimizer = bool(c.get("int8_optimizer", train_cfg.get("int8_optimizer", False)))
     # --- 以上 cfg 处理结束 ---
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
     # 1. tokenizer
+    tokenizer_path = _ensure_local_path(tokenizer_name_or_path, "tokenizer")
     tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_name_or_path,
+        tokenizer_path,
         use_fast=True,
+        local_files_only=True,
     )
+
+    precision_flags = [fp16, bf16, fp8]
+    if sum(bool(x) for x in precision_flags) > 1:
+        raise ValueError("Only one of fp16/bf16/fp8 can be enabled for Stage2.")
+
+    autocast_dtype = None
+    grad_scaler = None
+    if fp8:
+        if not hasattr(torch, "float8_e4m3fn"):
+            raise RuntimeError("fp8 requested but torch.float8_e4m3fn is unavailable in this build.")
+        if device.type != "cuda":
+            raise RuntimeError("fp8 training is only supported on CUDA devices.")
+        autocast_dtype = torch.float8_e4m3fn
+    elif fp16:
+        autocast_dtype = torch.float16 if torch.cuda.is_available() else None
+        grad_scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+    elif bf16:
+        autocast_dtype = torch.bfloat16 if torch.cuda.is_available() else None
 
     # 2. model config
     with open(model_config_path, "r", encoding="utf-8") as f:
@@ -431,8 +572,8 @@ def train_thinker_stage2(
 
     # 3. model
     model = Qwen3OmniMoeThinkerVisionAudioModel(model_config)
-    # ✅ 从 Stage1 ckpt 初始化 Thinker 权重
-    if stage1_init_ckpt:
+    # ✅ 从 Stage1 ckpt 初始化 Thinker 权重（仅在不从已有 stage2 ckpt 恢复时）
+    if stage1_init_ckpt and not resume_path:
         print(f"Loading Stage1 checkpoint from {stage1_init_ckpt}")
         base_thinker = Qwen3OmniMoeThinkerTextModel.from_pretrained(
             stage1_init_ckpt
@@ -442,7 +583,6 @@ def train_thinker_stage2(
         )
         print(f"Loaded Stage1 weights into Thinker. missing={len(missing)}, unexpected={len(unexpected)}")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)  # type: ignore[arg-type]
 
     # 4. dataset & dataloader
@@ -478,9 +618,20 @@ def train_thinker_stage2(
     )
 
     # 5. optimizer & scheduler (简单版)
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=learning_rate, weight_decay=weight_decay
-    )
+    if int8_optimizer:
+        try:
+            import bitsandbytes as bnb
+        except ImportError as exc:
+            raise ImportError(
+                "int8_optimizer=True requires bitsandbytes to be installed."
+            ) from exc
+        optimizer = bnb.optim.AdamW8bit(
+            model.parameters(), lr=learning_rate, weight_decay=weight_decay
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=learning_rate, weight_decay=weight_decay
+        )
 
     total_updates_per_epoch = max(
         1, len(train_loader) // grad_accum
@@ -496,14 +647,41 @@ def train_thinker_stage2(
     os.makedirs(output_dir, exist_ok=True)
     best_val_loss = float("inf")
 
+    # Resume training if checkpoint provided
+    start_epoch = 0
+    global_step = 0
+    if resume_path:
+        start_epoch, global_step, best_val_loss = load_checkpoint(
+            resume_path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=grad_scaler,
+            map_location=device,
+        )
+        print(
+            f"Resumed Stage2 from {resume_path}: start_epoch={start_epoch}, "
+            f"global_step={global_step}, best_val_loss={best_val_loss}"
+        )
+
     global_step = 0
     writer = None
     if enable_tensorboard and is_main_process():
-        run_name = os.path.join(log_dir, f"{c.get('experiment_name', 'thinker_stage2')}_stage2")
+        run_name = os.path.join(log_dir, f"{c.get('experiment_name', 'thinker_stage2')}_stage2" + time.strftime("-%Y%m%d-%H%M%S"))
         writer = SummaryWriter(log_dir=run_name)
+
+    train_start_time = time.time()
+    epoch_start_time = time.time()
+
+    def _fmt_secs(seconds: float) -> str:
+        seconds = max(0.0, float(seconds))
+        mins, secs = divmod(seconds, 60)
+        hrs, mins = divmod(mins, 60)
+        return f"{int(hrs):02d}:{int(mins):02d}:{int(secs):02d}"
 
     def log_step_fn(step: int, loss: float, batch_idx: int, ce_loss=None, aux_loss=None, lr=None):
         nonlocal global_step
+        nonlocal epoch_start_time
         global_step += 1
         if global_step % logging_steps == 0:
             msg = f"[step {global_step}] loss={loss:.4f}"
@@ -513,6 +691,20 @@ def train_thinker_stage2(
                 msg += f" aux={aux_loss:.4f}"
             if lr is not None:
                 msg += f" lr={lr:.6f}"
+
+            elapsed_total = time.time() - train_start_time
+            remaining = max(total_updates - global_step, 0)
+            avg_step = elapsed_total / max(global_step, 1)
+            eta_total = remaining * avg_step
+
+            elapsed_epoch = time.time() - epoch_start_time
+            progress_epoch = (batch_idx + 1) / max(len(train_loader), 1)
+            eta_epoch = (elapsed_epoch / progress_epoch - elapsed_epoch) if progress_epoch > 0 else None
+
+            if eta_epoch is not None:
+                msg += f" eta_epoch={_fmt_secs(eta_epoch)}"
+            if eta_total is not None:
+                msg += f" eta_total={_fmt_secs(eta_total)}"
             print(msg)
 
         if writer is not None:
@@ -525,8 +717,9 @@ def train_thinker_stage2(
                 writer.add_scalar("train/lr", lr, global_step)
             writer.flush()
 
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         print(f"Epoch {epoch} / {num_epochs - 1}")
+        epoch_start_time = time.time()
 
         train_loss = train_one_epoch(
             model=model,
@@ -536,6 +729,8 @@ def train_thinker_stage2(
             device=device,
             gradient_accumulation_steps=grad_accum,
             log_step_fn=log_step_fn,
+            autocast_dtype=autocast_dtype,
+            grad_scaler=grad_scaler,
         )
         print(f"Epoch {epoch} train_loss={train_loss:.4f}")
         if writer is not None:
@@ -546,6 +741,7 @@ def train_thinker_stage2(
             model=model,
             dataloader=val_loader,
             device=device,
+            autocast_dtype=autocast_dtype,
         )
         print(f"Epoch {epoch} val_loss={val_loss:.4f}")
         if writer is not None:
@@ -557,9 +753,17 @@ def train_thinker_stage2(
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             save_path = os.path.join(output_dir, f"best_epoch{epoch}")
-            os.makedirs(save_path, exist_ok=True)
             print(f"Saving best model to {save_path}")
-            model.save_pretrained(save_path, safe_serialization=False)
+            save_checkpoint(
+                checkpoint_dir=save_path,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=grad_scaler,
+                epoch=epoch + 1,
+                global_step=global_step,
+                best_val_loss=best_val_loss,
+            )
             tokenizer.save_pretrained(save_path)
 
             if writer is not None:
@@ -569,9 +773,17 @@ def train_thinker_stage2(
 
         # save latest
         latest_path = os.path.join(output_dir, "latest")
-        os.makedirs(latest_path, exist_ok=True)
         print(f"Saving latest model to {latest_path}")
-        model.save_pretrained(latest_path, safe_serialization=False)
+        save_checkpoint(
+            checkpoint_dir=latest_path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=grad_scaler,
+            epoch=epoch + 1,
+            global_step=global_step,
+            best_val_loss=best_val_loss,
+        )
         tokenizer.save_pretrained(latest_path)
 
     if writer is not None:
