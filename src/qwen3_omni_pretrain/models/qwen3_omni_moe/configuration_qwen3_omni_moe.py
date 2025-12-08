@@ -30,6 +30,12 @@ class Qwen3OmniMoeThinkerConfig:
     # 多模态 backbone 占位
     vision_hidden_size: int = 1152
     audio_hidden_size: int = 1024
+    
+    # --- NEW: SDPA output gating flags ---
+    # True → 使用 G1 位置的 head-wise gate
+    headwise_attn_output_gate: bool = False
+    # 可选：elementwise gate（更细粒度，但更费参数/显存）
+    elementwise_attn_output_gate: bool = False
 
 
 @dataclass

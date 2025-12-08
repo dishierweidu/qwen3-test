@@ -78,19 +78,69 @@ class RotaryEmbedding(nn.Module):
 
 
 class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, num_kv_heads: int, head_dim: int, use_flash_attention: bool = False):
+    def __init__(self, hidden_size: int, num_heads: int, num_kv_heads: int, 
+                 head_dim: int, 
+                 use_flash_attention: bool = False,
+                 headwise_attn_output_gate: bool = False,
+                 elementwise_attn_output_gate: bool = False):
         super().__init__()
-        assert hidden_size % num_heads == 0
+        
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.use_flash_attention = use_flash_attention
 
-        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        # 检查维度合法性
+        if (self.head_dim * self.num_heads) != self.hidden_size:
+            raise ValueError(
+                f"hidden_size must be divisible by num_heads "
+                f"(got hidden_size={self.hidden_size}, num_heads={self.num_heads}, "
+                f"head_dim={self.head_dim})"
+            )
+        if self.num_kv_heads <= 0 or (self.num_heads % self.num_kv_heads) != 0:
+            raise ValueError(
+                f"num_heads must be a multiple of num_kv_heads for GQA/MQA "
+                f"(got num_heads={self.num_heads}, num_kv_heads={self.num_kv_heads})"
+            )
+
+        # Q 全头；K/V 只用 num_kv_heads 头 → 真正利用 GQA
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+
+        # 输出还是 full hidden_size
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        
+        # --- NEW: SDPA output gate G1 ---
+        self.headwise_attn_output_gate = headwise_attn_output_gate
+        self.elementwise_attn_output_gate = elementwise_attn_output_gate
+        self.use_output_gate = headwise_attn_output_gate or elementwise_attn_output_gate
+
+        if self.headwise_attn_output_gate:
+            # 基于输入 token → 每个 head 一个标量 gate
+            self.gate_proj = nn.Linear(hidden_size, num_heads, bias=True)
+        elif self.elementwise_attn_output_gate:
+            # 基于输入 token → 每个 head、每个 channel 一个 gate
+            self.gate_proj = nn.Linear(hidden_size, hidden_size, bias=True)
+        else:
+            self.gate_proj = None
+            
+    @staticmethod
+    def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+        """
+        将 [B, num_kv_heads, T, head_dim] 复制成 [B, num_heads, T, head_dim]
+        参考 Qwen2 / LLaMA 的 repeat_kv 实现。:contentReference[oaicite:2]{index=2}
+        """
+        batch, num_kv_heads, slen, head_dim = hidden_states.shape
+        if n_rep == 1:
+            return hidden_states
+        # [B, num_kv_heads, 1, T, D] → expand → [B, num_kv_heads, n_rep, T, D]
+        hidden_states = hidden_states[:, :, None, :, :].expand(
+            batch, num_kv_heads, n_rep, slen, head_dim
+        )
+        # 合并 kv_head 和 group 维度
+        return hidden_states.reshape(batch, num_kv_heads * n_rep, slen, head_dim)
 
     def forward(
         self,
@@ -99,21 +149,49 @@ class MultiHeadSelfAttention(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         rotary_emb: Optional[RotaryEmbedding] = None,
     ) -> torch.Tensor:
-        B, T, H = hidden_states.size()
+        B, T, _ = hidden_states.size()
+        
+        # --- NEW: compute query-dependent gate from pre-norm hidden_states ---
+        gate = None
+        if self.use_output_gate:
+            if self.headwise_attn_output_gate:
+                # [B, T, num_heads] -> [B, num_heads, T, 1]
+                gate_logits = self.gate_proj(hidden_states)
+                gate = torch.sigmoid(gate_logits).view(B, T, self.num_heads, 1)
+                gate = gate.transpose(1, 2)  # [B, nh, T, 1]
+            else:
+                # elementwise: [B, T, H] -> [B, nh, T, hd]
+                gate_logits = self.gate_proj(hidden_states)
+                gate = torch.sigmoid(
+                    gate_logits.view(B, T, self.num_heads, self.head_dim)
+                )
+                gate = gate.transpose(1, 2)  # [B, nh, T, hd]
 
+        # 1) 线性映射得到 Q/K/V
+        # Q: [B, T, nh * hd] K/V: [B, T, n_kv * hd]
         q = self.q_proj(hidden_states)  # [B, T, H]
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
 
-        q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)  # [B, nh, T, hd]
-        k = k.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        # 2) reshape 成多头形式
+        # Q: [B, nh, T, hd] K/V: [B, n_kv, T, hd]
+        q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
+        # 3) RoPE 位置编码（先在 n_kv heads 上加，再 repeat）
         if rotary_emb is not None and position_ids is not None:
             # position_ids: [B, T]
             q = rotary_emb(q, position_ids)  # [B, nh, T, hd]
             k = rotary_emb(k, position_ids)
 
+        # 4) 如果 num_kv_heads < num_heads，则复制 KV 以实现 GQA/MQA
+        if self.num_kv_heads != self.num_heads:
+            n_rep = self.num_heads // self.num_kv_heads
+            k = self._repeat_kv(k, n_rep)  # [B, nh, T, hd]
+            v = self._repeat_kv(v, n_rep)  # [B, nh, T, hd]
+            
+        # 5) SDPA/FlashAttention
         if self.use_flash_attention:
             # 使用 PyTorch SDPA/FlashAttention 内核（自动选择最佳实现）
             attn_mask = attention_mask  # broadcast: [B, 1, 1, T] -> [B, nh, T, T]
@@ -141,9 +219,14 @@ class MultiHeadSelfAttention(nn.Module):
 
             attn = torch.softmax(scores, dim=-1)
             out = torch.matmul(attn, v)  # [B, nh, T, hd]
+            
+        # --- NEW: apply gate at SDPA output (G1 position) ---
+        if gate is not None:
+            out = out * gate  # 形状兼容自动广播
 
-        out = out.transpose(1, 2).contiguous().view(B, T, H)
-        out = self.o_proj(out)
+        # 6) 合并 heads + 输出投影
+        out = out.transpose(1, 2).contiguous().view(B, T, self.num_heads * self.head_dim)
+        out = self.o_proj(out) # [B, T, hidden_size]
         return out
 
 
@@ -173,6 +256,12 @@ class ThinkerDecoderLayer(nn.Module):
             num_kv_heads=config.num_key_value_heads,
             head_dim=head_dim,
             use_flash_attention=getattr(config, "use_flash_attention", False),
+            headwise_attn_output_gate=getattr(
+                config, "headwise_attn_output_gate", False
+            ),
+            elementwise_attn_output_gate=getattr(
+                config, "elementwise_attn_output_gate", False
+            ),
         )
         self.attn_norm = RMSNorm(config.hidden_size)
         
