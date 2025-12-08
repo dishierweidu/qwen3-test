@@ -14,8 +14,8 @@ data:
   val_corpus_paths:
     - "data/corpus/val_text.jsonl"
   max_seq_length: 2048
-  num_workers: 1
-  batch_size: 1           # per-GPU batch size
+  num_workers: 8
+  batch_size: 2           # per-GPU batch size
   shuffle: false
 
 train:
@@ -31,5 +31,7 @@ train:
   output_dir: "outputs/qwen3_omni_stage1_text_7b"
   fp16: false
   bf16: true
+  fp8: false
+  int8_optimizer: false
   seed: 42
   ddp: true              # 先做单卡/单机，后面再加 FSDP / DeepSpeed

@@ -56,6 +56,7 @@ def train_one_epoch(
     log_step_fn: Optional[Callable[..., None]] = None,
     autocast_dtype: Optional[torch.dtype] = None,
     grad_scaler: Optional[torch.cuda.amp.GradScaler] = None,
+    after_step_fn: Optional[Callable[..., None]] = None,
 ) -> float:
     """
     通用训练循环：
@@ -160,9 +161,10 @@ def train_one_epoch(
                 total_ce += ce_loss.detach().item()
             if isinstance(aux_loss, torch.Tensor):
                 total_aux += aux_loss.detach().item()
+                
+            current_lr = optimizer.param_groups[0].get("lr", None) if optimizer.param_groups else None
 
             if log_step_fn is not None:
-                current_lr = optimizer.param_groups[0].get("lr", None) if optimizer.param_groups else None
                 log_step_fn(
                     step=num_updates,
                     loss=true_loss,
@@ -171,6 +173,18 @@ def train_one_epoch(
                     aux_loss=aux_loss.detach().item() if isinstance(aux_loss, torch.Tensor) else None,
                     lr=current_lr,
                 )
+            
+            if after_step_fn is not None:
+                after_step_fn(
+                    step=num_updates,
+                    loss=true_loss,
+                    batch_idx=batch_idx,
+                    ce_loss=ce_loss.detach().item() if isinstance(ce_loss, torch.Tensor) else None,
+                    aux_loss=aux_loss.detach().item() if isinstance(aux_loss, torch.Tensor) else None,
+                    lr=current_lr,
+                    model=model,
+                )
+
 
     if num_updates == 0:
         return float("nan")

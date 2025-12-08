@@ -346,6 +346,21 @@ def train_thinker_stage1(
             run_name = f"{cfg.experiment_name}_stage1" + time.strftime("-%Y%m%d-%H%M%S")
             writer = SummaryWriter(log_dir=os.path.join(log_dir, run_name))
 
+        best_val_loss = float("inf")
+
+        def save_checkpoint(tag: str):
+            # 主进程保存即可，避免并发写
+            if not is_main_process():
+                return
+            save_path = os.path.join(cfg.output_dir, tag)
+            os.makedirs(save_path, exist_ok=True)
+            model_to_save = model.module if hasattr(model, "module") else model
+            model_to_save.save_pretrained(save_path, safe_serialization=False)
+            tokenizer.save_pretrained(save_path)
+            if writer is not None:
+                writer.add_text("ckpt/path", save_path, global_step)
+                writer.flush()
+        
         total_updates = num_training_steps
         train_start_time = time.time()
         epoch_start_time = time.time()
@@ -402,91 +417,94 @@ def train_thinker_stage1(
                     writer.add_scalar("train/lr", lr, global_step)
                 writer.flush()
 
-        save_interval = 5
+        def after_step_fn(step: int, loss: float, batch_idx: int, ce_loss=None, aux_loss=None, lr=None, model=None):
+            nonlocal best_val_loss, global_step
+            global_step = step
 
-        for epoch in range(start_epoch, cfg.num_epochs):
-            # DDP sampler 每个 epoch 需要设置一下 epoch，保证 shuffle 不同
-            if use_ddp and isinstance(train_sampler, DistributedSampler):
-                train_sampler.set_epoch(epoch)
+            # step-based checkpointing
+            if cfg.save_steps > 0 and step % cfg.save_steps == 0:
+                save_checkpoint(f"step_{step}")
 
-            if is_main_process():
-                print(f"Epoch {epoch} / {cfg.num_epochs - 1}")
-
-            epoch_start_time = time.time()
-
-            train_loss = train_one_epoch(
-                model=model,
-                dataloader=train_loader,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                device=device,
-                gradient_accumulation_steps=cfg.gradient_accumulation_steps,
-                log_step_fn=log_step_fn,
-                autocast_dtype=autocast_dtype,
-                grad_scaler=grad_scaler,
-            )
-            if is_main_process():
-                print(f"Epoch {epoch} train_loss={train_loss:.4f}")
-
-                if writer is not None:
-                    writer.add_scalar("epoch/train_loss", train_loss, global_step)
-                    writer.flush()
-
-            # ✅ 所有 rank 都跑 evaluate（这样 val_sampler 分片才有意义）
-            val_loss = evaluate(model, val_loader, device, autocast_dtype=autocast_dtype)
-
-            # 只在主进程打印 & 保存
-            if is_main_process():
-                print(f"Epoch {epoch} val_loss={val_loss:.4f}")
-
-                if writer is not None:
-                    writer.add_scalar("epoch/val_loss", val_loss, global_step)
-                    writer.add_scalar("epoch/epoch", epoch, global_step)
-                    writer.flush()
-
-                # 取出真正的 HF 模型（DDP 包裹时在 model.module 里）
-                model_to_save = model.module if hasattr(model, "module") else model
-
-                # 保存 best
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    save_path = os.path.join(cfg.output_dir, f"best_epoch{epoch}")
-                    print(f"Saving best model to {save_path}")
-                    save_checkpoint(
-                        checkpoint_dir=save_path,
-                        model=model_to_save,
-                        optimizer=optimizer,
-                        scheduler=scheduler,
-                        scaler=grad_scaler,
-                        epoch=epoch + 1,
-                        global_step=global_step,
-                        best_val_loss=best_val_loss,
-                    )
-                    tokenizer.save_pretrained(save_path)
+            # optional step-based evaluation
+            if cfg.eval_steps > 0 and step % cfg.eval_steps == 0:
+                if is_main_process():
+                    val_loss = evaluate(model, val_loader, device)
+                    model.train()
+                    print(f"[step {step}] val_loss={val_loss:.4f}")
 
                     if writer is not None:
-                        writer.add_scalar("ckpt/best_val_loss", best_val_loss, global_step)
-                        writer.add_text("ckpt/path", save_path, global_step)
+                        writer.add_scalar("step/val_loss", val_loss, step)
                         writer.flush()
 
-                # 每个 epoch 保存 latest，便于 resume
-                latest_path = os.path.join(cfg.output_dir, "latest")
-                print(f"Saving latest model to {latest_path}")
-                save_checkpoint(
-                    checkpoint_dir=latest_path,
-                    model=model_to_save,
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        save_checkpoint(f"best_step_{step}")
+
+        try:
+            for epoch in range(cfg.num_epochs):
+                # DDP sampler 每个 epoch 需要设置一下 epoch，保证 shuffle 不同
+                if use_ddp and isinstance(train_sampler, DistributedSampler):
+                    train_sampler.set_epoch(epoch)
+
+                if is_main_process():
+                    print(f"Epoch {epoch} / {cfg.num_epochs - 1}")
+
+                train_loss = train_one_epoch(
+                    model=model,
+                    dataloader=train_loader,
                     optimizer=optimizer,
                     scheduler=scheduler,
-                    scaler=grad_scaler,
-                    epoch=epoch + 1,
-                    global_step=global_step,
-                    best_val_loss=best_val_loss,
+                    device=device,
+                    gradient_accumulation_steps=cfg.gradient_accumulation_steps,
+                    log_step_fn=log_step_fn,
+                    autocast_dtype=autocast_dtype,
+                    grad_scaler=grad_scaler,
+                    after_step_fn=after_step_fn,
                 )
-                tokenizer.save_pretrained(latest_path)
+                if is_main_process():
+                    print(f"Epoch {epoch} train_loss={train_loss:.4f}")
 
-        if writer is not None:
-            writer.close()
+                    if writer is not None:
+                        writer.add_scalar("epoch/train_loss", train_loss, global_step)
+                        writer.flush()
 
+                # ✅ 所有 rank 都跑 evaluate（这样 val_sampler 分片才有意义）
+                val_loss = evaluate(model, val_loader, device)
+
+                # 只在主进程打印 & 保存
+                if is_main_process():
+                    print(f"Epoch {epoch} val_loss={val_loss:.4f}")
+
+                    if writer is not None:
+                        writer.add_scalar("epoch/val_loss", val_loss, global_step)
+                        writer.add_scalar("epoch/epoch", epoch, global_step)
+                        writer.flush()
+
+                    # 取出真正的 HF 模型（DDP 包裹时在 model.module 里）
+                    model_to_save = model.module if hasattr(model, "module") else model
+
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        save_checkpoint(f"best_epoch{epoch}")
+
+            # 最终再保存一版 latest
+            if is_main_process():
+                final_path = os.path.join(cfg.output_dir, "latest")
+                os.makedirs(final_path, exist_ok=True)
+                print(f"Saving final model to {final_path}")
+                model_to_save = model.module if hasattr(model, "module") else model
+                model_to_save.save_pretrained(final_path, safe_serialization=False)
+                tokenizer.save_pretrained(final_path)
+
+        except KeyboardInterrupt:
+            # 训练被打断时尽量保留一个可用 ckpt
+            if is_main_process():
+                print("KeyboardInterrupt received, saving emergency checkpoint...")
+                save_checkpoint(f"interrupted_step_{global_step}")
+            raise
+        finally:
+            if writer is not None:
+                writer.close()
 
 def train_thinker_stage2(
     cfg: Union[Stage2TrainConfig, Dict[str, Any]],
