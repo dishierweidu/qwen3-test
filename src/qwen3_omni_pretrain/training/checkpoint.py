@@ -2,6 +2,7 @@ import os
 from typing import Optional, Tuple
 
 import torch
+from transformers.modeling_utils import load_sharded_checkpoint
 
 
 def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
@@ -53,11 +54,15 @@ def load_checkpoint(
 	If trainer_state is missing, defaults to (0, 0, inf).
 	"""
 	model_path_bin = os.path.join(checkpoint_dir, "pytorch_model.bin")
+	model_index = os.path.join(checkpoint_dir, "pytorch_model.bin.index.json")
 	if os.path.exists(model_path_bin):
 		state_dict = torch.load(model_path_bin, map_location=map_location)
 		_unwrap_model(model).load_state_dict(state_dict, strict=False)
+	elif os.path.exists(model_index):
+		# HF sharded checkpoint
+		load_sharded_checkpoint(_unwrap_model(model), checkpoint_dir, strict=False)
 	else:
-		raise FileNotFoundError(f"No pytorch_model.bin under {checkpoint_dir}")
+		raise FileNotFoundError(f"No pytorch_model.bin or shard index under {checkpoint_dir}")
 
 	trainer_state_path = os.path.join(checkpoint_dir, "trainer_state.pt")
 	if os.path.exists(trainer_state_path):

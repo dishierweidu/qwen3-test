@@ -22,12 +22,41 @@ python -m qwen3_omni_pretrain.cli_train_thinker  --config configs/train/stage1_t
 
 python -m qwen3_omni_pretrain.cli_train_thinker   --stage stage1   --config configs/train/stage1_text_only.yaml   --tokenizer_name_or_path Qwen/Qwen2.5-7B --tensorboard --log_dir runs/
 
+python -m qwen3_omni_pretrain.cli_train_thinker   --stage stage1   --config configs/train/stage1_text_only.yaml   --tokenizer_name_or_path src/tokenizer/Qwen3/ --tensorboard --log_dir runs/ --resume_from_checkpoint outputs/omni_stage1_text_7b-20251209-003201/step_15000/
+
 torchrun --nproc_per_node=8 -m qwen3_omni_pretrain.cli_train_thinker \
     --stage stage1 \
     --config configs/train/stage1_text_only.yaml \
     --tokenizer_name_or_path Qwen/Qwen2.5-7B
 
 tensorboard --logdir runs/
+
+# quick inference sanity check
+python -m qwen3_omni_pretrain.cli_infer_thinker \
+    --stage stage1 \
+    --checkpoint outputs/qwen3_omni_stage1_text_7b-20251209-003201/best_step_14000 \
+    --jsonl data/corpus/val_text.jsonl \
+    --max_new_tokens 64
+
+python -m qwen3_omni_pretrain.cli_infer_thinker \
+  --stage stage1 \
+  --checkpoint outputs/qwen3_omni_stage1_text_7b-20251209-003201/best_step_14000 \
+  --chat \
+  --max_new_tokens 64
+
+python -m qwen3_omni_pretrain.cli_infer_thinker \
+    --stage stage2 \
+    --checkpoint outputs/20251208-184741/best_step_10000 \
+    --jsonl data/corpus/stage2_omni_val.jsonl \
+    --image_root data \
+    --audio_root data \
+    --max_new_tokens 64
+
+python -m qwen3_omni_pretrain.cli_infer_thinker \
+  --stage stage2 \
+  --checkpoint outputs/20251208-184741/best_step_10000 \
+  --chat \
+  --max_new_tokens 64
 
 git config --global user.email eliot.zhao@finnox.cn
 git config --global user.name "Eliot Zhao"

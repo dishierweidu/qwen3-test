@@ -1,7 +1,7 @@
-# 核心深度学习 & Transformers
-torch>=2.2.0
-torchvision>=0.15.0
-torchaudio>=2.2.0
+# 核心深度学习 & Transformers extra-index-url https://download.pytorch.org/whl/cu121
+torch>=2.6.0
+torchvision>=0.21.0
+torchaudio>=2.6.0
 transformers>=4.45.0
 tensorboard>=2.16.0
 
