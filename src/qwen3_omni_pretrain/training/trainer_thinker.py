@@ -346,16 +346,25 @@ def train_thinker_stage1(
             run_name = f"{cfg.experiment_name}_stage1" + time.strftime("-%Y%m%d-%H%M%S")
             writer = SummaryWriter(log_dir=os.path.join(log_dir, run_name))
 
-        best_val_loss = float("inf")
+        # 记录当前 epoch（用于 checkpoint 元数据）
+        current_epoch = start_epoch
 
-        def save_checkpoint(tag: str):
-            # 主进程保存即可，避免并发写
+        def save_full_checkpoint(tag: str):
+            """Persist full trainer state (model/opt/scheduler/scaler/step)."""
             if not is_main_process():
                 return
+
             save_path = os.path.join(cfg.output_dir, tag)
-            os.makedirs(save_path, exist_ok=True)
-            model_to_save = model.module if hasattr(model, "module") else model
-            model_to_save.save_pretrained(save_path, safe_serialization=False)
+            save_checkpoint(
+                checkpoint_dir=save_path,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=grad_scaler,
+                epoch=current_epoch,
+                global_step=global_step,
+                best_val_loss=best_val_loss,
+            )
             tokenizer.save_pretrained(save_path)
             if writer is not None:
                 writer.add_text("ckpt/path", save_path, global_step)
@@ -371,10 +380,12 @@ def train_thinker_stage1(
             hrs, mins = divmod(mins, 60)
             return f"{int(hrs):02d}:{int(mins):02d}:{int(secs):02d}"
 
+        step_offset = global_step
+
         def log_step_fn(step: int, loss: float, batch_idx: int, ce_loss=None, aux_loss=None, lr=None):
             nonlocal global_step
             nonlocal epoch_start_time
-            global_step += 1
+            global_step = step_offset + step
             # ✅ 只在主进程打 log
             if not is_main_process():
                 return
@@ -419,11 +430,11 @@ def train_thinker_stage1(
 
         def after_step_fn(step: int, loss: float, batch_idx: int, ce_loss=None, aux_loss=None, lr=None, model=None):
             nonlocal best_val_loss, global_step
-            global_step = step
+            global_step = step_offset + step
 
             # step-based checkpointing
             if cfg.save_steps > 0 and step % cfg.save_steps == 0:
-                save_checkpoint(f"step_{step}")
+                save_full_checkpoint(f"step_{global_step}")
 
             # optional step-based evaluation
             if cfg.eval_steps > 0 and step % cfg.eval_steps == 0:
@@ -438,10 +449,12 @@ def train_thinker_stage1(
 
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
-                        save_checkpoint(f"best_step_{step}")
+                        save_full_checkpoint(f"best_step_{global_step}")
 
         try:
-            for epoch in range(cfg.num_epochs):
+            for epoch in range(start_epoch, cfg.num_epochs):
+                current_epoch = epoch
+                step_offset = global_step
                 # DDP sampler 每个 epoch 需要设置一下 epoch，保证 shuffle 不同
                 if use_ddp and isinstance(train_sampler, DistributedSampler):
                     train_sampler.set_epoch(epoch)
@@ -485,22 +498,29 @@ def train_thinker_stage1(
 
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
-                        save_checkpoint(f"best_epoch{epoch}")
+                        save_full_checkpoint(f"best_epoch{epoch}")
 
             # 最终再保存一版 latest
             if is_main_process():
                 final_path = os.path.join(cfg.output_dir, "latest")
-                os.makedirs(final_path, exist_ok=True)
                 print(f"Saving final model to {final_path}")
-                model_to_save = model.module if hasattr(model, "module") else model
-                model_to_save.save_pretrained(final_path, safe_serialization=False)
+                save_checkpoint(
+                    checkpoint_dir=final_path,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=grad_scaler,
+                    epoch=current_epoch + 1,
+                    global_step=global_step,
+                    best_val_loss=best_val_loss,
+                )
                 tokenizer.save_pretrained(final_path)
 
         except KeyboardInterrupt:
             # 训练被打断时尽量保留一个可用 ckpt
             if is_main_process():
                 print("KeyboardInterrupt received, saving emergency checkpoint...")
-                save_checkpoint(f"interrupted_step_{global_step}")
+                save_full_checkpoint(f"interrupted_step_{global_step}")
             raise
         finally:
             if writer is not None:
@@ -682,7 +702,6 @@ def train_thinker_stage2(
             f"global_step={global_step}, best_val_loss={best_val_loss}"
         )
 
-    global_step = 0
     writer = None
     if enable_tensorboard and is_main_process():
         run_name = os.path.join(log_dir, f"{c.get('experiment_name', 'thinker_stage2')}_stage2" + time.strftime("-%Y%m%d-%H%M%S"))
@@ -690,6 +709,7 @@ def train_thinker_stage2(
 
     train_start_time = time.time()
     epoch_start_time = time.time()
+    step_offset = global_step
 
     def _fmt_secs(seconds: float) -> str:
         seconds = max(0.0, float(seconds))
@@ -700,7 +720,7 @@ def train_thinker_stage2(
     def log_step_fn(step: int, loss: float, batch_idx: int, ce_loss=None, aux_loss=None, lr=None):
         nonlocal global_step
         nonlocal epoch_start_time
-        global_step += 1
+        global_step = step_offset + step
         if global_step % logging_steps == 0:
             msg = f"[step {global_step}] loss={loss:.4f}"
             if ce_loss is not None:
@@ -738,6 +758,7 @@ def train_thinker_stage2(
     for epoch in range(start_epoch, num_epochs):
         print(f"Epoch {epoch} / {num_epochs - 1}")
         epoch_start_time = time.time()
+        step_offset = global_step
 
         train_loss = train_one_epoch(
             model=model,

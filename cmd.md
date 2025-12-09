@@ -24,6 +24,8 @@ python -m qwen3_omni_pretrain.cli_train_thinker   --stage stage1   --config conf
 
 python -m qwen3_omni_pretrain.cli_train_thinker   --stage stage1   --config configs/train/stage1_text_only.yaml   --tokenizer_name_or_path src/tokenizer/Qwen3/ --tensorboard --log_dir runs/ --resume_from_checkpoint outputs/omni_stage1_text_7b-20251209-003201/step_15000/
 
+# resume_from_checkpoint can point to any step_*/best_*/latest folder saved by trainer_thinker; it now restores optimizer/scheduler/scaler/global_step so training continues from the recorded step/epoch.
+
 torchrun --nproc_per_node=8 -m qwen3_omni_pretrain.cli_train_thinker \
     --stage stage1 \
     --config configs/train/stage1_text_only.yaml \
