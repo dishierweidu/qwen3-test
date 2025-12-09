@@ -36,7 +36,27 @@ class Qwen3OmniMoeThinkerConfig:
     headwise_attn_output_gate: bool = False
     # 可选：elementwise gate（更细粒度，但更费参数/显存）
     elementwise_attn_output_gate: bool = False
+    
+    # ---- Hybrid Attention / DeltaNet 相关配置 ----
+    # 是否启用 GatedDeltaNet + 3:1 混合注意力
+    use_deltanet: bool = False
 
+    # 显式指定哪些层使用 DeltaNet，例如 "0,1,2,4,5,6"；为空则按默认 3:1 模式
+    deltanet_layer_indices: Optional[str] = None
+
+    # 默认 block 类型（单层兜底），一般保持 "attn"，由构造器覆盖为每层 block_type
+    block_type: str = "attn"
+
+    # DeltaNet 前的因果 Conv1d 卷积核大小（奇数），例如 3/5
+    deltanet_kernel_size: int = 3
+    # 兼容旧字段名（如果外部传了 deltanet_conv_kernel_size，会在上层 __init__ 里转存）
+    deltanet_conv_kernel_size: Optional[int] = None
+
+    # DeltaNet 内部时间尺度门控的投影维度，以 head 为单位
+    deltanet_num_heads: int = 24  # 默认 = num_attention_heads
+
+    # 线性注意力的 chunk size（0 表示不按 chunk 切，纯 Python 循环版）
+    deltanet_chunk_size: int = 0
 
 @dataclass
 class Qwen3OmniMoeTalkerConfig:
@@ -86,6 +106,9 @@ class Qwen3OmniMoeConfig(PretrainedConfig):
         video_token_id: Optional[int] = None,
         audio_start_token_id: Optional[int] = None,
         audio_end_token_id: Optional[int] = None,
+        # Optional top-level gate flags (will be routed into thinker_config)
+        headwise_attn_output_gate: Optional[bool] = None,
+        elementwise_attn_output_gate: Optional[bool] = None,
         # 子配置（可以直接传 dict）
         thinker_config: Optional[Dict[str, Any]] = None,
         talker_config: Optional[Dict[str, Any]] = None,
@@ -140,11 +163,34 @@ class Qwen3OmniMoeConfig(PretrainedConfig):
             else (code2wav_config or Qwen3OmniMoeCode2WavConfig())
         )
 
+        # --- SDPA output gating flags ---
+        # Allow specifying at top-level (for backward compatibility) but keep
+        # thinker_config as the single source of truth.
+        if headwise_attn_output_gate is not None:
+            self.thinker_config.headwise_attn_output_gate = bool(headwise_attn_output_gate)
+        if elementwise_attn_output_gate is not None:
+            self.thinker_config.elementwise_attn_output_gate = bool(elementwise_attn_output_gate)
+
+        # ---- DeltaNet 兼容性处理：支持旧键 deltanet_conv_kernel_size ----
+        if getattr(self.thinker_config, "deltanet_kernel_size", None) is None:
+            legacy_kernel = getattr(self.thinker_config, "deltanet_conv_kernel_size", None)
+            if legacy_kernel is not None:
+                self.thinker_config.deltanet_kernel_size = int(legacy_kernel)
+        # 清理 None，保证后续 getattr 有默认值
+        if getattr(self.thinker_config, "deltanet_kernel_size", None) is None:
+            self.thinker_config.deltanet_kernel_size = 3
+
+        self.headwise_attn_output_gate = self.thinker_config.headwise_attn_output_gate
+        self.elementwise_attn_output_gate = self.thinker_config.elementwise_attn_output_gate
+
     def to_dict(self):
         # 确保保存到磁盘时，子配置能转成可 JSON 序列化的 dict
         output = super().to_dict()
         # 显式保留 RoPE 配置，避免序列化时丢失（resume 时要用到）
         output["rope_partial_factor"] = getattr(self, "rope_partial_factor", 1.0)
+        # 方便阅读/调试，也同步保存顶层 gate 标记
+        output["headwise_attn_output_gate"] = self.headwise_attn_output_gate
+        output["elementwise_attn_output_gate"] = self.elementwise_attn_output_gate
         output["thinker_config"] = self.thinker_config.__dict__
         output["talker_config"] = self.talker_config.__dict__
         output["code2wav_config"] = self.code2wav_config.__dict__

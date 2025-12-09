@@ -299,6 +299,192 @@ class MultiHeadSelfAttention(nn.Module):
         out = self.o_proj(out) # [B, T, hidden_size]
         return out
 
+class CausalConv1d(nn.Module):
+    """
+    一维因果卷积：
+      - 输入: [B, T, H]
+      - 输出: [B, T, H]
+    只看当前及之前的 token（左填充）。
+    """
+
+    def __init__(self, hidden_size: int, kernel_size: int = 3, dilation: int = 1):
+        super().__init__()
+        assert kernel_size > 0 and kernel_size % 2 == 1, "kernel_size 必须为正奇数"
+        self.hidden_size = hidden_size
+        self.kernel_size = kernel_size
+        self.dilation = dilation
+
+        # Conv1d 输入 [B, C, T]，这里 C=hidden_size
+        self.conv = nn.Conv1d(
+            in_channels=hidden_size,
+            out_channels=hidden_size,
+            kernel_size=kernel_size,
+            dilation=dilation,
+            bias=True,
+        )
+
+        # 左填充长度 = (kernel_size - 1) * dilation
+        self.pad = (kernel_size - 1) * dilation
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B, T, H]
+        """
+        bsz, seq_len, hidden = x.size()
+        assert hidden == self.hidden_size
+
+        # [B, T, H] -> [B, H, T]
+        x = x.transpose(1, 2)
+        # 只在左侧 padding，保持因果性
+        x = F.pad(x, (self.pad, 0))
+        x = self.conv(x)  # [B, H, T]
+        x = x.transpose(1, 2)  # [B, T, H]
+        return x
+    
+class GatedDeltaNetAttention(nn.Module):
+    """
+    简化版 Gated DeltaNet：
+      - 前端 CausalConv1d 捕捉 N-gram
+      - 线性投影到 Q/V（这里简单不用 K）
+      - 使用 per-head 时间尺度门控 (A_log, dt_bias)
+      - 通过逐步更新“状态向量” state_t 得到输出
+
+    注意：
+      - 这里的实现是结构/接口对齐版，便于后续替换为 fused kernel。
+      - 当前版本时间复杂度 O(B * H * T * D)，适合先在中小模型上验证。
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        head_dim: int,
+        conv_kernel_size: int = 3,
+        num_heads_for_dt: Optional[int] = None,
+        chunk_size: int = 0,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.chunk_size = chunk_size
+
+        if (self.head_dim * self.num_heads) != self.hidden_size:
+            raise ValueError(
+                f"[GatedDeltaNet] hidden_size must be divisible by num_heads "
+                f"(got hidden_size={self.hidden_size}, num_heads={self.num_heads}, "
+                f"head_dim={self.head_dim})"
+            )
+
+        # 1) 前端因果卷积
+        self.causal_conv = CausalConv1d(
+            hidden_size=hidden_size,
+            kernel_size=conv_kernel_size,
+        )
+
+        # 2) Q / V 投影（这里用 num_heads；后续可以扩展为 QK/V 不同 head 数）
+        self.q_proj = nn.Linear(hidden_size, num_heads * head_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_size, num_heads * head_dim, bias=False)
+
+        # 3) 时间尺度门控：dt 投影到每个 head
+        if num_heads_for_dt is None:
+            num_heads_for_dt = num_heads
+        self.num_heads_for_dt = num_heads_for_dt
+
+        # 从 hidden_size 投影到 per-head dt，形状 [B, T, num_heads_for_dt]
+        self.dt_proj = nn.Linear(hidden_size, num_heads_for_dt, bias=True)
+
+        # A_log & dt_bias: 参考 Mamba/DeltaNet 风格的时间尺度参数化
+        self.A_log = nn.Parameter(torch.zeros(num_heads_for_dt))
+        self.dt_bias = nn.Parameter(torch.zeros(num_heads_for_dt))
+
+        # 输出投影
+        self.out_proj = nn.Linear(num_heads * head_dim, hidden_size, bias=False)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        rotary_emb: Optional[RotaryEmbedding] = None,
+    ) -> torch.Tensor:
+        """
+        hidden_states: [B, T, H]
+        attention_mask: [B, 1, 1, T]（目前未使用，可用于将来做 padding/segment）
+        position_ids: [B, T]（可选，用于对 Q 做 RoPE）
+        """
+
+        B, T, H = hidden_states.size()
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+
+        # 1) Causal Conv 提取局部模式
+        x = self.causal_conv(hidden_states)  # [B, T, H]
+
+        # 2) 线性投影到 Q / V
+        q = self.q_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        # q, v: [B, num_heads, T, head_dim]
+
+        # 3) 可选：对 Q 做 RoPE（和 Attention 保持一致的接口）
+        if rotary_emb is not None and position_ids is not None:
+            q = rotary_emb(q, position_ids)  # [B, num_heads, T, head_dim]
+
+        # 4) 计算时间尺度门控参数
+        # dt_raw: [B, T, H_dt] -> [B, H_dt, T]
+        dt_raw = self.dt_proj(hidden_states)  # [B, T, num_heads_for_dt]
+        dt_raw = dt_raw.transpose(1, 2)       # [B, num_heads_for_dt, T]
+
+        # softplus 保证 dt>0，再加上 dt_bias
+        dt = F.softplus(dt_raw + self.dt_bias.view(1, -1, 1))  # [B, H_dt, T]
+        # A_log 控制衰减率
+        A = -self.A_log.exp().view(1, -1, 1)                   # [B, H_dt, 1]
+        # 连续时间到离散时间的转换，这里是简化版本
+        alpha = torch.exp(A * dt)  # [B, H_dt, T]
+        beta = dt                  # [B, H_dt, T]
+
+        # 5) 状态更新：简化版 Delta 规则
+        # 我们用 per-head state_t: [B, num_heads, head_dim]
+        state = torch.zeros(
+            B, self.num_heads, self.head_dim, device=device, dtype=dtype
+        )
+
+        outputs = []
+
+        # 为了简单，将 dt 的 head 维对齐到 num_heads（若数量不同则 broadcast）
+        if self.num_heads_for_dt != self.num_heads:
+            # [B, H_dt, T] -> [B, num_heads, T] (repeat / crop)
+            if self.num_heads_for_dt > self.num_heads:
+                alpha = alpha[:, : self.num_heads, :]
+                beta = beta[:, : self.num_heads, :]
+            else:
+                repeat_factor = (self.num_heads + self.num_heads_for_dt - 1) // self.num_heads_for_dt
+                alpha = alpha.repeat_interleave(repeat_factor, dim=1)[:, : self.num_heads, :]
+                beta = beta.repeat_interleave(repeat_factor, dim=1)[:, : self.num_heads, :]
+
+        # 简单的逐时间步循环：后续可用 fused kernel 替换
+        for t in range(T):
+            v_t = v[:, :, t, :]              # [B, num_heads, head_dim]
+            alpha_t = alpha[:, :, t].unsqueeze(-1)  # [B, num_heads, 1]
+            beta_t = beta[:, :, t].unsqueeze(-1)    # [B, num_heads, 1]
+
+            # 状态更新：state_t = alpha_t * state_{t-1} + beta_t * v_t
+            state = alpha_t * state + beta_t * v_t
+
+            # 输出：用 q_t 对 state 做一个门控（逐元素乘）
+            q_t = q[:, :, t, :]  # [B, num_heads, head_dim]
+            out_t = q_t * state  # [B, num_heads, head_dim]
+
+            outputs.append(out_t)
+
+        # 7) 输出 [T * [B, num_heads, head_dim]] -> [B, num_heads, T, head_dim]
+        out = torch.stack(outputs, dim=2)
+
+        # 8) 合并 heads + 输出投影
+        out = out.transpose(1, 2).contiguous().view(B, T, self.num_heads * self.head_dim)
+        out = self.out_proj(out)  # [B, T, H]
+        return out
+
 
 class MLP(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int):
@@ -318,21 +504,42 @@ class ThinkerDecoderLayer(nn.Module):
         self.use_moe = getattr(config, "use_moe", False)
         self.num_experts = getattr(config, "num_experts", 0)
         self.num_experts_per_tok = getattr(config, "num_experts_per_tok", 1)
+        
+        # 当前层的 block 类型：'attn' or 'deltanet'
+        self.block_type = getattr(config, "block_type", "attn")
 
         head_dim = config.hidden_size // config.num_attention_heads
-        self.self_attn = MultiHeadSelfAttention(
-            hidden_size=config.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            head_dim=head_dim,
-            use_flash_attention=getattr(config, "use_flash_attention", False),
-            headwise_attn_output_gate=getattr(
-                config, "headwise_attn_output_gate", False
-            ),
-            elementwise_attn_output_gate=getattr(
-                config, "elementwise_attn_output_gate", False
-            ),
-        )
+        if self.block_type == "deltanet":
+            # DeltaNet 占位实现：Causal Conv1d + gated temporal dynamics
+            kernel_size = getattr(config, "deltanet_kernel_size", 3)
+            num_heads_for_dt = getattr(
+                config, "deltanet_num_heads", config.num_attention_heads
+            )
+            chunk_size = getattr(config, "deltanet_chunk_size", 0)
+
+            self.self_attn = GatedDeltaNetAttention(
+                hidden_size=config.hidden_size,
+                num_heads=config.num_attention_heads,
+                head_dim=head_dim,
+                conv_kernel_size=kernel_size,
+                num_heads_for_dt=num_heads_for_dt,
+                chunk_size=chunk_size,
+            )
+        else:
+            # 标准 MultiHeadSelfAttention（GatedAttention）
+            self.self_attn = MultiHeadSelfAttention(
+                hidden_size=config.hidden_size,
+                num_heads=config.num_attention_heads,
+                num_kv_heads=config.num_key_value_heads,
+                head_dim=head_dim,
+                use_flash_attention=getattr(config, "use_flash_attention", False),
+                headwise_attn_output_gate=getattr(
+                    config, "headwise_attn_output_gate", False
+                ),
+                elementwise_attn_output_gate=getattr(
+                    config, "elementwise_attn_output_gate", False
+                ),
+            )
         self.attn_norm = RMSNorm(config.hidden_size)
         
         # Shared Dense FFN（所有层都有）
@@ -437,6 +644,17 @@ class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
                 moe_layer_set = set(
                     int(x) for x in indices_str.split(",") if x.strip().isdigit()
                 )
+                
+        # 解析 deltanet_layer_indices: 例如 "0,1,2,4,5,6"
+        deltanet_layer_set = None
+        if getattr(thinker_cfg, "deltanet_layer_indices", None) is not None:
+            indices_str = thinker_cfg.deltanet_layer_indices
+            if isinstance(indices_str, str) and indices_str.strip():
+                deltanet_layer_set = set(
+                    int(x) for x in indices_str.split(",") if x.strip().isdigit()
+                )
+
+        use_deltanet_global = getattr(thinker_cfg, "use_deltanet", False)
 
         layers = []
         for layer_idx in range(thinker_cfg.num_hidden_layers):
@@ -445,10 +663,24 @@ class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
             # 如果指定了 moe_layer_indices，则以它为准
             if moe_layer_set is not None:
                 use_moe_layer = layer_idx in moe_layer_set
+                
+            # ---- Attention / DeltaNet 层类型选择 ----
+            block_type = "attn"
+            if use_deltanet_global:
+                if deltanet_layer_set is not None:
+                    # 显式指定哪些层用 DeltaNet
+                    block_type = "deltanet" if layer_idx in deltanet_layer_set else "attn"
+                else:
+                    # 默认 3:1 模式：每 4 层中前 3 层 DeltaNet，最后 1 层标准 Attention
+                    if (layer_idx % 4) in (0, 1, 2):
+                        block_type = "deltanet"
+                    else:
+                        block_type = "attn"
 
             # 为当前层构造一个“局部Config”拷贝，覆盖 use_moe
             local_cfg = Qwen3OmniMoeThinkerConfig(**thinker_cfg.__dict__)
             local_cfg.use_moe = use_moe_layer
+            local_cfg.block_type = block_type
 
             layers.append(ThinkerDecoderLayer(local_cfg, self.rotary_emb))
 
@@ -527,9 +759,11 @@ class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
         all_hidden_states = [] if output_hidden_states else None
         total_aux_loss = None
 
+        # 1. 堆叠所有解码层，顺便把 MoE aux loss 累加起来
         for layer in self.layers:
             if output_hidden_states:
                 all_hidden_states.append(hidden_states)
+
             hidden_states, layer_aux = layer(
                 hidden_states, attention_mask_full, position_ids
             )
@@ -539,95 +773,77 @@ class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
                 else:
                     total_aux_loss = total_aux_loss + layer_aux
 
-                hidden_states = self.norm(hidden_states)
-                logits = self.lm_head(hidden_states)  # [B, T, V]
+        # 2. 最后一层 RMSNorm + LM Head
+        hidden_states = self.norm(hidden_states)
+        logits = self.lm_head(hidden_states)  # [B, T, V]
 
-                loss = None
-                ce_loss = None
-                aux_loss = None
-                vocab_size = logits.size(-1)
+        loss = None
+        ce_loss = None
+        aux_loss = None
+        vocab_size = logits.size(-1)
 
-                if labels is not None:
-                    # 1. 标准自回归 shift
-                    shift_logits = logits[:, :-1, :].contiguous()   # [B, T-1, V]
-                    shift_labels = labels[:, 1:].contiguous()       # [B, T-1]
+        # 3. 自回归 CE loss
+        if labels is not None:
+            shift_logits = logits[:, :-1, :].contiguous()   # [B, T-1, V]
+            shift_labels = labels[:, 1:].contiguous()       # [B, T-1]
 
-                    # 2. 统计有效 token 数（剔除 ignore_index）
-                    valid_mask = (shift_labels != -100)             # [B, T-1]
+            valid_mask = (shift_labels != -100)
+            num_tokens = valid_mask.sum()
+
+            loss_fct = nn.CrossEntropyLoss(
+                ignore_index=-100,
+                reduction="sum",
+            )
+            ce_loss_raw = loss_fct(
+                shift_logits.view(-1, vocab_size),
+                shift_labels.view(-1),
+            )
+
+            if num_tokens > 0:
+                ce_loss = ce_loss_raw / num_tokens
+            else:
+                ce_loss = ce_loss_raw * 0.0
+
+            loss = ce_loss
+
+        # 4. MoE aux loss 归一化 + 合并
+        if total_aux_loss is not None:
+            if labels is not None:
+                if "num_tokens" not in locals():
+                    valid_mask = (labels != -100)
                     num_tokens = valid_mask.sum()
+                if num_tokens > 0:
+                    aux_loss = total_aux_loss / num_tokens
+                else:
+                    aux_loss = total_aux_loss * 0.0
+            else:
+                aux_loss = total_aux_loss
 
-                    # 3. 用 sum，然后手动除，防止 num_tokens=0 时 mean 爆掉
-                    loss_fct = nn.CrossEntropyLoss(
-                        ignore_index=-100,
-                        reduction="sum",
-                    )
-                    ce_loss_raw = loss_fct(
-                        shift_logits.view(-1, vocab_size),
-                        shift_labels.view(-1),
-                    )  # 标量，可能是 0
+            if loss is None:
+                loss = self.thinker_cfg.moe_aux_loss_coef * aux_loss
+            else:
+                loss = loss + self.thinker_cfg.moe_aux_loss_coef * aux_loss
 
-                    if num_tokens > 0:
-                        ce_loss = ce_loss_raw / num_tokens
-                    else:
-                        # 整个 batch 没有任何有效 token → 这个 batch 的 CE 贡献记为 0
-                        ce_loss = ce_loss_raw * 0.0  # 保持 dtype/device
+        # 5. 把 NaN/Inf 压到有限值
+        if loss is not None:
+            loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
+        if ce_loss is not None:
+            ce_loss = torch.nan_to_num(ce_loss, nan=0.0, posinf=1e4, neginf=-1e4)
+        if aux_loss is not None:
+            aux_loss = torch.nan_to_num(aux_loss, nan=0.0, posinf=1e4, neginf=-1e4)
 
-                    loss = ce_loss
+        output = {
+            "logits": logits,
+            "loss": loss,
+        }
+        if ce_loss is not None:
+            output["ce_loss"] = ce_loss
+        if aux_loss is not None:
+            output["aux_loss"] = aux_loss
 
-                # 4. MoE aux loss 归一化 + 合并
-                if total_aux_loss is not None:
-                    if labels is not None:
-                        # 复用上面的 num_tokens，如果还没算就现算一遍
-                        if "num_tokens" not in locals():
-                            valid_mask = (labels != -100)
-                            num_tokens = valid_mask.sum()
+        if output_hidden_states:
+            all_hidden_states.append(hidden_states)
+            output["hidden_states"] = all_hidden_states
 
-                        if num_tokens > 0:
-                            aux_loss = total_aux_loss / num_tokens
-                        else:
-                            aux_loss = total_aux_loss * 0.0
-                    else:
-                        # 没 labels 的情况，直接用 total_aux_loss（一般 Stage1/2都会有 labels）
-                        aux_loss = total_aux_loss
-
-                    if loss is None:
-                        loss = self.thinker_cfg.moe_aux_loss_coef * aux_loss
-                    else:
-                        loss = loss + self.thinker_cfg.moe_aux_loss_coef * aux_loss
-
-                # 5. 最后一层保险，把任何潜在 NaN/Inf 压成有限值
-                if loss is not None:
-                    loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
-                if ce_loss is not None:
-                    ce_loss = torch.nan_to_num(ce_loss, nan=0.0, posinf=1e4, neginf=-1e4)
-                if aux_loss is not None:
-                    aux_loss = torch.nan_to_num(aux_loss, nan=0.0, posinf=1e4, neginf=-1e4)
-
-                output = {
-                    "logits": logits,
-                    "loss": loss,
-                }
-                if ce_loss is not None:
-                    output["ce_loss"] = ce_loss
-                if aux_loss is not None:
-                    output["aux_loss"] = aux_loss
-
-                if output_hidden_states:
-                    all_hidden_states.append(hidden_states)
-                    output["hidden_states"] = all_hidden_states
-
-                return output
-
-    # ---- 让 transformers 知道怎么 tie 权重 ----
-    def get_input_embeddings(self):
-        return self.embed_tokens
-
-    def set_input_embeddings(self, new_embeddings):
-        self.embed_tokens = new_embeddings
-
-    def get_output_embeddings(self):
-        return self.lm_head
-
-    def set_output_embeddings(self, new_embeddings):
-        self.lm_head = new_embeddings
+        return output
 
