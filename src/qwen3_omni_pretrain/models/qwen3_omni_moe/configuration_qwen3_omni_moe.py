@@ -73,6 +73,7 @@ class Qwen3OmniMoeConfig(PretrainedConfig):
         max_position_embeddings: int = 4096,
         rope_theta: float = 10000.0,
         rope_scaling: Optional[Dict[str, Any]] = None,
+        rope_partial_factor: float = 1.0,
         use_moe: bool = False,
         num_experts: int = 8,
         num_experts_per_tok: int = 2,
@@ -109,6 +110,7 @@ class Qwen3OmniMoeConfig(PretrainedConfig):
 
         self.rope_theta = rope_theta
         self.rope_scaling = rope_scaling
+        self.rope_partial_factor = rope_partial_factor
 
         self.use_moe = use_moe
         self.num_experts = num_experts
@@ -141,6 +143,8 @@ class Qwen3OmniMoeConfig(PretrainedConfig):
     def to_dict(self):
         # 确保保存到磁盘时，子配置能转成可 JSON 序列化的 dict
         output = super().to_dict()
+        # 显式保留 RoPE 配置，避免序列化时丢失（resume 时要用到）
+        output["rope_partial_factor"] = getattr(self, "rope_partial_factor", 1.0)
         output["thinker_config"] = self.thinker_config.__dict__
         output["talker_config"] = self.talker_config.__dict__
         output["code2wav_config"] = self.code2wav_config.__dict__

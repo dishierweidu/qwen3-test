@@ -578,9 +578,8 @@ def train_thinker_stage2(
 
 
     # 1. tokenizer
-    tokenizer_path = _ensure_local_path(tokenizer_name_or_path, "tokenizer")
     tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_path,
+        tokenizer_name_or_path,
         use_fast=True,
         local_files_only=True,
     )

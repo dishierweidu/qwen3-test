@@ -14,64 +14,134 @@ from .modules.moe import Qwen3OmniMoeMLP
 
 
 class RMSNorm(nn.Module):
-    """简化版 RMSNorm"""
+    r"""Zero-centered RMSNorm used in Qwen3-Next / Omni style blocks.
+
+    y = x / rms(x) * (1 + weight)
+    """
 
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
+        # Zero-centered: 初始化为 0，而不是 1
+        self.weight = nn.Parameter(torch.zeros(dim))
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        norm = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(norm + self.eps)
-        return self.weight * x
+        # 计算 RMS，末维上归一化
+        # 为了数值稳定，可以在 FP32 里做归一化，再 cast 回去
+        orig_dtype = x.dtype
+        if x.dtype in (torch.float16, torch.bfloat16):
+            x_float = x.to(torch.float32)
+            norm = x_float.pow(2).mean(-1, keepdim=True)
+            x_float = x_float * torch.rsqrt(norm + self.eps)
+            x = x_float.to(orig_dtype)
+        else:
+            norm = x.pow(2).mean(-1, keepdim=True)
+            x = x * torch.rsqrt(norm + self.eps)
+
+        # 核心：乘以 (1 + weight)，而不是直接乘 weight
+        scale = (1.0 + self.weight).to(x.dtype)
+        return x * scale
+
 
 
 class RotaryEmbedding(nn.Module):
     """
-    一维 RoPE，只针对 head_dim 维度。
+    一维 RoPE，支持部分维度旋转。
     支持输入形状:
       - [B, T, D]
       - [B, num_heads, T, D]
+
+    参数:
+      dim:        总的 head_dim（例如 128、192 等）
+      rope_dim:   真正用于 RoPE 的前缀维度，必须为偶数且 <= dim
+                  rope_dim = 0 表示完全不加 RoPE
     """
 
-    def __init__(self, dim: int, max_position_embeddings: int, base: float = 10000.0):
+    def __init__(
+        self,
+        dim: int,
+        max_position_embeddings: int,
+        base: float = 10000.0,
+        rope_dim: int = None,
+    ):
         super().__init__()
-        self.dim = dim
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        t = torch.arange(max_position_embeddings, dtype=torch.float)
-        freqs = torch.einsum("i,j->ij", t, inv_freq)  # [T, dim/2]
-        emb = torch.cat((freqs, freqs), dim=-1)       # [T, dim]
-        self.register_buffer("cos_cached", emb.cos(), persistent=False)  # [T, dim]
-        self.register_buffer("sin_cached", emb.sin(), persistent=False)  # [T, dim]
+
+        # 总维度（head_dim）
+        self.total_dim = dim
+
+        # 用于 RoPE 的前缀维度
+        if rope_dim is None:
+            rope_dim = dim
+        # 保证非负且不超过 total_dim
+        rope_dim = max(0, min(rope_dim, dim))
+        # RoPE 维度必须为偶数，如果是奇数就减一
+        if rope_dim % 2 == 1:
+            rope_dim -= 1
+        self.rope_dim = rope_dim
+
+        if self.rope_dim > 0:
+            inv_freq = 1.0 / (base ** (torch.arange(0, self.rope_dim, 2).float() / self.rope_dim))
+            t = torch.arange(max_position_embeddings, dtype=torch.float)
+            freqs = torch.einsum("i,j->ij", t, inv_freq)  # [T, rope_dim/2]
+            emb = torch.cat((freqs, freqs), dim=-1)       # [T, rope_dim]
+            self.register_buffer("cos_cached", emb.cos(), persistent=False)  # [T, rope_dim]
+            self.register_buffer("sin_cached", emb.sin(), persistent=False)  # [T, rope_dim]
+        else:
+            # 不使用 RoPE 的情况
+            self.register_buffer("cos_cached", None, persistent=False)
+            self.register_buffer("sin_cached", None, persistent=False)
 
     def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
         """
         x: [B, T, D] 或 [B, num_heads, T, D]
         position_ids: [B, T]
         """
+        if self.rope_dim == 0:
+            # 不做 RoPE，直接返回
+            return x
+
         if x.dim() == 3:
-            # [B, T, D] -> 假装 num_heads=1
+            # [B, T, D]
             bsz, seq_len, dim = x.size()
-            assert dim == self.dim
-            cos = self.cos_cached[position_ids]        # [B, T, D]
-            sin = self.sin_cached[position_ids]        # [B, T, D]
-            x1, x2 = x[..., ::2], x[..., 1::2]
-            x_rot = torch.stack([-x2, x1], dim=-1).reshape_as(x)
-            return x * cos + x_rot * sin
+            assert dim == self.total_dim
+
+            cos = self.cos_cached[position_ids]  # [B, T, rope_dim]
+            sin = self.sin_cached[position_ids]  # [B, T, rope_dim]
+
+            # 拆分前 rope_dim 和剩余部分
+            x_rope = x[..., :self.rope_dim]      # [B, T, rope_dim]
+            x_pass = x[..., self.rope_dim:]      # [B, T, D - rope_dim]
+
+            x1, x2 = x_rope[..., ::2], x_rope[..., 1::2]
+            x_rot = torch.stack([-x2, x1], dim=-1).reshape_as(x_rope)
+            x_rope = x_rope * cos + x_rot * sin
+
+            if self.rope_dim == self.total_dim:
+                return x_rope
+            else:
+                return torch.cat([x_rope, x_pass], dim=-1)
 
         elif x.dim() == 4:
             # [B, nh, T, D]
             bsz, nh, seq_len, dim = x.size()
-            assert dim == self.dim
-            # cos/sin: [B, T, D] -> [B, 1, T, D]
-            cos = self.cos_cached[position_ids]        # [B, T, D]
-            sin = self.sin_cached[position_ids]        # [B, T, D]
-            cos = cos.unsqueeze(1)                     # [B, 1, T, D]
-            sin = sin.unsqueeze(1)                     # [B, 1, T, D]
-            x1, x2 = x[..., ::2], x[..., 1::2]
-            x_rot = torch.stack([-x2, x1], dim=-1).reshape_as(x)
-            return x * cos + x_rot * sin
+            assert dim == self.total_dim
+
+            cos = self.cos_cached[position_ids]  # [B, T, rope_dim]
+            sin = self.sin_cached[position_ids]  # [B, T, rope_dim]
+            cos = cos.unsqueeze(1)               # [B, 1, T, rope_dim]
+            sin = sin.unsqueeze(1)               # [B, 1, T, rope_dim]
+
+            x_rope = x[..., :self.rope_dim]      # [B, nh, T, rope_dim]
+            x_pass = x[..., self.rope_dim:]      # [B, nh, T, D - rope_dim]
+
+            x1, x2 = x_rope[..., ::2], x_rope[..., 1::2]
+            x_rot = torch.stack([-x2, x1], dim=-1).reshape_as(x_rope)
+            x_rope = x_rope * cos + x_rot * sin
+
+            if self.rope_dim == self.total_dim:
+                return x_rope
+            else:
+                return torch.cat([x_rope, x_pass], dim=-1)
 
         else:
             raise ValueError(f"Unsupported x.dim() for RoPE: {x.dim()}")
@@ -340,11 +410,23 @@ class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
 
         # head_dim 用于 RoPE
         self.head_dim = thinker_cfg.hidden_size // thinker_cfg.num_attention_heads
+
+        # 从 config 中读取部分 RoPE 比例，默认 1.0（全维度）
+        rope_partial_factor = getattr(config, "rope_partial_factor", 1.0)
+        # 计算真正参与 RoPE 的维度
+        rope_dim = int(self.head_dim * rope_partial_factor)
+        # 保证非负且不超过 head_dim，偶数对齐
+        rope_dim = max(0, min(rope_dim, self.head_dim))
+        if rope_dim % 2 == 1:
+            rope_dim -= 1
+
         self.rotary_emb = RotaryEmbedding(
             dim=self.head_dim,
             max_position_embeddings=thinker_cfg.max_position_embeddings,
             base=config.rope_theta,
+            rope_dim=rope_dim,
         )
+
         self.use_flash_attention = getattr(thinker_cfg, "use_flash_attention", False)
 
         # 解析 moe_layer_indices: 例如 "0,2,4" -> {0,2,4}
