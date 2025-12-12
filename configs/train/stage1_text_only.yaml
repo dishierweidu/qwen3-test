@@ -18,6 +18,9 @@ data:
   num_workers: 8
   batch_size: 2           # per-GPU batch size
   shuffle: false
+  # DDP 性能开关：若你确认每个 iteration 的 forward 都会用到全部参数，可设为 false 提速。
+  # 对 MoE/条件分支/多模态路由模型，可能存在“某些 step unused 参数”，建议保持 true。
+  ddp_find_unused_parameters: true
   # packed 模式配置
   use_packed_dataset: false
   packed_train_bin_path: "data/corpus/train_packed.bin"

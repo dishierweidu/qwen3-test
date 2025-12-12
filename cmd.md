@@ -17,6 +17,12 @@ unset https_proxy
 pip install -e .
 pip install -r requirements.txt
 
+<!-- 看是否存在 unused 参数 如果脚本显示 grad is None: 0，就可以在训练 YAML 里把它关掉：
+train:
+  ddp: true
+  ddp_find_unused_parameters: false -->
+python scripts/check_unused_grads.py   --config configs/train/stage1_text_only.yaml   --tokenizer_name_or_path Qwen/Qwen2.5-7B   --device cuda
+
 
 python -m qwen3_omni_pretrain.cli_train_thinker  --config configs/train/stage1_text_only.yaml  --tokenizer_name_or_path Qwen/Qwen2.5-7B
 

@@ -41,7 +41,11 @@ def ddp_init(backend: str = "nccl"):
         dist.init_process_group(backend=backend)
 
 
-def ddp_wrap_model(model: torch.nn.Module) -> torch.nn.Module:
+def ddp_wrap_model(
+    model: torch.nn.Module,
+    *,
+    find_unused_parameters: bool = True,
+) -> torch.nn.Module:
     if not ddp_available():
         return model
 
@@ -50,7 +54,7 @@ def ddp_wrap_model(model: torch.nn.Module) -> torch.nn.Module:
         model,
         device_ids=[local_rank],
         output_device=local_rank,
-        find_unused_parameters=True,
+        find_unused_parameters=find_unused_parameters,
     )
     return model
 

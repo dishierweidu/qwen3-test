@@ -64,6 +64,7 @@ class TrainerThinkerConfig:
     bf16: bool
     seed: int = 42
     ddp: bool = False
+    ddp_find_unused_parameters: bool = True
     fp8: bool = False
     int8_optimizer: bool = False
     resume_from_checkpoint: Optional[str] = None
@@ -163,6 +164,7 @@ def build_trainer_config(yaml_path: str) -> TrainerThinkerConfig:
         int8_optimizer=bool(train_cfg.get("int8_optimizer", False)),
         seed=int(train_cfg.get("seed", 42)),
         ddp=bool(train_cfg.get("ddp", False)),
+        ddp_find_unused_parameters=bool(train_cfg.get("ddp_find_unused_parameters", True)),
         resume_from_checkpoint=train_cfg.get("resume_from_checkpoint"),
         use_packed_dataset=use_packed_dataset,
         packed_train_bin_path=packed_train_bin_path,
@@ -240,7 +242,14 @@ def train_thinker_stage1(
         model.to(device)  # type: ignore[arg-type]
 
         # ✅ DDP 包裹模型
-        model = ddp_wrap_model(model) if use_ddp else model
+        model = (
+            ddp_wrap_model(
+                model,
+                find_unused_parameters=cfg.ddp_find_unused_parameters,
+            )
+            if use_ddp
+            else model
+        )
 
         # 5. 数据集
         # train_dataset = _build_text_dataset(cfg.train_corpus_paths, tokenizer, cfg.max_seq_length)
