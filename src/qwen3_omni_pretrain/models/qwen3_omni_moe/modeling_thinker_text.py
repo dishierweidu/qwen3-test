@@ -681,6 +681,8 @@ class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
 
         use_deltanet_global = getattr(thinker_cfg, "use_deltanet", False)
 
+        self.gradient_checkpointing = getattr(thinker_cfg, "gradient_checkpointing", False)
+
         layers = []
         for layer_idx in range(thinker_cfg.num_hidden_layers):
             # 默认按 config.use_moe
@@ -789,9 +791,20 @@ class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
             if output_hidden_states:
                 all_hidden_states.append(hidden_states)
 
-            hidden_states, layer_aux = layer(
-                hidden_states, attention_mask_full, position_ids
-            )
+            if self.gradient_checkpointing and self.training:
+                def layer_forward(x, pos_ids):
+                    return layer(x, attention_mask_full, pos_ids)
+
+                hidden_states, layer_aux = torch.utils.checkpoint.checkpoint(
+                    layer_forward,
+                    hidden_states,
+                    position_ids,
+                    use_reentrant=False,
+                )
+            else:
+                hidden_states, layer_aux = layer(
+                    hidden_states, attention_mask_full, position_ids
+                )
             if layer_aux is not None:
                 if total_aux_loss is None:
                     total_aux_loss = layer_aux

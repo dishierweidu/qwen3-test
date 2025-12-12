@@ -69,6 +69,8 @@ class TrainerThinkerConfig:
     fp8: bool = False
     int8_optimizer: bool = False
     resume_from_checkpoint: Optional[str] = None
+
+    gradient_checkpointing: bool = False
     
     use_packed_dataset: bool = False
     packed_train_bin_path: Optional[str] = None
@@ -167,6 +169,7 @@ def build_trainer_config(yaml_path: str) -> TrainerThinkerConfig:
         ddp=bool(train_cfg.get("ddp", False)),
         ddp_find_unused_parameters=bool(train_cfg.get("ddp_find_unused_parameters", True)),
         resume_from_checkpoint=train_cfg.get("resume_from_checkpoint"),
+        gradient_checkpointing=bool(train_cfg.get("gradient_checkpointing", False)),
         use_packed_dataset=use_packed_dataset,
         packed_train_bin_path=packed_train_bin_path,
         packed_val_bin_path=packed_val_bin_path,
@@ -251,6 +254,10 @@ def train_thinker_stage1(
             if use_ddp
             else model
         )
+
+        # 激活检查点：降低显存占用，耗时换显存
+        if cfg.gradient_checkpointing:
+            model.thinker_cfg.gradient_checkpointing = True
 
         # 5. 数据集
         # train_dataset = _build_text_dataset(cfg.train_corpus_paths, tokenizer, cfg.max_seq_length)

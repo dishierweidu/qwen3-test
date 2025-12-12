@@ -44,3 +44,5 @@ train:
   int8_optimizer: false
   seed: 42
   ddp: true              # 先做单卡/单机，后面再加 FSDP / DeepSpeed
+  # 显存不够时可打开，激活检查点（前向重算换显存）。对长序列/大模型建议开启。
+  gradient_checkpointing: false

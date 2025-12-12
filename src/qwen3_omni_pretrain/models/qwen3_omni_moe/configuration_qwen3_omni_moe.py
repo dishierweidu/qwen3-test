@@ -68,6 +68,9 @@ class Qwen3OmniMoeThinkerConfig:
     # 线性注意力的 chunk size（0 表示不按 chunk 切，纯 Python 循环版）
     deltanet_chunk_size: int = 0
 
+    # 激活检查点，降低显存占用（牺牲前向重算时间）
+    gradient_checkpointing: bool = False
+
 @dataclass
 class Qwen3OmniMoeTalkerConfig:
     hidden_size: int = 1536
