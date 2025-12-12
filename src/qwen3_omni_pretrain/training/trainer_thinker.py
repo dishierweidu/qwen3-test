@@ -32,8 +32,8 @@ from qwen3_omni_pretrain.models.qwen3_omni_moe.modeling_thinker_text import (
 from qwen3_omni_pretrain.models.qwen3_omni_moe.modeling_thinker_vision_audio import (
     Qwen3OmniMoeThinkerVisionAudioModel,
 )
-from qwen3_omni_pretrain.data.datasets.text_dataset import TextJsonlDataset
-from qwen3_omni_pretrain.data.collators import TextCausalLMCollator
+from qwen3_omni_pretrain.data.datasets.text_dataset import TextJsonlDataset, PackedTokenDataset
+from qwen3_omni_pretrain.data.collators import TextCausalLMCollator, PackedCausalLMCollator
 from qwen3_omni_pretrain.training.loop import train_one_epoch, evaluate
 from qwen3_omni_pretrain.training.checkpoint import save_checkpoint, load_checkpoint
 # from qwen3_omni_pretrain.utils.seed import set_seed
@@ -67,6 +67,11 @@ class TrainerThinkerConfig:
     fp8: bool = False
     int8_optimizer: bool = False
     resume_from_checkpoint: Optional[str] = None
+    
+    use_packed_dataset: bool = False
+    packed_train_bin_path: Optional[str] = None
+    packed_val_bin_path: Optional[str] = None
+    packed_seq_length: Optional[int] = None
     
 @dataclass
 class Stage2TrainConfig:
@@ -121,6 +126,16 @@ def build_trainer_config(yaml_path: str) -> TrainerThinkerConfig:
     
     train_paths = data_cfg.get("train_corpus_paths", data_cfg.get("train_corpus_path"))
     val_paths = data_cfg.get("val_corpus_paths", data_cfg.get("val_corpus_path"))
+    
+    use_packed_dataset = bool(data_cfg.get("use_packed_dataset", False))
+    packed_train_bin_path = data_cfg.get("packed_train_bin_path", None)
+    packed_val_bin_path = data_cfg.get("packed_val_bin_path", None)
+    packed_seq_length = int(
+        data_cfg.get(
+            "packed_seq_length",
+            data_cfg.get("max_seq_length", 2048),
+        )
+    )
 
 
     return TrainerThinkerConfig(
@@ -149,6 +164,10 @@ def build_trainer_config(yaml_path: str) -> TrainerThinkerConfig:
         seed=int(train_cfg.get("seed", 42)),
         ddp=bool(train_cfg.get("ddp", False)),
         resume_from_checkpoint=train_cfg.get("resume_from_checkpoint"),
+        use_packed_dataset=use_packed_dataset,
+        packed_train_bin_path=packed_train_bin_path,
+        packed_val_bin_path=packed_val_bin_path,
+        packed_seq_length=packed_seq_length,
     )
 
 
@@ -224,10 +243,30 @@ def train_thinker_stage1(
         model = ddp_wrap_model(model) if use_ddp else model
 
         # 5. 数据集
-        train_dataset = _build_text_dataset(cfg.train_corpus_paths, tokenizer, cfg.max_seq_length)
-        val_dataset = _build_text_dataset(cfg.val_corpus_paths, tokenizer, cfg.max_seq_length)
+        # train_dataset = _build_text_dataset(cfg.train_corpus_paths, tokenizer, cfg.max_seq_length)
+        # val_dataset = _build_text_dataset(cfg.val_corpus_paths, tokenizer, cfg.max_seq_length)
 
-        collator = TextCausalLMCollator(tokenizer, cfg.max_seq_length)
+        # collator = TextCausalLMCollator(tokenizer, cfg.max_seq_length)
+        if cfg.use_packed_dataset:
+            assert cfg.packed_train_bin_path is not None, "use_packed_dataset=True 但 packed_train_bin_path 为空"
+            assert cfg.packed_val_bin_path is not None, "use_packed_dataset=True 但 packed_val_bin_path 为空"
+
+            train_dataset = PackedTokenDataset(
+                bin_path=cfg.packed_train_bin_path,
+                seq_length=cfg.packed_seq_length or cfg.max_seq_length,
+            )
+            val_dataset = PackedTokenDataset(
+                bin_path=cfg.packed_val_bin_path,
+                seq_length=cfg.packed_seq_length or cfg.max_seq_length,
+            )
+            collator = PackedCausalLMCollator(
+                pad_token_id=tokenizer.pad_token_id,
+            )
+        else:
+            train_dataset = _build_text_dataset(cfg.train_corpus_paths, tokenizer, cfg.max_seq_length)
+            val_dataset = _build_text_dataset(cfg.val_corpus_paths, tokenizer, cfg.max_seq_length)
+            collator = TextCausalLMCollator(tokenizer, cfg.max_seq_length)
+
 
         # ✅ DistributedSampler
         if use_ddp:
@@ -426,7 +465,8 @@ def train_thinker_stage1(
                     writer.add_scalar("train/aux_loss", aux_loss, global_step)
                 if lr is not None:
                     writer.add_scalar("train/lr", lr, global_step)
-                writer.flush()
+                if global_step % (cfg.logging_steps * 5) == 0:
+                    writer.flush()
 
         def after_step_fn(step: int, loss: float, batch_idx: int, ce_loss=None, aux_loss=None, lr=None, model=None):
             nonlocal best_val_loss, global_step

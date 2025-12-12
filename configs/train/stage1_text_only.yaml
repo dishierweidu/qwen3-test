@@ -2,21 +2,27 @@
 
 # configs/train/stage1_text_only.yaml
 
-experiment_name: "qwen3_omni_stage1_text_7b"
+experiment_name: "qwen3_omni_stage1_text_1_3b"
 
 model:
-  config_path: "configs/model/qwen3_omni_7b_moe.yaml"
+  config_path: "configs/model/qwen3_omni_1_3b_moe.yaml"
 
 data:
   train_corpus_paths: 
     - "data/corpus/train_text.jsonl"
-    - "/ai/finnox/mobvoi_seq_monkey_general_open_corpus.jsonl"
+    # - "/ai/finnox/mobvoi_seq_monkey_general_open_corpus.jsonl"
+    - "/hpc2hdd/home/zzhao056/mobv/mobvoi_seq_monkey_general_open_corpus.jsonl"
   val_corpus_paths:
     - "data/corpus/val_text.jsonl"
   max_seq_length: 2048
-  num_workers: 4
-  batch_size: 1           # per-GPU batch size
+  num_workers: 8
+  batch_size: 2           # per-GPU batch size
   shuffle: false
+  # packed 模式配置
+  use_packed_dataset: false
+  packed_train_bin_path: "data/corpus/train_packed.bin"
+  packed_val_bin_path: "data/corpus/val_packed.bin"
+  packed_seq_length: 2048   # 可以和 max_seq_length 一致
 
 train:
   num_epochs: 10
@@ -25,13 +31,13 @@ train:
   learning_rate: 1e-4
   weight_decay: 0.01
   warmup_ratio: 0.03
-  logging_steps: 1
+  logging_steps: 20
   eval_steps: 1000
   save_steps: 10000
-  output_dir: "outputs/stage1_text_7b"
+  output_dir: "outputs/stage1_text_1_3b"
   fp16: false
   bf16: true
   fp8: false
   int8_optimizer: false
   seed: 42
-  ddp: false              # 先做单卡/单机，后面再加 FSDP / DeepSpeed
+  ddp: true              # 先做单卡/单机，后面再加 FSDP / DeepSpeed

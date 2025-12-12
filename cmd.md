@@ -26,10 +26,7 @@ python -m qwen3_omni_pretrain.cli_train_thinker   --stage stage1   --config conf
 
 # resume_from_checkpoint can point to any step_*/best_*/latest folder saved by trainer_thinker; it now restores optimizer/scheduler/scaler/global_step so training continues from the recorded step/epoch.
 
-torchrun --nproc_per_node=8 -m qwen3_omni_pretrain.cli_train_thinker \
-    --stage stage1 \
-    --config configs/train/stage1_text_only.yaml \
-    --tokenizer_name_or_path Qwen/Qwen2.5-7B
+torchrun --nproc_per_node=8 -m qwen3_omni_pretrain.cli_train_thinker --stage stage1 --config configs/train/stage1_text_only.yaml --tokenizer_name_or_path src/tokenizer/Qwen3 --tensorboard --log_dir runs/
 
 tensorboard --logdir runs/
 
@@ -64,3 +61,17 @@ git config --global user.email eliot.zhao@finnox.cn
 git config --global user.name "Eliot Zhao"
 
 netstat -tulnp | grep 29500
+
+# 训练集
+python scripts/pretokenize_corpus.py \
+  --input data/corpus/train_text.jsonl /ai/finnox/mobvoi_seq_monkey_general_open_corpus.jsonl \
+  --output-prefix data/corpus/train_packed \
+  --tokenizer Qwen/Qwen2.5-7B \
+  --append-eos
+
+# 验证集
+python scripts/pretokenize_corpus.py \
+  --input data/corpus/val_text.jsonl \
+  --output-prefix data/corpus/val_packed \
+  --tokenizer Qwen/Qwen2.5-7B \
+  --append-eos

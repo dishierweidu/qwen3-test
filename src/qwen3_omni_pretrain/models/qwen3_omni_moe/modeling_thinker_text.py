@@ -442,16 +442,8 @@ class GatedDeltaNetAttention(nn.Module):
         # 连续时间到离散时间的转换，这里是简化版本
         alpha = torch.exp(A * dt)  # [B, H_dt, T]
         beta = dt                  # [B, H_dt, T]
-
-        # 5) 状态更新：简化版 Delta 规则
-        # 我们用 per-head state_t: [B, num_heads, head_dim]
-        state = torch.zeros(
-            B, self.num_heads, self.head_dim, device=device, dtype=dtype
-        )
-
-        outputs = []
-
-        # 为了简单，将 dt 的 head 维对齐到 num_heads（若数量不同则 broadcast）
+        
+        # 5) 为了简单，将 dt 的 head 维对齐到 num_heads（若数量不同则 broadcast）
         if self.num_heads_for_dt != self.num_heads:
             # [B, H_dt, T] -> [B, num_heads, T] (repeat / crop)
             if self.num_heads_for_dt > self.num_heads:
@@ -461,24 +453,38 @@ class GatedDeltaNetAttention(nn.Module):
                 repeat_factor = (self.num_heads + self.num_heads_for_dt - 1) // self.num_heads_for_dt
                 alpha = alpha.repeat_interleave(repeat_factor, dim=1)[:, : self.num_heads, :]
                 beta = beta.repeat_interleave(repeat_factor, dim=1)[:, : self.num_heads, :]
+        
+        # 6) 逐时间步更新 state 并计算输出
+        # 我们用 per-head state_t: [B, num_heads, head_dim]
+        # state = torch.zeros(
+        #     B, self.num_heads, self.head_dim, device=device, dtype=dtype
+        # )
+        
+        # 6.1 计算 p_t = cumprod(alpha)
+        #     alpha: [B, nh, T]
 
-        # 简单的逐时间步循环：后续可用 fused kernel 替换
-        for t in range(T):
-            v_t = v[:, :, t, :]              # [B, num_heads, head_dim]
-            alpha_t = alpha[:, :, t].unsqueeze(-1)  # [B, num_heads, 1]
-            beta_t = beta[:, :, t].unsqueeze(-1)    # [B, num_heads, 1]
+        eps = 1e-6
+        alpha = alpha.to(dtype)                 # 保持精度一致
+        beta = beta.to(dtype)
 
-            # 状态更新：state_t = alpha_t * state_{t-1} + beta_t * v_t
-            state = alpha_t * state + beta_t * v_t
+        p = torch.cumprod(alpha, dim=2)        # [B, nh, T]
 
-            # 输出：用 q_t 对 state 做一个门控（逐元素乘）
-            q_t = q[:, :, t, :]  # [B, num_heads, head_dim]
-            out_t = q_t * state  # [B, num_heads, head_dim]
+        # 6.2 计算贡献项 contrib = beta * v
+        # v: [B, nh, T, hd]
+        contrib = beta.unsqueeze(-1) * v       # [B, nh, T, hd]
 
-            outputs.append(out_t)
+        # 6.3 u = contrib / p_i
+        inv_p = 1.0 / (p.unsqueeze(-1) + eps)  # [B, nh, T, 1]
+        u = contrib * inv_p                    # [B, nh, T, hd]
 
-        # 7) 输出 [T * [B, num_heads, head_dim]] -> [B, num_heads, T, head_dim]
-        out = torch.stack(outputs, dim=2)
+        # 6.4 前缀和 s_t = sum_{i<=t} u_i
+        s = torch.cumsum(u, dim=2)             # [B, nh, T, hd]
+
+        # 6.5 state_t = p_t * s_t
+        state = p.unsqueeze(-1) * s            # [B, nh, T, hd]
+
+        # 7) 输出：q_t * state_t
+        out = q * state                        # [B, nh, T, hd]
 
         # 8) 合并 heads + 输出投影
         out = out.transpose(1, 2).contiguous().view(B, T, self.num_heads * self.head_dim)

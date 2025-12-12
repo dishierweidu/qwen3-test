@@ -12,38 +12,66 @@ import torchaudio
 class TextCausalLMCollator:
     """
     Stage1: 纯文本 Causal LM collator。
+
+    现在假设 Dataset 已经返回好:
+        {
+            "input_ids": 1D LongTensor,
+            "attention_mask": 1D LongTensor
+        }
+    这里只负责：
+        - 截断到 max_seq_length
+        - pad 到 batch 的最大长度
+        - 生成 labels（pad 部分置为 -100）
     """
 
     def __init__(self, tokenizer, max_seq_length: int = 2048):
-        self.tokenizer = tokenizer
+        # 只需要 pad_token_id，不再在这里做 tokenize
+        pad_id = tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = tokenizer.eos_token_id
+        self.pad_token_id = pad_id
         self.max_seq_length = max_seq_length
 
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-        texts = []
+        input_ids_list = []
+        attn_list = []
+
         for ex in batch:
-            # 假设 ex["text"] 存原始文本；也可以根据你的 text_dataset 改这里
-            txt = ex.get("text", "")
-            texts.append(txt)
+            ids = ex["input_ids"]
+            mask = ex["attention_mask"]
 
-        tokenized = self.tokenizer(
-            texts,
-            padding=True,
-            truncation=True,
-            max_length=self.max_seq_length,
-            return_tensors="pt",
-        )
+            if not torch.is_tensor(ids):
+                ids = torch.tensor(ids, dtype=torch.long)
+            if not torch.is_tensor(mask):
+                mask = torch.tensor(mask, dtype=torch.long)
 
-        input_ids = tokenized["input_ids"]
-        attention_mask = tokenized["attention_mask"]
+            # 截断到 max_seq_length（防止 Dataset 返回太长）
+            ids = ids[: self.max_seq_length]
+            mask = mask[: self.max_seq_length]
+
+            input_ids_list.append(ids)
+            attn_list.append(mask)
+
+        # pad 到同一长度
+        input_ids = pad_sequence(
+            input_ids_list,
+            batch_first=True,
+            padding_value=self.pad_token_id,
+        )  # [B, T]
+        attention_mask = pad_sequence(
+            attn_list,
+            batch_first=True,
+            padding_value=0,
+        )  # [B, T]
+
         labels = input_ids.clone()
+        labels[input_ids == self.pad_token_id] = -100
 
         return {
-            "input_ids": input_ids,
+            "input_ids": input_ids,          # [B, T]
             "attention_mask": attention_mask,
             "labels": labels,
         }
-
-
 class OmniStage2Collator:
     """
     Stage2: 文本 + 图像 + 音频统一 collator。
@@ -160,4 +188,30 @@ class OmniStage2Collator:
             "audio_values": audio_values,
             "has_image": has_image,
             "has_audio": has_audio,
+        }
+
+
+class PackedCausalLMCollator:
+    """
+    针对 PackedTokenDataset：
+      - dataset 已经是固定长度的 token 序列 [seq_length]
+      - 这里仅做 batch 维度上的堆叠
+      - attention_mask 全 1（没有 padding）
+    """
+
+    def __init__(self, pad_token_id: int):
+        self.pad_token_id = int(pad_token_id)
+
+    def __call__(self, batch):
+        # batch: List[{"input_ids": LongTensor[seq_length]}]
+        input_ids = [item["input_ids"].long() for item in batch]
+        input_ids = torch.stack(input_ids, dim=0)  # [B, T]
+
+        labels = input_ids.clone()
+        attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": attention_mask,
         }

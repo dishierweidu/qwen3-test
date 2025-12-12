@@ -2,6 +2,7 @@
 *.cache
 *.lock
 *.egg-info/
+core.*
 
 # Temporary files
 *.tmp
