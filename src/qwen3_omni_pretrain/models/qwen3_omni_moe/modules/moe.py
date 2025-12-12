@@ -37,17 +37,34 @@ class Qwen3OmniMoeMLP(nn.Module):
         intermediate_size: int,
         num_experts: int,
         num_experts_per_tok: int,
+        *,
+        use_shared_expert: bool = True,
+        shared_intermediate_size: int | None = None,
+        router_init_std: float = 1e-3,
+        router_normalize_init: bool = True,
+        renormalize_topk: bool = True,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.num_experts = num_experts
         self.num_experts_per_tok = max(1, min(num_experts_per_tok, num_experts))
+        self.use_shared_expert = use_shared_expert
+        self.shared_intermediate_size = shared_intermediate_size
+        self.renormalize_topk = renormalize_topk
 
         self.gate = nn.Linear(hidden_size, num_experts, bias=False)
+        with torch.no_grad():
+            self.gate.weight.normal_(mean=0.0, std=float(router_init_std))
+            if router_normalize_init:
+                self.gate.weight.div_(torch.norm(self.gate.weight, dim=-1, keepdim=True) + 1e-6)
         self.experts = nn.ModuleList(
             [ExpertMLP(hidden_size, intermediate_size) for _ in range(num_experts)]
         )
+        self.shared_expert = None
+        if self.use_shared_expert:
+            shared_int = shared_intermediate_size or intermediate_size
+            self.shared_expert = ExpertMLP(hidden_size, shared_int)
 
     def _dispatch_tokens(
         self,
@@ -130,5 +147,9 @@ class Qwen3OmniMoeMLP(nn.Module):
 
             # 一个 token 可能被多个 expert 选中，因此用 index_add_ 累加
             y_flat.index_add_(0, sel_token_idx, weighted_out)
+
+        if self.shared_expert is not None:
+            shared_out = self.shared_expert(x_flat)  # [NT, H]
+            y_flat = y_flat + shared_out
 
         return y_flat.view(B, T, H), aux_loss

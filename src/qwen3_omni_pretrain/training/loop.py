@@ -57,6 +57,7 @@ def train_one_epoch(
     autocast_dtype: Optional[torch.dtype] = None,
     grad_scaler: Optional[torch.cuda.amp.GradScaler] = None,
     after_step_fn: Optional[Callable[..., None]] = None,
+    should_stop_fn: Optional[Callable[[], bool]] = None,
 ) -> float:
     """
     通用训练循环：
@@ -84,6 +85,8 @@ def train_one_epoch(
     num_updates = 0           # 逻辑上的 optimizer.step() 次数
 
     for batch_idx, batch in enumerate(dataloader):
+        if should_stop_fn is not None and should_stop_fn():
+            break
         if batch_idx == 0:
             # 确认每个 rank 都拿到数据了
             if "input_ids" in batch:
@@ -184,6 +187,9 @@ def train_one_epoch(
                     lr=current_lr,
                     model=model,
                 )
+
+            if should_stop_fn is not None and should_stop_fn():
+                break
 
 
     if num_updates == 0:

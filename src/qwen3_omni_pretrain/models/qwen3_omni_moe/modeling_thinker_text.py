@@ -266,7 +266,21 @@ class MultiHeadSelfAttention(nn.Module):
             # 使用 PyTorch SDPA/FlashAttention 内核（自动选择最佳实现）
             attn_mask = attention_mask  # broadcast: [B, 1, 1, T] -> [B, nh, T, T]
             try:
-                with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True):
+                sdpa_ctx = None
+                if hasattr(torch.nn, "attention") and hasattr(torch.nn.attention, "sdpa_kernel"):
+                    sdpa_ctx = torch.nn.attention.sdpa_kernel(
+                        enable_flash=True,
+                        enable_math=True,
+                        enable_mem_efficient=True,
+                    )
+                else:
+                    sdpa_ctx = torch.backends.cuda.sdp_kernel(
+                        enable_flash=True,
+                        enable_math=True,
+                        enable_mem_efficient=True,
+                    )
+
+                with sdpa_ctx:
                     out = F.scaled_dot_product_attention(
                         q, k, v,
                         attn_mask=attn_mask,
@@ -558,6 +572,11 @@ class ThinkerDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 num_experts=self.num_experts,
                 num_experts_per_tok=self.num_experts_per_tok,
+                use_shared_expert=getattr(config, "moe_shared_expert", True),
+                shared_intermediate_size=getattr(config, "moe_shared_intermediate_size", None),
+                router_init_std=getattr(config, "moe_router_init_std", 1e-3),
+                router_normalize_init=getattr(config, "moe_router_normalize_init", True),
+                renormalize_topk=getattr(config, "moe_renormalize_topk", True),
             )
         else:
             self.moe_mlp = None

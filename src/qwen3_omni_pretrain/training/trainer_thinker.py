@@ -2,6 +2,7 @@
 
 import os
 import time
+import signal
 from dataclasses import dataclass
 from typing import Any, Dict, Union, List, Optional
 
@@ -417,6 +418,41 @@ def train_thinker_stage1(
             if writer is not None:
                 writer.add_text("ckpt/path", save_path, global_step)
                 writer.flush()
+
+        # --- graceful stop handling ---
+        stop_requested = False
+        received_signal = None
+
+        def _request_stop(sig, frame):
+            nonlocal stop_requested, received_signal
+            if stop_requested:
+                return
+            stop_requested = True
+            received_signal = sig
+            if is_main_process():
+                print(f"Received signal {sig}, will barrier, save, then exit after current step.")
+
+        old_sigint = signal.getsignal(signal.SIGINT)
+        old_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGINT, _request_stop)
+        signal.signal(signal.SIGTERM, _request_stop)
+
+        def _maybe_exit_gracefully():
+            nonlocal stop_requested, received_signal
+            if not stop_requested:
+                return
+            if dist.is_available() and dist.is_initialized():
+                dist.barrier()
+            if is_main_process():
+                tag = f"interrupted_step_{global_step}"
+                print(f"Saving emergency checkpoint: {tag} (signal={received_signal})")
+                save_full_checkpoint(tag)
+            if dist.is_available() and dist.is_initialized():
+                dist.barrier()
+            # 恢复信号处理后退出
+            signal.signal(signal.SIGINT, old_sigint)
+            signal.signal(signal.SIGTERM, old_sigterm)
+            raise SystemExit(0)
         
         total_updates = num_training_steps
         train_start_time = time.time()
@@ -500,6 +536,8 @@ def train_thinker_stage1(
                         best_val_loss = val_loss
                         save_full_checkpoint(f"best_step_{global_step}")
 
+            _maybe_exit_gracefully()
+
         try:
             for epoch in range(start_epoch, cfg.num_epochs):
                 current_epoch = epoch
@@ -522,6 +560,7 @@ def train_thinker_stage1(
                     autocast_dtype=autocast_dtype,
                     grad_scaler=grad_scaler,
                     after_step_fn=after_step_fn,
+                    should_stop_fn=lambda: stop_requested,
                 )
                 if is_main_process():
                     print(f"Epoch {epoch} train_loss={train_loss:.4f}")
@@ -532,6 +571,8 @@ def train_thinker_stage1(
 
                 # ✅ 所有 rank 都跑 evaluate（这样 val_sampler 分片才有意义）
                 val_loss = evaluate(model, val_loader, device)
+
+                _maybe_exit_gracefully()
 
                 # 只在主进程打印 & 保存
                 if is_main_process():
@@ -572,6 +613,9 @@ def train_thinker_stage1(
                 save_full_checkpoint(f"interrupted_step_{global_step}")
             raise
         finally:
+            # 恢复信号处理，避免影响后续代码
+            signal.signal(signal.SIGINT, old_sigint)
+            signal.signal(signal.SIGTERM, old_sigterm)
             if writer is not None:
                 writer.close()
 

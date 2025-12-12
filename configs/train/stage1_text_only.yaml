@@ -15,7 +15,7 @@ data:
   val_corpus_paths:
     - "data/corpus/val_text.jsonl"
   max_seq_length: 2048
-  num_workers: 8
+  num_workers: 16
   batch_size: 2           # per-GPU batch size
   shuffle: false
   # DDP 性能开关：若你确认每个 iteration 的 forward 都会用到全部参数，可设为 false 提速。

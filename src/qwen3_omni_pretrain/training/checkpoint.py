@@ -1,4 +1,5 @@
 import os
+import warnings
 from typing import Optional, Tuple
 
 import torch
@@ -69,13 +70,28 @@ def load_checkpoint(
 		trainer_state = torch.load(trainer_state_path, map_location=map_location)
 
 		if optimizer is not None and trainer_state.get("optimizer") is not None:
-			optimizer.load_state_dict(trainer_state["optimizer"])
+			try:
+				optimizer.load_state_dict(trainer_state["optimizer"])
+			except (ValueError, RuntimeError) as e:
+				warnings.warn(
+					f"[checkpoint] optimizer state mismatch, skip loading optimizer: {e}"
+				)
 
 		if scheduler is not None and trainer_state.get("scheduler") is not None:
-			scheduler.load_state_dict(trainer_state["scheduler"])
+			try:
+				scheduler.load_state_dict(trainer_state["scheduler"])
+			except (ValueError, RuntimeError) as e:
+				warnings.warn(
+					f"[checkpoint] scheduler state mismatch, skip loading scheduler: {e}"
+				)
 
 		if scaler is not None and trainer_state.get("scaler") is not None:
-			scaler.load_state_dict(trainer_state["scaler"])
+			try:
+				scaler.load_state_dict(trainer_state["scaler"])
+			except (ValueError, RuntimeError) as e:
+				warnings.warn(
+					f"[checkpoint] scaler state mismatch, skip loading scaler: {e}"
+				)
 
 		start_epoch = int(trainer_state.get("epoch", 0))
 		global_step = int(trainer_state.get("global_step", 0))

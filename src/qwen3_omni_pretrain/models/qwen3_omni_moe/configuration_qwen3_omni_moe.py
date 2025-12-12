@@ -18,6 +18,16 @@ class Qwen3OmniMoeThinkerConfig:
     num_experts: int = 8
     num_experts_per_tok: int = 2
     
+    # shared expert 是否启用（启用时：y = shared(x) + routed(x)）
+    moe_shared_expert: bool = True
+    # shared expert 的 intermediate size（None -> 跟 intermediate_size 相同）
+    moe_shared_intermediate_size: Optional[int] = None
+    # Router 初始化：小方差（避免初期 collapse），并可做行归一化
+    moe_router_init_std: float = 1e-3
+    moe_router_normalize_init: bool = True
+    # 对每个 token 的 top-k 权重是否重新归一化（保持输出尺度稳定）
+    moe_renormalize_topk: bool = True
+    
     # 新增：哪些层使用 MoE，字符串形式，例如 "0,2,4,6"
     moe_layer_indices: Optional[str] = None
     
@@ -147,10 +157,25 @@ class Qwen3OmniMoeConfig(PretrainedConfig):
         self.audio_end_token_id = audio_end_token_id
 
         # 子配置：我们用 dataclass 来保存，但序列化时会转回 dict
+        thinker_cfg_dict = thinker_config if isinstance(thinker_config, dict) else (thinker_config.__dict__ if thinker_config else {})
+
+        if isinstance(thinker_cfg_dict, dict):
+            # 兼容 YAML/旧字段：use_shared_expert -> moe_shared_expert，shared_intermediate_size -> moe_shared_intermediate_size
+            mapping = {
+                "use_shared_expert": "moe_shared_expert",
+                "shared_intermediate_size": "moe_shared_intermediate_size",
+                "moe_router_init_std": "moe_router_init_std",
+                "moe_router_normalize_init": "moe_router_normalize_init",
+                "moe_renormalize_topk": "moe_renormalize_topk",
+            }
+            thinker_cfg_dict = {
+                (mapping.get(k, k)): v for k, v in thinker_cfg_dict.items()
+            }
+
         self.thinker_config = (
-            Qwen3OmniMoeThinkerConfig(**thinker_config)
-            if isinstance(thinker_config, dict)
-            else (thinker_config or Qwen3OmniMoeThinkerConfig())
+            Qwen3OmniMoeThinkerConfig(**thinker_cfg_dict)
+            if isinstance(thinker_cfg_dict, dict)
+            else (thinker_cfg_dict or Qwen3OmniMoeThinkerConfig())
         )
         self.talker_config = (
             Qwen3OmniMoeTalkerConfig(**talker_config)
