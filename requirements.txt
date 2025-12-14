@@ -4,6 +4,7 @@ torchvision>=0.21.0
 torchaudio>=2.6.0
 transformers>=4.45.0
 tensorboard>=2.16.0
+# galore-torch
 
 # 配置 & 工具
 deepspeed

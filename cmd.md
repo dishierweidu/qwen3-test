@@ -1,4 +1,6 @@
-apt-get install libpng-dev libjpeg-dev zlib1g-dev git cmake build-essential pkg-config libtiff-dev libavcodec-dev libavformat-dev libswscale-dev libv4l-dev libxvidcore-dev libx264-dev libgtk-3-dev libatlas-base-dev gfortran python3-dev python3-pip python3-venv python-is-python3 sudo iputils-ping net-tools curl wget libssl-dev libffi-dev python3-setuptools screen tmux htop nvtop zip unzip software-properties-common vim -y
+apt-get install libpng-dev libjpeg-dev zlib1g-dev git cmake build-essential pkg-config libtiff-dev libavcodec-dev libavformat-dev libswscale-dev libv4l-dev libxvidcore-dev libx264-dev libgtk-3-dev libatlas-base-dev gfortran python3-dev python3-pip python3-venv python-is-python3 sudo iputils-ping net-tools curl wget libssl-dev libffi-dev python3-setuptools screen tmux htop nvtop zip unzip software-properties-common vim libaio-dev -y
+
+DS_BUILD_CPU_ADAM=1 DS_BUILD_UTILS=1 DS_BUILD_AIO=1 pip install deepspeed --force-reinstall --no-build-isolation --extra-index-url https://download.pytorch.org/whl/cu121
 
 sudo add-apt-repository ppa:deadsnakes/ppa     ppa:fkrull/deadsnakes
 sudo apt-get update
@@ -29,6 +31,14 @@ python -m qwen3_omni_pretrain.cli_train_thinker  --config configs/train/stage1_t
 python -m qwen3_omni_pretrain.cli_train_thinker   --stage stage1   --config configs/train/stage1_text_only.yaml   --tokenizer_name_or_path Qwen/Qwen2.5-7B --tensorboard --log_dir runs/
 
 python -m qwen3_omni_pretrain.cli_train_thinker   --stage stage1   --config configs/train/stage1_text_only.yaml   --tokenizer_name_or_path src/tokenizer/Qwen3/ --tensorboard --log_dir runs/ --resume_from_checkpoint outputs/omni_stage1_text_7b-20251209-003201/step_15000/
+
+deepspeed --num_gpus 8 \
+  --module qwen3_omni_pretrain.cli_train_thinker \
+  --stage stage1 \
+  --config configs/train/deepspeed.yaml \
+  --tokenizer_name_or_path src/tokenizer/Qwen3 \
+  --deepspeed configs/deepspeed/zero3_offload.json \
+  --tensorboard --log_dir runs/
 
 # resume_from_checkpoint can point to any step_*/best_*/latest folder saved by trainer_thinker; it now restores optimizer/scheduler/scaler/global_step so training continues from the recorded step/epoch.
 

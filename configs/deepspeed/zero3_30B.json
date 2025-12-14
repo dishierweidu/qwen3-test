@@ -1,0 +1,37 @@
+{
+  "train_micro_batch_size_per_gpu": 8, 
+  "gradient_accumulation_steps": 8,
+
+  "bf16": { "enabled": true },
+
+  "zero_optimization": {
+    "stage": 3,
+    "contiguous_gradients": true,
+    "overlap_comm": true,
+    "zero_quantized_weights": true, 
+    "zero_hpz_partition_size": 8,         
+    "zero_quantized_gradients": true,
+    "reduce_bucket_size": 5e7,
+    "stage3_prefetch_bucket_size": 5e7,
+    "stage3_param_persistence_threshold": 1e5,
+    "stage3_max_live_parameters": 5e8,
+    "stage3_max_reuse_distance": 1e9,
+    "stage3_gather_16bit_weights_on_model_save": true
+  },
+
+  "optimizer": {
+    "type": "FusedAdam", 
+    "params": {
+      "lr": 1e-4,
+      "betas": [0.9, 0.95],
+      "eps": 1e-8,
+      "weight_decay": 0.01
+    }
+  },
+
+  "gradient_checkpointing": {
+    "enabled": true
+  },
+
+  "wall_clock_breakdown": false
+}

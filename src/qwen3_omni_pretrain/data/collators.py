@@ -29,43 +29,55 @@ class TextCausalLMCollator:
         pad_id = tokenizer.pad_token_id
         if pad_id is None:
             pad_id = tokenizer.eos_token_id
-        self.pad_token_id = pad_id
-        self.max_seq_length = max_seq_length
+        self.pad_token_id = int(pad_id)
+        self.max_seq_length = int(max_seq_length)
 
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-        input_ids_list = []
-        attn_list = []
+        bsz = len(batch)
+        
+        # 1. 初始化全 Pad 的 Tensor [B, max_seq_length]
+        #    这样无论数据多短，送入 GPU 的都是满长矩阵
+        input_ids = torch.full(
+            (bsz, self.max_seq_length), 
+            self.pad_token_id, 
+            dtype=torch.long
+        )
+        attention_mask = torch.zeros(
+            (bsz, self.max_seq_length), 
+            dtype=torch.long
+        )
+        labels = torch.full(
+            (bsz, self.max_seq_length), 
+            -100, 
+            dtype=torch.long
+        )
 
-        for ex in batch:
+        for i, ex in enumerate(batch):
             ids = ex["input_ids"]
             mask = ex["attention_mask"]
 
+            # 转换为 Tensor
             if not torch.is_tensor(ids):
                 ids = torch.tensor(ids, dtype=torch.long)
             if not torch.is_tensor(mask):
                 mask = torch.tensor(mask, dtype=torch.long)
 
-            # 截断到 max_seq_length（防止 Dataset 返回太长）
-            ids = ids[: self.max_seq_length]
-            mask = mask[: self.max_seq_length]
+            # 截断
+            seq_len = ids.size(0)
+            if seq_len > self.max_seq_length:
+                ids = ids[:self.max_seq_length]
+                mask = mask[:self.max_seq_length]
+                seq_len = self.max_seq_length
 
-            input_ids_list.append(ids)
-            attn_list.append(mask)
-
-        # pad 到同一长度
-        input_ids = pad_sequence(
-            input_ids_list,
-            batch_first=True,
-            padding_value=self.pad_token_id,
-        )  # [B, T]
-        attention_mask = pad_sequence(
-            attn_list,
-            batch_first=True,
-            padding_value=0,
-        )  # [B, T]
-
-        labels = input_ids.clone()
-        labels[input_ids == self.pad_token_id] = -100
+            # 填充到固定位置
+            input_ids[i, :seq_len] = ids
+            attention_mask[i, :seq_len] = mask
+            
+            # Labels: Pad 部分已经在初始化时设为 -100 了，这里只填有效部分
+            # 同样要把 input_ids 中的 pad_token 设为 -100 (虽然理论上 mask 掉就行，双重保险)
+            label_ids = ids.clone()
+            label_ids[label_ids == self.pad_token_id] = -100
+            labels[i, :seq_len] = label_ids
 
         return {
             "input_ids": input_ids,          # [B, T]

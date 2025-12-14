@@ -12,7 +12,6 @@ from .configuration_qwen3_omni_moe import Qwen3OmniMoeConfig, Qwen3OmniMoeThinke
 from .modules.moe import Qwen3OmniMoeMLP
 
 
-
 class RMSNorm(nn.Module):
     r"""Zero-centered RMSNorm used in Qwen3-Next / Omni style blocks.
 
@@ -41,7 +40,6 @@ class RMSNorm(nn.Module):
         # 核心：乘以 (1 + weight)，而不是直接乘 weight
         scale = (1.0 + self.weight).to(x.dtype)
         return x * scale
-
 
 
 class RotaryEmbedding(nn.Module):
@@ -163,16 +161,9 @@ class MultiHeadSelfAttention(nn.Module):
 
         # 检查维度合法性
         if (self.head_dim * self.num_heads) != self.hidden_size:
-            raise ValueError(
-                f"hidden_size must be divisible by num_heads "
-                f"(got hidden_size={self.hidden_size}, num_heads={self.num_heads}, "
-                f"head_dim={self.head_dim})"
-            )
+            raise ValueError(f"hidden_size must be divisible by num_heads")
         if self.num_kv_heads <= 0 or (self.num_heads % self.num_kv_heads) != 0:
-            raise ValueError(
-                f"num_heads must be a multiple of num_kv_heads for GQA/MQA "
-                f"(got num_heads={self.num_heads}, num_kv_heads={self.num_kv_heads})"
-            )
+            raise ValueError(f"num_heads must be a multiple of num_kv_heads for GQA")
 
         # Q 全头；K/V 只用 num_kv_heads 头 → 真正利用 GQA
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
@@ -263,48 +254,32 @@ class MultiHeadSelfAttention(nn.Module):
             
         # 5) SDPA/FlashAttention
         if self.use_flash_attention:
-            # 使用 PyTorch SDPA/FlashAttention 内核（自动选择最佳实现）
-            attn_mask = attention_mask  # broadcast: [B, 1, 1, T] -> [B, nh, T, T]
-            try:
-                sdpa_ctx = None
-                if hasattr(torch.nn, "attention") and hasattr(torch.nn.attention, "sdpa_kernel"):
-                    sdpa_ctx = torch.nn.attention.sdpa_kernel(
-                        enable_flash=True,
-                        enable_math=True,
-                        enable_mem_efficient=True,
-                    )
-                else:
-                    sdpa_ctx = torch.backends.cuda.sdp_kernel(
-                        enable_flash=True,
-                        enable_math=True,
-                        enable_mem_efficient=True,
-                    )
+            attn_mask = attention_mask
+            
+            # [FIX 1] Dtype 修正：必须让 bias (mask) 的类型匹配 query 的类型 (bf16/fp16)
+            if attn_mask is not None and attn_mask.dtype != q.dtype:
+                attn_mask = attn_mask.to(q.dtype)
 
-                with sdpa_ctx:
-                    out = F.scaled_dot_product_attention(
-                        q, k, v,
-                        attn_mask=attn_mask,
-                        dropout_p=0.0,
-                        is_causal=False,
-                    )
-            except Exception:
-                out = F.scaled_dot_product_attention(
-                    q, k, v,
-                    attn_mask=attn_mask,
-                    dropout_p=0.0,
-                    is_causal=False,
-                )
+            # [FIX 2] API 修正：移除旧版 sdpa_kernel(enable_flash=True)
+            # PyTorch 2.4+ 默认会自动尝试 FlashAttention，无需强制 context
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+                is_causal=False,
+            )
         else:
-            scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)  # [B, nh, T, T]
-
+            scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)
             if attention_mask is not None:
-                # attention_mask: [B, 1, 1, T] 或 [B, 1, T, T]
+                # [FIX 1] 这里也加上 dtype 转换更安全
+                if attention_mask.dtype != scores.dtype:
+                    attention_mask = attention_mask.to(scores.dtype)
                 scores = scores + attention_mask
 
             attn = torch.softmax(scores, dim=-1)
             out = torch.matmul(attn, v)  # [B, nh, T, hd]
             
-        # --- NEW: apply gate at SDPA output (G1 position) ---
+        # 6) Gate & Output
         if gate is not None:
             out = out * gate  # 形状兼容自动广播
 
@@ -312,6 +287,7 @@ class MultiHeadSelfAttention(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, T, self.num_heads * self.head_dim)
         out = self.o_proj(out) # [B, T, hidden_size]
         return out
+
 
 class CausalConv1d(nn.Module):
     """
@@ -345,11 +321,7 @@ class CausalConv1d(nn.Module):
         x: [B, T, H]
         """
         bsz, seq_len, hidden = x.size()
-        assert hidden == self.hidden_size
-
-        # [B, T, H] -> [B, H, T]
         x = x.transpose(1, 2)
-        # 只在左侧 padding，保持因果性
         x = F.pad(x, (self.pad, 0))
         x = self.conv(x)  # [B, H, T]
         x = x.transpose(1, 2)  # [B, T, H]
@@ -384,11 +356,7 @@ class GatedDeltaNetAttention(nn.Module):
         self.chunk_size = chunk_size
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
-            raise ValueError(
-                f"[GatedDeltaNet] hidden_size must be divisible by num_heads "
-                f"(got hidden_size={self.hidden_size}, num_heads={self.num_heads}, "
-                f"head_dim={self.head_dim})"
-            )
+            raise ValueError(f"hidden_size must be divisible by num_heads")
 
         # 1) 前端因果卷积
         self.causal_conv = CausalConv1d(
@@ -442,20 +410,13 @@ class GatedDeltaNetAttention(nn.Module):
 
         # 3) 可选：对 Q 做 RoPE（和 Attention 保持一致的接口）
         if rotary_emb is not None and position_ids is not None:
-            q = rotary_emb(q, position_ids)  # [B, num_heads, T, head_dim]
+            q = rotary_emb(q, position_ids)
 
-        # 4) 计算时间尺度门控参数
-        # dt_raw: [B, T, H_dt] -> [B, H_dt, T]
-        dt_raw = self.dt_proj(hidden_states)  # [B, T, num_heads_for_dt]
-        dt_raw = dt_raw.transpose(1, 2)       # [B, num_heads_for_dt, T]
-
-        # softplus 保证 dt>0，再加上 dt_bias
-        dt = F.softplus(dt_raw + self.dt_bias.view(1, -1, 1))  # [B, H_dt, T]
-        # A_log 控制衰减率
-        A = -self.A_log.exp().view(1, -1, 1)                   # [B, H_dt, 1]
-        # 连续时间到离散时间的转换，这里是简化版本
-        alpha = torch.exp(A * dt)  # [B, H_dt, T]
-        beta = dt                  # [B, H_dt, T]
+        dt_raw = self.dt_proj(hidden_states).transpose(1, 2)
+        dt = F.softplus(dt_raw + self.dt_bias.view(1, -1, 1))
+        A = -self.A_log.exp().view(1, -1, 1)
+        alpha = torch.exp(A * dt)
+        beta = dt
         
         # 5) 为了简单，将 dt 的 head 维对齐到 num_heads（若数量不同则 broadcast）
         if self.num_heads_for_dt != self.num_heads:
@@ -468,39 +429,18 @@ class GatedDeltaNetAttention(nn.Module):
                 alpha = alpha.repeat_interleave(repeat_factor, dim=1)[:, : self.num_heads, :]
                 beta = beta.repeat_interleave(repeat_factor, dim=1)[:, : self.num_heads, :]
         
-        # 6) 逐时间步更新 state 并计算输出
-        # 我们用 per-head state_t: [B, num_heads, head_dim]
-        # state = torch.zeros(
-        #     B, self.num_heads, self.head_dim, device=device, dtype=dtype
-        # )
-        
-        # 6.1 计算 p_t = cumprod(alpha)
-        #     alpha: [B, nh, T]
-
         eps = 1e-6
-        alpha = alpha.to(dtype)                 # 保持精度一致
+        alpha = alpha.to(dtype)
         beta = beta.to(dtype)
 
-        p = torch.cumprod(alpha, dim=2)        # [B, nh, T]
+        p = torch.cumprod(alpha, dim=2)
+        contrib = beta.unsqueeze(-1) * v
+        inv_p = 1.0 / (p.unsqueeze(-1) + eps)
+        u = contrib * inv_p
+        s = torch.cumsum(u, dim=2)
+        state = p.unsqueeze(-1) * s
+        out = q * state
 
-        # 6.2 计算贡献项 contrib = beta * v
-        # v: [B, nh, T, hd]
-        contrib = beta.unsqueeze(-1) * v       # [B, nh, T, hd]
-
-        # 6.3 u = contrib / p_i
-        inv_p = 1.0 / (p.unsqueeze(-1) + eps)  # [B, nh, T, 1]
-        u = contrib * inv_p                    # [B, nh, T, hd]
-
-        # 6.4 前缀和 s_t = sum_{i<=t} u_i
-        s = torch.cumsum(u, dim=2)             # [B, nh, T, hd]
-
-        # 6.5 state_t = p_t * s_t
-        state = p.unsqueeze(-1) * s            # [B, nh, T, hd]
-
-        # 7) 输出：q_t * state_t
-        out = q * state                        # [B, nh, T, hd]
-
-        # 8) 合并 heads + 输出投影
         out = out.transpose(1, 2).contiguous().view(B, T, self.num_heads * self.head_dim)
         out = self.out_proj(out)  # [B, T, H]
         return out
@@ -582,7 +522,6 @@ class ThinkerDecoderLayer(nn.Module):
             self.moe_mlp = None
 
         self.mlp_norm = RMSNorm(config.hidden_size)
-
         self.rotary_emb = rotary_emb
 
     def forward(
@@ -591,7 +530,6 @@ class ThinkerDecoderLayer(nn.Module):
         attention_mask: Optional[torch.Tensor],
         position_ids: torch.Tensor,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        # Self-Attention
         residual = hidden_states
         hidden_states = self.attn_norm(hidden_states)
         attn_out = self.self_attn(
@@ -611,15 +549,13 @@ class ThinkerDecoderLayer(nn.Module):
 
         aux_loss = None
         if self.moe_mlp is not None:
-            moe_out, aux_loss = self.moe_mlp(hidden_states)  # aux_loss: scalar tensor
+            moe_out, aux_loss = self.moe_mlp(hidden_states)
             mlp_out = shared_out + moe_out
         else:
             mlp_out = shared_out
 
         hidden_states = residual + mlp_out
-
         return hidden_states, aux_loss
-
 
 
 class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
@@ -627,14 +563,13 @@ class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
 
     def __init__(self, config: Qwen3OmniMoeConfig):
         super().__init__(config)
-
         self.vocab_size = config.vocab_size
         self.hidden_size = config.hidden_size
         self.max_position_embeddings = config.max_position_embeddings
 
         thinker_cfg = config.thinker_config
         assert isinstance(thinker_cfg, Qwen3OmniMoeThinkerConfig)
-        self.thinker_cfg = thinker_cfg  # 保存一份，forward 里要用 moe_aux_loss_coef
+        self.thinker_cfg = thinker_cfg
 
         self.embed_tokens = nn.Embedding(
             config.vocab_size, thinker_cfg.hidden_size
@@ -680,7 +615,6 @@ class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
                 )
 
         use_deltanet_global = getattr(thinker_cfg, "use_deltanet", False)
-
         self.gradient_checkpointing = getattr(thinker_cfg, "gradient_checkpointing", False)
 
         layers = []
@@ -712,17 +646,13 @@ class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
             layers.append(ThinkerDecoderLayer(local_cfg, self.rotary_emb))
 
         self.layers = nn.ModuleList(layers)
-
         self.norm = RMSNorm(thinker_cfg.hidden_size)
-
-        # LM head
         self.lm_head = nn.Linear(thinker_cfg.hidden_size, config.vocab_size, bias=False)
         
         # transformers 要绑词嵌入
         self.config.tie_word_embeddings = True
         # 让 lm_head.weight 和 embed_tokens.weight 指向同一个 Tensor
         self.lm_head.weight = self.embed_tokens.weight
-
         self.post_init()
 
     def _prepare_attention_mask(
@@ -741,11 +671,10 @@ class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
             device=device,
         )
         causal_mask = torch.triu(causal_mask, diagonal=1)
-        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1,1,T,T]
+        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
 
         # padding mask [B, 1, 1, T]
         padding_mask = (1.0 - attention_mask[:, None, None, :]) * -1e4
-
         return causal_mask + padding_mask
 
     def forward(
@@ -841,7 +770,6 @@ class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
                 ce_loss = ce_loss_raw / num_tokens
             else:
                 ce_loss = ce_loss_raw * 0.0
-
             loss = ce_loss
 
         # 4. MoE aux loss 归一化 + 合并
@@ -878,10 +806,8 @@ class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
             output["ce_loss"] = ce_loss
         if aux_loss is not None:
             output["aux_loss"] = aux_loss
-
         if output_hidden_states:
             all_hidden_states.append(hidden_states)
             output["hidden_states"] = all_hidden_states
 
         return output
-

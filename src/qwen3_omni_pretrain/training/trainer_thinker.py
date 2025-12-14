@@ -2,6 +2,7 @@
 
 import os
 import time
+import datetime
 import signal
 import json
 from contextlib import nullcontext
@@ -17,6 +18,10 @@ from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
 try:
     import deepspeed
+    deepspeed.init_distributed(
+        dist_backend="nccl", 
+        timeout=datetime.timedelta(hours=2)  # <--- 关键！强制传入 2小时
+    )
 except ImportError:
     deepspeed = None
 
@@ -216,6 +221,14 @@ def train_thinker_stage1(
     use_deepspeed = cfg.deepspeed is not None
     use_ddp = (cfg.ddp and ddp_available()) and (not use_deepspeed)
 
+    # -------------------------------------------------------------------------
+    # [FIX] 预加载 DeepSpeed Config，用于后续的 zero.Init
+    # -------------------------------------------------------------------------
+    ds_config_dict = None
+    if use_deepspeed:
+        with open(cfg.deepspeed, "r") as f:
+            ds_config_dict = json.load(f)
+
     # 把后面的所有逻辑包进 distributed_context，这样会自动 init/destroy process_group
     with distributed_context():
         # 2. 设备 & rank
@@ -258,27 +271,43 @@ def train_thinker_stage1(
         # 4. 模型配置 & 模型
         model_cfg_dict = load_yaml(cfg.model_config_path)
         model_cfg = Qwen3OmniMoeConfig(**model_cfg_dict)
-        model = Qwen3OmniMoeThinkerTextModel(model_cfg)
-        model.to(device)  # type: ignore[arg-type]
+
+        # -------------------------------------------------------------------------
+        # [FIX] 使用 ZeRO-3 Init 初始化模型 (防止 CPU OOM)
+        # -------------------------------------------------------------------------
+        if use_deepspeed:
+            if is_main_process():
+                print(">> Initializing model with DeepSpeed ZeRO-3 Context (Partitioning params)...")
+            # 传入 config 字典，Init 会自动按照 fp16/bf16 和 ZeRO 策略切分参数
+            init_ctx = deepspeed.zero.Init(config_dict_or_path=ds_config_dict)
+        else:
+            init_ctx = nullcontext()
+
+        with init_ctx:
+            model = Qwen3OmniMoeThinkerTextModel(model_cfg)
+        
+        # 即使使用了 zero.Init，to(device) 也是安全的（通常只移动 buffer）
+        if not use_deepspeed: 
+             model.to(device) # DeepSpeed下通常不需要完整to(device)，但保留也无妨
 
         model_engine = None
-        # ✅ 分布式封装
+        # DDP 封装
         if use_ddp:
             model = ddp_wrap_model(
                 model,
                 find_unused_parameters=cfg.ddp_find_unused_parameters,
             )
-        # DeepSpeed 的 initialize 在 optimizer/scheduler 创建后进行
 
-        # 激活检查点：降低显存占用，耗时换显存
+        # 激活检查点
         if cfg.gradient_checkpointing:
-            model.thinker_cfg.gradient_checkpointing = True
+            # 注意：使用了 DeepSpeed 后，直接修改 internal model config 可能需要小心
+            # 但 Qwen3OmniMoeThinkerTextModel 应该把 config 暴露出来了
+            if hasattr(model, "thinker_cfg"):
+                model.thinker_cfg.gradient_checkpointing = True
+            elif hasattr(model, "module") and hasattr(model.module, "thinker_cfg"):
+                model.module.thinker_cfg.gradient_checkpointing = True
 
-        # 5. 数据集
-        # train_dataset = _build_text_dataset(cfg.train_corpus_paths, tokenizer, cfg.max_seq_length)
-        # val_dataset = _build_text_dataset(cfg.val_corpus_paths, tokenizer, cfg.max_seq_length)
-
-        # collator = TextCausalLMCollator(tokenizer, cfg.max_seq_length)
+        # 5. 数据集 (保持原逻辑)
         if cfg.use_packed_dataset:
             assert cfg.packed_train_bin_path is not None, "use_packed_dataset=True 但 packed_train_bin_path 为空"
             assert cfg.packed_val_bin_path is not None, "use_packed_dataset=True 但 packed_val_bin_path 为空"
@@ -299,8 +328,7 @@ def train_thinker_stage1(
             val_dataset = _build_text_dataset(cfg.val_corpus_paths, tokenizer, cfg.max_seq_length)
             collator = TextCausalLMCollator(tokenizer, cfg.max_seq_length)
 
-
-        # ✅ DistributedSampler
+        # DistributedSampler
         if use_ddp or (dist.is_available() and dist.is_initialized()):
             train_sampler = DistributedSampler(
                 train_dataset,
@@ -322,7 +350,6 @@ def train_thinker_stage1(
             train_dataset,
             batch_size=cfg.batch_size,
             sampler=train_sampler,
-            # sampler 存在时必须 shuffle=False
             shuffle=(train_sampler is None and cfg.shuffle),
             num_workers=cfg.num_workers,
             collate_fn=collator,
@@ -338,7 +365,17 @@ def train_thinker_stage1(
             pin_memory=True,
         )
 
-        # 6. 优化器 & scheduler
+        # 计算总步数 (用于 Scheduler)
+        if cfg.max_steps > 0:
+            num_training_steps = cfg.max_steps
+        else:
+            num_training_steps = len(train_loader) * cfg.num_epochs // max(cfg.gradient_accumulation_steps, 1)
+        num_warmup_steps = int(num_training_steps * cfg.warmup_ratio)
+
+        # 6. 优化器 & scheduler 配置
+        optimizer = None
+        scheduler = None
+
         no_decay = ["bias", "norm", "layernorm", "ln"]
         optimizer_grouped_parameters = [
             {
@@ -356,102 +393,115 @@ def train_thinker_stage1(
                 "weight_decay": 0.0,
             },
         ]
-        if cfg.int8_optimizer:
-            try:
-                import bitsandbytes as bnb
-            except ImportError as exc:
-                raise ImportError(
-                    "int8_optimizer=True requires bitsandbytes to be installed."
-                ) from exc
-
-            optimizer = bnb.optim.AdamW8bit(
-                optimizer_grouped_parameters,
-                lr=cfg.learning_rate,
-                betas=(0.9, 0.95),
-                eps=1e-8,
-            )
-        else:
-            optimizer = torch.optim.AdamW(
-                optimizer_grouped_parameters,
-                lr=cfg.learning_rate,
-                betas=(0.9, 0.95),
-                eps=1e-8,
-            )
-
-        if cfg.max_steps > 0:
-            num_training_steps = cfg.max_steps
-        else:
-            num_training_steps = len(train_loader) * cfg.num_epochs // max(cfg.gradient_accumulation_steps, 1)
-
-        num_warmup_steps = int(num_training_steps * cfg.warmup_ratio)
-
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=num_warmup_steps,
-            num_training_steps=num_training_steps,
-        )
-
         if use_deepspeed:
             if deepspeed is None:
-                raise ImportError("DeepSpeed is not installed, but deepspeed config was provided.")
-            assert cfg.deepspeed is not None
-            with open(cfg.deepspeed, "r") as f:
-                ds_cfg = json.load(f)
+                raise ImportError("DeepSpeed is not installed")
+            
+            zero_opt = ds_config_dict.get("zero_optimization", {})
+            offload_opt = zero_opt.get("offload_optimizer", {})
+            
+            # 检查是否配置了 device 为 cpu 或 nvme
+            offload_device = offload_opt.get("device")
+            is_offload_enabled = offload_device in ["cpu", "nvme"]
 
-            # 若使用 ZeRO-Offload 或 ds-config 提供了 optimizer，则交给 DeepSpeed 自建 CPUAdam/配置的优化器
-            zero_cfg = ds_cfg.get("zero_optimization", {}) if isinstance(ds_cfg, dict) else {}
-            offload_opt = bool(zero_cfg.get("offload_optimizer", False)) or bool(zero_cfg.get("offload_param", False))
-            ds_has_optimizer = isinstance(ds_cfg, dict) and ("optimizer" in ds_cfg)
-            use_client_optimizer = not (offload_opt or ds_has_optimizer)
+            if is_offload_enabled:
+                # 场景 A: 70B模型 或 30B+CPU内存 (开启了 Offload) -> 必须用 CPUAdam
+                from deepspeed.ops.adam import DeepSpeedCPUAdam
+                OptimizerClass = DeepSpeedCPUAdam
+                if is_main_process():
+                    print(f">> [Auto-Select] Detected Offload (device={offload_device}). Using 'DeepSpeedCPUAdam'.")
+            else:
+                # 场景 B: 30B模型+纯显存 (关闭了 Offload) -> 推荐用 FusedAdam (更快)
+                from deepspeed.ops.adam import FusedAdam
+                OptimizerClass = FusedAdam
+                if is_main_process():
+                    print(">> [Auto-Select] Detected Pure GPU training. Using 'FusedAdam'.")
 
-            # 对 offload 且未提供 optimizer 的情况，优先尝试 CPUAdam；若不可用则允许自带 AdamW 并关闭强制检查
-            if offload_opt and (not ds_has_optimizer) and isinstance(ds_cfg, dict):
-                cpuadam_available = False
-                try:
-                    from deepspeed.ops.adam import DeepSpeedCPUAdam  # noqa: F401
-                    cpuadam_available = True
-                except Exception:
-                    cpuadam_available = False
-
-                if cpuadam_available:
-                    ds_cfg["optimizer"] = {
-                        "type": "CPUAdam",
-                        "params": {
-                            "lr": cfg.learning_rate,
-                            "betas": [0.9, 0.95],
-                            "eps": 1e-8,
-                            "weight_decay": cfg.weight_decay,
-                        },
-                    }
-                    ds_has_optimizer = True
-                    use_client_optimizer = False
-                else:
-                    # 回退：允许自带 AdamW，并关闭 zero_force_ds_cpu_optimizer 强制校验
-                    ds_cfg.setdefault("zero_force_ds_cpu_optimizer", False)
-                    use_client_optimizer = True
-
-            ds_optimizer = optimizer if use_client_optimizer else None
-            ds_scheduler = scheduler if use_client_optimizer else None
-
+            # [Step 3] 实例化选中的优化器类
+            optimizer = OptimizerClass(
+                optimizer_grouped_parameters,
+                lr=cfg.learning_rate,
+                betas=(0.9, 0.95),
+                eps=1e-8,
+                bias_correction=True,
+                # 注意: FusedAdam 参数叫 adam_w_mode, CPUAdam 叫 adamw_mode
+                # 这里做一个小的参数适配
+                **({"adam_w_mode": True} if OptimizerClass.__name__ == "FusedAdam" else {"adamw_mode": True}),
+                amsgrad=False
+            )
+            
+            # 3. 将两者传给 deepspeed.initialize
+            # 这样 DeepSpeed 引擎内部就会接管这个 scheduler 的 step
             model_engine, optimizer, _, scheduler = deepspeed.initialize(
                 model=model,
                 model_parameters=model.parameters(),
-                optimizer=ds_optimizer,
-                lr_scheduler=ds_scheduler,
-                config=ds_cfg,
+                optimizer=optimizer,      # <--- 传入手动创建的优化器
+                lr_scheduler=scheduler,   # <--- 传入手动创建的调度器
+                config=ds_config_dict,
             )
+            
             model = model_engine
             device = torch.device(f"cuda:{model_engine.local_rank}")
 
-        # 如果提供了 resume 路径，加载训练状态
+        else:
+            # DDP 模式 (保持不变)
+            if cfg.int8_optimizer:
+                try:
+                    import bitsandbytes as bnb
+                    optimizer = bnb.optim.AdamW8bit(
+                        optimizer_grouped_parameters,
+                        lr=cfg.learning_rate,
+                        betas=(0.9, 0.95),
+                        eps=1e-8,
+                    )
+                except ImportError:
+                    raise ImportError("int8_optimizer=True requires bitsandbytes.")
+            else:
+                optimizer = torch.optim.AdamW(
+                    optimizer_grouped_parameters,
+                    lr=cfg.learning_rate,
+                    betas=(0.9, 0.95),
+                    eps=1e-8,
+                )
+
+            scheduler = get_linear_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=num_warmup_steps,
+                num_training_steps=num_training_steps,
+            )
+
+        # -------------------------------------------------------------------------
+        # Checkpoint Resume (修复 DeepSpeed Resume 逻辑)
+        # -------------------------------------------------------------------------
         start_epoch = 0
         global_step = 0
         best_val_loss = float("inf")
         resume_path = resume_from_checkpoint or cfg.resume_from_checkpoint
+        
         if resume_path:
             if use_deepspeed:
-                if is_main_process():
-                    print(f"[warn] DeepSpeed resume not implemented; ignoring {resume_path} and starting fresh.")
+                # DeepSpeed 的 load_checkpoint 需要传入目录路径
+                # 它会自动加载 model, optimizer, scheduler (如果 scheduler 是传给 initialize 的)
+                # 因为我们 scheduler 是后挂的，所以只能加载 model 和 optimizer 状态
+                load_path, client_state = model_engine.load_checkpoint(resume_path)
+                if load_path is None:
+                    if is_main_process():
+                        print(f"[Warn] DeepSpeed failed to load checkpoint from {resume_path}")
+                else:
+                    if is_main_process():
+                        print(f"DeepSpeed Resumed from {load_path}")
+                    # 尝试恢复 step 信息
+                    if client_state:
+                         global_step = client_state.get('step', global_step)
+                         start_epoch = client_state.get('epoch', start_epoch)
+                         best_val_loss = client_state.get('best_val_loss', best_val_loss)
+                    
+                    # 恢复 scheduler 状态
+                    # 注意：如果 DeepSpeed 没有管理 scheduler，需要手动 load
+                    scheduler_state = os.path.join(resume_path, "scheduler.pt")
+                    if os.path.exists(scheduler_state):
+                        scheduler.load_state_dict(torch.load(scheduler_state, map_location="cpu"))
+
             else:
                 start_epoch, global_step, best_val_loss = load_checkpoint(
                     resume_path,
@@ -477,28 +527,45 @@ def train_thinker_stage1(
         current_epoch = start_epoch
 
         def save_full_checkpoint(tag: str):
-            """Persist full trainer state (model/opt/scheduler/scaler/step)."""
+            """Persist full trainer state."""
             if not is_main_process():
-                return
+                # DeepSpeed 只有 rank 0 负责协调，但所有进程都要参与 save_checkpoint 调用
+                if use_deepspeed:
+                     pass # DeepSpeed 要求所有 rank 调用，见下文
+                else:
+                     return
 
             save_path = os.path.join(cfg.output_dir, tag)
+            
+            client_state = {
+                'step': global_step,
+                'epoch': current_epoch,
+                'best_val_loss': best_val_loss
+            }
+
             if use_deepspeed and model_engine is not None:
-                os.makedirs(save_path, exist_ok=True)
-                model_engine.save_checkpoint(save_path)
-                tokenizer.save_pretrained(save_path)
+                # DeepSpeed save_checkpoint 需要所有进程调用
+                model_engine.save_checkpoint(save_path, client_state=client_state)
+                # Scheduler 如果没托管给 DS，需要单独存
+                if is_main_process():
+                    tokenizer.save_pretrained(save_path)
+                    torch.save(scheduler.state_dict(), os.path.join(save_path, "scheduler.pt"))
             else:
-                save_checkpoint(
-                    checkpoint_dir=save_path,
-                    model=model,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    scaler=grad_scaler,
-                    epoch=current_epoch,
-                    global_step=global_step,
-                    best_val_loss=best_val_loss,
-                )
-                tokenizer.save_pretrained(save_path)
-            if writer is not None:
+                # DDP 模式仅主进程保存
+                if is_main_process():
+                    save_checkpoint(
+                        checkpoint_dir=save_path,
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=grad_scaler,
+                        epoch=current_epoch,
+                        global_step=global_step,
+                        best_val_loss=best_val_loss,
+                    )
+                    tokenizer.save_pretrained(save_path)
+
+            if is_main_process() and writer is not None:
                 writer.add_text("ckpt/path", save_path, global_step)
                 writer.flush()
 
@@ -526,10 +593,13 @@ def train_thinker_stage1(
                 return
             if dist.is_available() and dist.is_initialized():
                 dist.barrier()
+            # DeepSpeed 下所有 rank 都要调 save
+            tag = f"interrupted_step_{global_step}"
             if is_main_process():
-                tag = f"interrupted_step_{global_step}"
                 print(f"Saving emergency checkpoint: {tag} (signal={received_signal})")
-                save_full_checkpoint(tag)
+            
+            save_full_checkpoint(tag)
+            
             if dist.is_available() and dist.is_initialized():
                 dist.barrier()
             # 恢复信号处理后退出
@@ -565,7 +635,6 @@ def train_thinker_stage1(
                 if lr is not None:
                     msg += f" lr={lr:.6f}"
 
-                # ETA 估算
                 elapsed_total = time.time() - train_start_time
                 eta_total = None
                 if total_updates > 0:
@@ -606,11 +675,13 @@ def train_thinker_stage1(
 
             # optional step-based evaluation
             if cfg.eval_steps > 0 and step % cfg.eval_steps == 0:
+                # 只有主进程打印，但 evaluate 内部应该是所有 rank 参与（如果 DataLoader 是分布式的）
+                # 这里为了简单，假设 evaluate 是全 rank 同步的，只在 rank 0 打印
+                val_loss = evaluate(model, val_loader, device)
+                model.train()
+                
                 if is_main_process():
-                    val_loss = evaluate(model, val_loader, device)
-                    model.train()
                     print(f"[step {step}] val_loss={val_loss:.4f}")
-
                     if writer is not None:
                         writer.add_scalar("step/val_loss", val_loss, step)
                         writer.flush()
@@ -636,7 +707,9 @@ def train_thinker_stage1(
             total_aux = 0.0
             num_updates = 0
 
+            # Rank check for logging
             rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            
             amp_ctx = (
                 torch.autocast(device_type=device.type, dtype=autocast_dtype)
                 if autocast_dtype is not None
@@ -647,7 +720,7 @@ def train_thinker_stage1(
                 if should_stop_fn is not None and should_stop_fn():
                     break
 
-                if batch_idx == 0:
+                if batch_idx == 0 and rank == 0:
                     if "input_ids" in batch:
                         print(f"[Rank {rank}] got first batch, input_ids={batch['input_ids'].shape}")
                     else:
@@ -655,6 +728,8 @@ def train_thinker_stage1(
 
                 batch = _move_batch_to_device(batch, device)
 
+                # DeepSpeed 自动处理 mixed precision，通常不需要外层 autocast
+                # 但如果你的模型内部没有 cast 逻辑，保险起见保留
                 with amp_ctx:
                     outputs = model_engine(**batch)
                     loss = outputs["loss"]
@@ -662,19 +737,23 @@ def train_thinker_stage1(
                     aux_loss = outputs.get("aux_loss", None)
 
                 if _is_global_bad_loss(loss):
-                    print(
-                        f"[train_one_epoch_ds] NaN/Inf loss at batch {batch_idx + 1} "
-                        f"(loss={loss}, ce={ce_loss if isinstance(ce_loss, torch.Tensor) else ce_loss}, "
-                        f"aux={aux_loss if isinstance(aux_loss, torch.Tensor) else aux_loss}) — skip this batch."
-                    )
-                    model_engine.zero_grad()
+                    if rank == 0:
+                        print(
+                            f"[train_one_epoch_ds] NaN/Inf loss at batch {batch_idx + 1} "
+                            f"(loss={loss}) — skip this batch."
+                        )
+                    # DeepSpeed 遇到 NaN 会导致 overflow warning，通常不需要手动 zero_grad
+                    # 但可以显式跳过
                     continue
 
                 model_engine.backward(loss)
+                model_engine.step()
 
+                # DeepSpeed 内部处理了 gradient accumulation，
+                # 所以每次 step 之后检查一下是否真的发生了 optimizer update
+                # model_engine.is_gradient_accumulation_boundary() 用来判断
+                
                 if model_engine.is_gradient_accumulation_boundary():
-                    model_engine.step()
-
                     num_updates += 1
                     step_loss = loss.detach().item()
                     total_loss += step_loss
@@ -724,7 +803,7 @@ def train_thinker_stage1(
             for epoch in range(start_epoch, cfg.num_epochs):
                 current_epoch = epoch
                 step_offset = global_step
-                # DDP sampler 每个 epoch 需要设置一下 epoch，保证 shuffle 不同
+                # DDP sampler 每个 epoch 需要设置一下 epoch
                 if isinstance(train_sampler, DistributedSampler) and dist.is_available() and dist.is_initialized():
                     train_sampler.set_epoch(epoch)
 
@@ -755,19 +834,18 @@ def train_thinker_stage1(
                         after_step_fn=after_step_fn,
                         should_stop_fn=lambda: stop_requested,
                     )
+                
                 if is_main_process():
                     print(f"Epoch {epoch} train_loss={train_loss:.4f}")
-
                     if writer is not None:
                         writer.add_scalar("epoch/train_loss", train_loss, global_step)
                         writer.flush()
 
-                # ✅ 所有 rank 都跑 evaluate（这样 val_sampler 分片才有意义）
+                # Evaluate
                 val_loss = evaluate(model, val_loader, device)
 
                 _maybe_exit_gracefully()
 
-                # 只在主进程打印 & 保存
                 if is_main_process():
                     print(f"Epoch {epoch} val_loss={val_loss:.4f}")
 
@@ -780,19 +858,16 @@ def train_thinker_stage1(
                         best_val_loss = val_loss
                         save_full_checkpoint(f"best_epoch{epoch}")
 
-            # 最终再保存一版 latest
             if is_main_process():
                 print("Saving final model to latest")
                 save_full_checkpoint("latest")
 
         except KeyboardInterrupt:
-            # 训练被打断时尽量保留一个可用 ckpt
             if is_main_process():
                 print("KeyboardInterrupt received, saving emergency checkpoint...")
                 save_full_checkpoint(f"interrupted_step_{global_step}")
             raise
         finally:
-            # 恢复信号处理，避免影响后续代码
             signal.signal(signal.SIGINT, old_sigint)
             signal.signal(signal.SIGTERM, old_sigterm)
             if writer is not None:
