@@ -4,6 +4,13 @@ model_type: qwen3_omni_moe
 
 vocab_size: 152064
 
+# 多模态相关占位（后续会用）
+image_token_id: 151857
+audio_token_id: 151858
+video_token_id: 151859
+audio_start_token_id: 151860
+audio_end_token_id: 151861
+
 # 统一 RoPE / 三维 RoPE，一开始可以都用一维 RoPE
 rope_theta: 10000.0
 rope_partial_factor: 0.25

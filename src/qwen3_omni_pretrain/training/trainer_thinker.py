@@ -3,6 +3,8 @@
 import os
 import time
 import signal
+import json
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, Union, List, Optional
 
@@ -12,6 +14,11 @@ from torch.utils.data import DataLoader, ConcatDataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard.writer import SummaryWriter
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
+
+try:
+    import deepspeed
+except ImportError:
+    deepspeed = None
 
 from qwen3_omni_pretrain.training.distributed import (
     distributed_context,
@@ -35,7 +42,7 @@ from qwen3_omni_pretrain.models.qwen3_omni_moe.modeling_thinker_vision_audio imp
 )
 from qwen3_omni_pretrain.data.datasets.text_dataset import TextJsonlDataset, PackedTokenDataset
 from qwen3_omni_pretrain.data.collators import TextCausalLMCollator, PackedCausalLMCollator
-from qwen3_omni_pretrain.training.loop import train_one_epoch, evaluate
+from qwen3_omni_pretrain.training.loop import train_one_epoch, evaluate, _move_batch_to_device, _is_global_bad_loss
 from qwen3_omni_pretrain.training.checkpoint import save_checkpoint, load_checkpoint
 # from qwen3_omni_pretrain.utils.seed import set_seed
 
@@ -71,6 +78,7 @@ class TrainerThinkerConfig:
     resume_from_checkpoint: Optional[str] = None
 
     gradient_checkpointing: bool = False
+    deepspeed: Optional[str] = None
     
     use_packed_dataset: bool = False
     packed_train_bin_path: Optional[str] = None
@@ -170,6 +178,7 @@ def build_trainer_config(yaml_path: str) -> TrainerThinkerConfig:
         ddp_find_unused_parameters=bool(train_cfg.get("ddp_find_unused_parameters", True)),
         resume_from_checkpoint=train_cfg.get("resume_from_checkpoint"),
         gradient_checkpointing=bool(train_cfg.get("gradient_checkpointing", False)),
+        deepspeed=train_cfg.get("deepspeed"),
         use_packed_dataset=use_packed_dataset,
         packed_train_bin_path=packed_train_bin_path,
         packed_val_bin_path=packed_val_bin_path,
@@ -193,20 +202,27 @@ def train_thinker_stage1(
     enable_tensorboard: bool = False,
     log_dir: str = "./runs",
     resume_from_checkpoint: Optional[str] = None,
+    deepspeed_config: Optional[str] = None,
 ):
     # 1. 加载配置
     cfg = build_trainer_config(config_path)
+    if deepspeed_config:
+        cfg.deepspeed = deepspeed_config
     os.makedirs(cfg.output_dir, exist_ok=True)
 
     set_seed(cfg.seed)
 
-    # 用 cfg.ddp 控制是否开启 DDP（再叠加 ddp_available 判断）
-    use_ddp = cfg.ddp and ddp_available()
+    # DeepSpeed 有自己的分布式初始化；DDP 仅在未使用 DeepSpeed 时启用
+    use_deepspeed = cfg.deepspeed is not None
+    use_ddp = (cfg.ddp and ddp_available()) and (not use_deepspeed)
 
     # 把后面的所有逻辑包进 distributed_context，这样会自动 init/destroy process_group
     with distributed_context():
         # 2. 设备 & rank
-        if use_ddp:
+        if use_deepspeed:
+            local_rank = get_local_rank()
+            device = torch.device(f"cuda:{local_rank}")
+        elif use_ddp:
             local_rank = get_local_rank()
             device = torch.device(f"cuda:{local_rank}")
         else:
@@ -245,15 +261,14 @@ def train_thinker_stage1(
         model = Qwen3OmniMoeThinkerTextModel(model_cfg)
         model.to(device)  # type: ignore[arg-type]
 
-        # ✅ DDP 包裹模型
-        model = (
-            ddp_wrap_model(
+        model_engine = None
+        # ✅ 分布式封装
+        if use_ddp:
+            model = ddp_wrap_model(
                 model,
                 find_unused_parameters=cfg.ddp_find_unused_parameters,
             )
-            if use_ddp
-            else model
-        )
+        # DeepSpeed 的 initialize 在 optimizer/scheduler 创建后进行
 
         # 激活检查点：降低显存占用，耗时换显存
         if cfg.gradient_checkpointing:
@@ -286,7 +301,7 @@ def train_thinker_stage1(
 
 
         # ✅ DistributedSampler
-        if use_ddp:
+        if use_ddp or (dist.is_available() and dist.is_initialized()):
             train_sampler = DistributedSampler(
                 train_dataset,
                 num_replicas=dist.get_world_size(),
@@ -376,25 +391,81 @@ def train_thinker_stage1(
             num_training_steps=num_training_steps,
         )
 
+        if use_deepspeed:
+            if deepspeed is None:
+                raise ImportError("DeepSpeed is not installed, but deepspeed config was provided.")
+            assert cfg.deepspeed is not None
+            with open(cfg.deepspeed, "r") as f:
+                ds_cfg = json.load(f)
+
+            # 若使用 ZeRO-Offload 或 ds-config 提供了 optimizer，则交给 DeepSpeed 自建 CPUAdam/配置的优化器
+            zero_cfg = ds_cfg.get("zero_optimization", {}) if isinstance(ds_cfg, dict) else {}
+            offload_opt = bool(zero_cfg.get("offload_optimizer", False)) or bool(zero_cfg.get("offload_param", False))
+            ds_has_optimizer = isinstance(ds_cfg, dict) and ("optimizer" in ds_cfg)
+            use_client_optimizer = not (offload_opt or ds_has_optimizer)
+
+            # 对 offload 且未提供 optimizer 的情况，优先尝试 CPUAdam；若不可用则允许自带 AdamW 并关闭强制检查
+            if offload_opt and (not ds_has_optimizer) and isinstance(ds_cfg, dict):
+                cpuadam_available = False
+                try:
+                    from deepspeed.ops.adam import DeepSpeedCPUAdam  # noqa: F401
+                    cpuadam_available = True
+                except Exception:
+                    cpuadam_available = False
+
+                if cpuadam_available:
+                    ds_cfg["optimizer"] = {
+                        "type": "CPUAdam",
+                        "params": {
+                            "lr": cfg.learning_rate,
+                            "betas": [0.9, 0.95],
+                            "eps": 1e-8,
+                            "weight_decay": cfg.weight_decay,
+                        },
+                    }
+                    ds_has_optimizer = True
+                    use_client_optimizer = False
+                else:
+                    # 回退：允许自带 AdamW，并关闭 zero_force_ds_cpu_optimizer 强制校验
+                    ds_cfg.setdefault("zero_force_ds_cpu_optimizer", False)
+                    use_client_optimizer = True
+
+            ds_optimizer = optimizer if use_client_optimizer else None
+            ds_scheduler = scheduler if use_client_optimizer else None
+
+            model_engine, optimizer, _, scheduler = deepspeed.initialize(
+                model=model,
+                model_parameters=model.parameters(),
+                optimizer=ds_optimizer,
+                lr_scheduler=ds_scheduler,
+                config=ds_cfg,
+            )
+            model = model_engine
+            device = torch.device(f"cuda:{model_engine.local_rank}")
+
         # 如果提供了 resume 路径，加载训练状态
         start_epoch = 0
         global_step = 0
         best_val_loss = float("inf")
         resume_path = resume_from_checkpoint or cfg.resume_from_checkpoint
         if resume_path:
-            start_epoch, global_step, best_val_loss = load_checkpoint(
-                resume_path,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                scaler=grad_scaler,
-                map_location=device,
-            )
-            if is_main_process():
-                print(
-                    f"Resumed from {resume_path}: start_epoch={start_epoch}, "
-                    f"global_step={global_step}, best_val_loss={best_val_loss}"
+            if use_deepspeed:
+                if is_main_process():
+                    print(f"[warn] DeepSpeed resume not implemented; ignoring {resume_path} and starting fresh.")
+            else:
+                start_epoch, global_step, best_val_loss = load_checkpoint(
+                    resume_path,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=grad_scaler,
+                    map_location=device,
                 )
+                if is_main_process():
+                    print(
+                        f"Resumed from {resume_path}: start_epoch={start_epoch}, "
+                        f"global_step={global_step}, best_val_loss={best_val_loss}"
+                    )
 
         # 7. 训练循环
         writer = None
@@ -411,17 +482,22 @@ def train_thinker_stage1(
                 return
 
             save_path = os.path.join(cfg.output_dir, tag)
-            save_checkpoint(
-                checkpoint_dir=save_path,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                scaler=grad_scaler,
-                epoch=current_epoch,
-                global_step=global_step,
-                best_val_loss=best_val_loss,
-            )
-            tokenizer.save_pretrained(save_path)
+            if use_deepspeed and model_engine is not None:
+                os.makedirs(save_path, exist_ok=True)
+                model_engine.save_checkpoint(save_path)
+                tokenizer.save_pretrained(save_path)
+            else:
+                save_checkpoint(
+                    checkpoint_dir=save_path,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=grad_scaler,
+                    epoch=current_epoch,
+                    global_step=global_step,
+                    best_val_loss=best_val_loss,
+                )
+                tokenizer.save_pretrained(save_path)
             if writer is not None:
                 writer.add_text("ckpt/path", save_path, global_step)
                 writer.flush()
@@ -545,30 +621,140 @@ def train_thinker_stage1(
 
             _maybe_exit_gracefully()
 
+        def train_one_epoch_deepspeed(
+            model_engine,
+            dataloader,
+            device,
+            autocast_dtype=None,
+            log_step_fn=None,
+            after_step_fn=None,
+            should_stop_fn=None,
+        ) -> float:
+            model_engine.train()
+            total_loss = 0.0
+            total_ce = 0.0
+            total_aux = 0.0
+            num_updates = 0
+
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            amp_ctx = (
+                torch.autocast(device_type=device.type, dtype=autocast_dtype)
+                if autocast_dtype is not None
+                else nullcontext()
+            )
+
+            for batch_idx, batch in enumerate(dataloader):
+                if should_stop_fn is not None and should_stop_fn():
+                    break
+
+                if batch_idx == 0:
+                    if "input_ids" in batch:
+                        print(f"[Rank {rank}] got first batch, input_ids={batch['input_ids'].shape}")
+                    else:
+                        print(f"[Rank {rank}] got first batch, keys={list(batch.keys())}")
+
+                batch = _move_batch_to_device(batch, device)
+
+                with amp_ctx:
+                    outputs = model_engine(**batch)
+                    loss = outputs["loss"]
+                    ce_loss = outputs.get("ce_loss", None)
+                    aux_loss = outputs.get("aux_loss", None)
+
+                if _is_global_bad_loss(loss):
+                    print(
+                        f"[train_one_epoch_ds] NaN/Inf loss at batch {batch_idx + 1} "
+                        f"(loss={loss}, ce={ce_loss if isinstance(ce_loss, torch.Tensor) else ce_loss}, "
+                        f"aux={aux_loss if isinstance(aux_loss, torch.Tensor) else aux_loss}) — skip this batch."
+                    )
+                    model_engine.zero_grad()
+                    continue
+
+                model_engine.backward(loss)
+
+                if model_engine.is_gradient_accumulation_boundary():
+                    model_engine.step()
+
+                    num_updates += 1
+                    step_loss = loss.detach().item()
+                    total_loss += step_loss
+
+                    if isinstance(ce_loss, torch.Tensor):
+                        total_ce += ce_loss.detach().item()
+                    if isinstance(aux_loss, torch.Tensor):
+                        total_aux += aux_loss.detach().item()
+
+                    current_lr = None
+                    if hasattr(model_engine, "get_lr"):
+                        lrs = model_engine.get_lr()
+                        if isinstance(lrs, (list, tuple)) and len(lrs) > 0:
+                            current_lr = lrs[0]
+
+                    if log_step_fn is not None:
+                        log_step_fn(
+                            step=num_updates,
+                            loss=step_loss,
+                            batch_idx=batch_idx,
+                            ce_loss=ce_loss.detach().item() if isinstance(ce_loss, torch.Tensor) else None,
+                            aux_loss=aux_loss.detach().item() if isinstance(aux_loss, torch.Tensor) else None,
+                            lr=current_lr,
+                        )
+
+                    if after_step_fn is not None:
+                        after_step_fn(
+                            step=num_updates,
+                            loss=step_loss,
+                            batch_idx=batch_idx,
+                            ce_loss=ce_loss.detach().item() if isinstance(ce_loss, torch.Tensor) else None,
+                            aux_loss=aux_loss.detach().item() if isinstance(aux_loss, torch.Tensor) else None,
+                            lr=current_lr,
+                            model=model_engine,
+                        )
+
+                if should_stop_fn is not None and should_stop_fn():
+                    break
+
+            if num_updates == 0:
+                return float("nan")
+
+            avg_loss = total_loss / num_updates
+            return avg_loss
+
         try:
             for epoch in range(start_epoch, cfg.num_epochs):
                 current_epoch = epoch
                 step_offset = global_step
                 # DDP sampler 每个 epoch 需要设置一下 epoch，保证 shuffle 不同
-                if use_ddp and isinstance(train_sampler, DistributedSampler):
+                if isinstance(train_sampler, DistributedSampler) and dist.is_available() and dist.is_initialized():
                     train_sampler.set_epoch(epoch)
 
                 if is_main_process():
                     print(f"Epoch {epoch} / {cfg.num_epochs - 1}")
 
-                train_loss = train_one_epoch(
-                    model=model,
-                    dataloader=train_loader,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    device=device,
-                    gradient_accumulation_steps=cfg.gradient_accumulation_steps,
-                    log_step_fn=log_step_fn,
-                    autocast_dtype=autocast_dtype,
-                    grad_scaler=grad_scaler,
-                    after_step_fn=after_step_fn,
-                    should_stop_fn=lambda: stop_requested,
-                )
+                if use_deepspeed and model_engine is not None:
+                    train_loss = train_one_epoch_deepspeed(
+                        model_engine=model_engine,
+                        dataloader=train_loader,
+                        device=device,
+                        autocast_dtype=autocast_dtype,
+                        log_step_fn=log_step_fn,
+                        after_step_fn=after_step_fn,
+                        should_stop_fn=lambda: stop_requested,
+                    )
+                else:
+                    train_loss = train_one_epoch(
+                        model=model,
+                        dataloader=train_loader,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        device=device,
+                        gradient_accumulation_steps=cfg.gradient_accumulation_steps,
+                        log_step_fn=log_step_fn,
+                        autocast_dtype=autocast_dtype,
+                        grad_scaler=grad_scaler,
+                        after_step_fn=after_step_fn,
+                        should_stop_fn=lambda: stop_requested,
+                    )
                 if is_main_process():
                     print(f"Epoch {epoch} train_loss={train_loss:.4f}")
 
@@ -590,28 +776,14 @@ def train_thinker_stage1(
                         writer.add_scalar("epoch/epoch", epoch, global_step)
                         writer.flush()
 
-                    # 取出真正的 HF 模型（DDP 包裹时在 model.module 里）
-                    model_to_save = model.module if hasattr(model, "module") else model
-
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
                         save_full_checkpoint(f"best_epoch{epoch}")
 
             # 最终再保存一版 latest
             if is_main_process():
-                final_path = os.path.join(cfg.output_dir, "latest")
-                print(f"Saving final model to {final_path}")
-                save_checkpoint(
-                    checkpoint_dir=final_path,
-                    model=model,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    scaler=grad_scaler,
-                    epoch=current_epoch + 1,
-                    global_step=global_step,
-                    best_val_loss=best_val_loss,
-                )
-                tokenizer.save_pretrained(final_path)
+                print("Saving final model to latest")
+                save_full_checkpoint("latest")
 
         except KeyboardInterrupt:
             # 训练被打断时尽量保留一个可用 ckpt

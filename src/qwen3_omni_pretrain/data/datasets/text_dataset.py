@@ -11,7 +11,10 @@ from transformers import PreTrainedTokenizerBase
 
 class TextJsonlDataset(Dataset):
     """
-    每行: {"text": "..."} 的 jsonl 文本语料
+    每行: {"text": "..."} 的 jsonl 文本语料。
+
+    为了限制常驻 RAM 占用，不再把所有文本读入内存，而是只记录
+    每条样本在文件中的偏移量，按需 seek 读取并 tokenize。
     """
 
     def __init__(self, path: str, tokenizer: PreTrainedTokenizerBase, max_seq_length: int = 2048):
@@ -19,23 +22,39 @@ class TextJsonlDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_seq_length = max_seq_length
 
-        self.samples: List[str] = []
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
+        self.offsets: List[int] = []
+        with open(path, "rb") as f:
+            while True:
+                pos = f.tell()
+                line = f.readline()
+                if not line:
+                    break
                 line = line.strip()
                 if not line:
                     continue
-                obj = json.loads(line)
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
                 text = obj.get("text", "")
                 if text:
-                    self.samples.append(text)
+                    self.offsets.append(pos)
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.offsets)
+
+    def _read_line(self, offset: int) -> str:
+        with open(self.path, "rb") as f:
+            f.seek(offset)
+            line = f.readline()
+        return line.decode("utf-8", errors="ignore")
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        # 👉 这里直接做 tokenize，让 DataLoader 的 num_workers 并行跑
-        text = self.samples[idx]
+        offset = self.offsets[idx]
+        line = self._read_line(offset).strip()
+
+        obj = json.loads(line)
+        text = obj.get("text", "")
 
         encoded = self.tokenizer(
             text,

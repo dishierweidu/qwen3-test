@@ -49,6 +49,20 @@ def parse_args():
         default=None,
         help="Path to a checkpoint directory to resume training.",
     )
+    # DeepSpeed / torch.distributed launchers会自动注入 local_rank；接受但不使用
+    parser.add_argument(
+        "--local_rank",
+        type=int,
+        default=None,
+        help="Local rank passed by launcher (unused here).",
+    )
+    # DeepSpeed 配置文件路径占位（传入后交给 trainer 初始化）
+    parser.add_argument(
+        "--deepspeed",
+        type=str,
+        default=None,
+        help="Path to DeepSpeed config JSON.",
+    )
     return parser.parse_args()
 
 
@@ -64,6 +78,7 @@ def main():
                 enable_tensorboard=args.tensorboard,
                 log_dir=args.log_dir,
                 resume_from_checkpoint=args.resume_from_checkpoint,
+                deepspeed_config=args.deepspeed,
             )
         else:
             cfg = load_yaml(args.config)
