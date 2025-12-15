@@ -1,0 +1,48 @@
+# configs/train/accelerator.yaml
+# Accelerator 训练配置 - 支持 DDP、DeepSpeed、FSDP 统一接口
+
+# ============================================================================
+# 基础开关
+# ============================================================================
+use_accelerator: true                 # 是否启用 Accelerator（与原有 deepspeed/ddp 配置互斥）
+
+# ============================================================================
+# 混合精度配置
+# ============================================================================
+mixed_precision: "bf16"               # 可选: "no", "fp16", "bf16"
+
+# ============================================================================
+# 分布式策略选择 (三选一)
+# ============================================================================
+# 策略 1: 纯 DDP（默认）
+distributed_type: "MULTI_GPU"         # 可选: "NO", "MULTI_GPU", "DEEPSPEED", "FSDP"
+
+# 策略 2: DeepSpeed ZeRO
+# distributed_type: "DEEPSPEED"
+deepspeed_config_path: null           # DeepSpeed JSON 配置文件路径，仅 distributed_type=DEEPSPEED 时生效
+                                       # 例如: "configs/deepspeed/zero3_30B.json"
+
+# 策略 3: FSDP
+# distributed_type: "FSDP"
+fsdp_config_path: null                # FSDP YAML 配置文件路径，仅 distributed_type=FSDP 时生效
+                                       # 例如: "configs/accelerate/fsdp_config.yaml"
+
+# ============================================================================
+# 梯度累积 & 优化
+# ============================================================================
+gradient_accumulation_steps: 8        # 梯度累积步数（会同步到 train 配置）
+gradient_checkpointing: false         # 激活检查点（节省显存，增加计算）
+
+# ============================================================================
+# 日志 & 调试
+# ============================================================================
+log_with: "tensorboard"               # 可选: "tensorboard", "wandb", "all", null
+project_dir: "./runs"                 # Accelerator 项目目录
+
+# ============================================================================
+# 高级选项
+# ============================================================================
+dispatch_batches: null                # DataLoader dispatch 策略
+split_batches: false                  # 是否跨设备拆分 batch
+even_batches: true                    # 是否填充最后一个不完整 batch
+step_scheduler_with_optimizer: true   # scheduler 是否和 optimizer 同步 step

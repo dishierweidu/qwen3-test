@@ -16,6 +16,6 @@ pyyaml>=6.0.0
 sentencepiece>=0.1.99
 tokenizers>=0.15.0
 
-# 可选：以后如果用到加速/分布式，可以再加
-# accelerate>=0.30.0
+# 分布式训练加速
+accelerate>=0.30.0
 # bitsandbytes>=0.43.0

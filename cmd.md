@@ -78,6 +78,46 @@ git config --global user.name "Eliot Zhao"
 
 netstat -tulnp | grep 29500
 
+# =============================================================================
+# Accelerator 训练模式 (推荐)
+# =============================================================================
+# 支持 DDP、DeepSpeed ZeRO、FSDP 三种分布式策略的统一接口
+
+# 方式1: 使用 accelerate launch (推荐)
+# DDP 模式
+accelerate launch --multi_gpu --num_processes 8 --mixed_precision bf16 \
+  -m qwen3_omni_pretrain.cli_train_thinker \
+  --stage stage1 \
+  --config configs/train/stage1_text_only.yaml \
+  --tokenizer_name_or_path src/tokenizer/Qwen3 \
+  --use_accelerator \
+  --tensorboard --log_dir runs/
+
+# DeepSpeed ZeRO-3 模式
+accelerate launch --multi_gpu --num_processes 8 --mixed_precision bf16 \
+  --use_deepspeed --deepspeed_config_file configs/deepspeed/zero3_30B.json \
+  -m qwen3_omni_pretrain.cli_train_thinker \
+  --stage stage1 \
+  --config configs/train/deepspeed.yaml \
+  --tokenizer_name_or_path src/tokenizer/Qwen3 \
+  --use_accelerator \
+  --tensorboard --log_dir runs/
+
+# FSDP 模式
+accelerate launch --multi_gpu --num_processes 8 --mixed_precision bf16 \
+  --use_fsdp --fsdp_sharding_strategy FULL_SHARD \
+  -m qwen3_omni_pretrain.cli_train_thinker \
+  --stage stage1 \
+  --config configs/train/stage1_text_only.yaml \
+  --tokenizer_name_or_path src/tokenizer/Qwen3 \
+  --use_accelerator \
+  --tensorboard --log_dir runs/
+
+# 方式2: 使用封装脚本
+./scripts/run_with_accelerate.sh --config configs/train/deepspeed.yaml --num-gpus 8
+./scripts/run_with_accelerate.sh --config configs/train/deepspeed.yaml --deepspeed configs/deepspeed/zero3_30B.json
+./scripts/run_with_accelerate.sh --config configs/train/stage1_text_only.yaml --fsdp
+
 # 训练集
 python scripts/pretokenize_corpus.py \
   --input data/corpus/train_text.jsonl /ai/finnox/mobvoi_seq_monkey_general_open_corpus.jsonl \

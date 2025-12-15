@@ -70,6 +70,15 @@ class Qwen3OmniMoeThinkerConfig:
 
     # 激活检查点，降低显存占用（牺牲前向重算时间）
     gradient_checkpointing: bool = False
+    
+    # ============================================================================
+    # Tensor Parallelism 配置 (可选)
+    # ============================================================================
+    # 是否启用 Tensor Parallelism
+    use_tensor_parallel: bool = False
+    # TP 大小（必须能整除 num_attention_heads 和 num_kv_heads）
+    # 如果为 None 或 0，则根据 initialize_model_parallel 自动获取
+    tensor_parallel_size: Optional[int] = None
 
 @dataclass
 class Qwen3OmniMoeTalkerConfig:

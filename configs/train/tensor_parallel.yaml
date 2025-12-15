@@ -1,0 +1,103 @@
+# configs/train/tensor_parallel.yaml
+# ============================================================================
+# 3D Parallel Training Configuration (TP + ZeRO)
+# ============================================================================
+# This configuration enables Tensor Parallelism combined with DeepSpeed ZeRO
+# for efficient large model training across multiple GPUs.
+#
+# Usage:
+#   accelerate launch --config_file configs/accelerate/deepspeed_zero3.yaml \
+#     -m qwen3_omni_pretrain.cli_train_thinker \
+#     --config configs/train/tensor_parallel.yaml \
+#     --use_tensor_parallel --tp_size 2
+#
+# Parallelism layout with 8 GPUs, tp_size=2:
+#   - Tensor Parallel Groups: [GPU 0,1], [GPU 2,3], [GPU 4,5], [GPU 6,7]
+#   - Data Parallel Groups: [GPU 0,2,4,6], [GPU 1,3,5,7]
+#   - Each DP group sees different data batches
+#   - Each TP group shares the same model partition
+# ============================================================================
+
+experiment_name: "qwen3_omni_stage1_text_tp"
+
+model:
+  config_path: configs/model/qwen3_omni_30b_moe.yaml
+
+data:
+  # 支持单路径或多路径
+  train_corpus_paths:
+    - "data/corpus/train_text.jsonl"
+    # - "/ai/finnox/mobvoi_seq_monkey_general_open_corpus.jsonl"
+    - "/hpc2hdd/home/zzhao056/mobv/mobvoi_seq_monkey_general_open_corpus.jsonl"
+  val_corpus_paths:
+    - "data/corpus/val_text.jsonl"
+  max_seq_length: 2048
+  batch_size: 4  # Per-GPU batch size
+  num_workers: 4
+  shuffle: true
+  
+  # Packed dataset 选项 (可选)
+  use_packed_dataset: false
+  # packed_train_bin_path: data/packed/train.bin
+  # packed_val_bin_path: data/packed/val.bin
+  # packed_seq_length: 2048
+
+train:
+  num_epochs: 1
+  max_steps: -1  # -1 表示按 epoch 训练
+  
+  # 优化器参数
+  learning_rate: 2.0e-4
+  weight_decay: 0.1
+  warmup_ratio: 0.03
+  
+  # 梯度累积
+  gradient_accumulation_steps: 4
+  
+  # 日志和检查点
+  logging_steps: 10
+  eval_steps: 500
+  save_steps: 1000
+  output_dir: outputs/stage1_text_tp
+  
+  # 精度
+  bf16: true
+  fp16: false
+  
+  # 梯度检查点 (推荐开启以节省显存)
+  gradient_checkpointing: true
+  
+  # 分布式训练模式
+  ddp: false  # 使用 Accelerator 或 TP 时关闭原生 DDP
+  
+  # Accelerator 配置 (推荐与 TP 一起使用)
+  use_accelerator: true
+  accelerator_config_path: configs/accelerate/deepspeed_zero3.yaml
+  
+  # ============================================================================
+  # Tensor Parallelism 配置 (新增)
+  # ============================================================================
+  tensor_parallel:
+    enabled: true
+    tp_size: 2  # Tensor Parallel 大小，必须能整除 world_size
+    # pp_size: 1  # Pipeline Parallel 大小 (暂不支持，保留字段)
+    
+    # 同步策略
+    # - "allreduce": 在反向传播时 all-reduce 梯度 (默认)
+    # - "reduce_scatter": 使用 reduce-scatter + all-gather (更高效但需要 NCCL 2.10+)
+    gradient_sync_strategy: "allreduce"
+    
+    # 权重初始化
+    # - "megatron": Megatron-LM 风格，保证 TP 组内一致性
+    # - "random": 随机初始化 (用于测试)
+    weight_init_method: "megatron"
+    
+    # Sequence Parallelism (可选，与 TP 配合使用)
+    # 将 LayerNorm/Dropout 的激活值也沿序列维度切分
+    sequence_parallel: false
+    
+  # DeepSpeed 配置 (可与 TP 结合使用)
+  deepspeed: configs/deepspeed/zero3_offload.json
+  
+  # 随机种子
+  seed: 42

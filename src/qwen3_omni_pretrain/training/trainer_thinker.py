@@ -25,6 +25,27 @@ try:
 except ImportError:
     deepspeed = None
 
+# Accelerate 支持
+try:
+    from accelerate import Accelerator, DistributedType
+    from accelerate.utils import is_deepspeed_available
+    from qwen3_omni_pretrain.training.accelerator_utils import (
+        ACCELERATE_AVAILABLE,
+        AcceleratorConfig,
+        load_accelerator_config,
+        create_accelerator,
+        prepare_model_optimizer_dataloader,
+        save_accelerator_checkpoint,
+        load_accelerator_checkpoint,
+        print_on_main,
+        unwrap_model,
+    )
+except ImportError:
+    ACCELERATE_AVAILABLE = False
+    Accelerator = None
+    DistributedType = None
+    is_deepspeed_available = None
+
 from qwen3_omni_pretrain.training.distributed import (
     distributed_context,
     ddp_available,
@@ -84,6 +105,10 @@ class TrainerThinkerConfig:
 
     gradient_checkpointing: bool = False
     deepspeed: Optional[str] = None
+    
+    # Accelerator 配置
+    use_accelerator: bool = False
+    accelerator_config_path: Optional[str] = None
     
     use_packed_dataset: bool = False
     packed_train_bin_path: Optional[str] = None
@@ -184,6 +209,9 @@ def build_trainer_config(yaml_path: str) -> TrainerThinkerConfig:
         resume_from_checkpoint=train_cfg.get("resume_from_checkpoint"),
         gradient_checkpointing=bool(train_cfg.get("gradient_checkpointing", False)),
         deepspeed=train_cfg.get("deepspeed"),
+        # Accelerator 配置
+        use_accelerator=bool(train_cfg.get("use_accelerator", False)),
+        accelerator_config_path=train_cfg.get("accelerator_config_path"),
         use_packed_dataset=use_packed_dataset,
         packed_train_bin_path=packed_train_bin_path,
         packed_val_bin_path=packed_val_bin_path,
@@ -201,6 +229,442 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
+# =============================================================================
+# Accelerator 训练模式实现
+# =============================================================================
+def _train_with_accelerator(
+    cfg: TrainerThinkerConfig,
+    tokenizer_name_or_path: str,
+    enable_tensorboard: bool,
+    log_dir: str,
+    resume_from_checkpoint: Optional[str],
+    use_tensor_parallel: bool = False,
+    tensor_parallel_size: int = 1,
+    pipeline_parallel_size: int = 1,
+):
+    """
+    使用 HuggingFace Accelerate 进行训练
+    支持 DDP、DeepSpeed ZeRO、FSDP 三种分布式策略的统一接口
+    可选支持 Tensor Parallelism (TP + ZeRO)
+    """
+    from qwen3_omni_pretrain.training.accelerator_utils import (
+        load_accelerator_config,
+        create_accelerator,
+        save_accelerator_checkpoint,
+        load_accelerator_checkpoint,
+    )
+    from qwen3_omni_pretrain.training.loop_accelerator import (
+        train_one_epoch_accelerator,
+        evaluate_accelerator,
+    )
+    
+    # 1. 加载 Accelerator 配置
+    if cfg.accelerator_config_path:
+        accel_cfg = load_accelerator_config(cfg.accelerator_config_path)
+    else:
+        # 使用默认配置
+        accel_cfg = AcceleratorConfig(
+            use_accelerator=True,
+            mixed_precision="bf16" if cfg.bf16 else ("fp16" if cfg.fp16 else "no"),
+            gradient_accumulation_steps=cfg.gradient_accumulation_steps,
+            gradient_checkpointing=cfg.gradient_checkpointing,
+            log_with="tensorboard" if enable_tensorboard else None,
+            project_dir=log_dir,
+        )
+    
+    # 2. 创建 Accelerator
+    accelerator = create_accelerator(accel_cfg, project_name=cfg.experiment_name)
+    if accelerator.device.type != "cuda":
+        raise RuntimeError(
+            f"Accelerator picked device={accelerator.device}; expected CUDA. Check CUDA visibility / accelerate config."
+        )
+    torch.cuda.set_device(accelerator.local_process_index % torch.cuda.device_count())
+    
+    # 主进程打印配置
+    if accelerator.is_main_process:
+        print(f">> Using Accelerator Mode")
+        print(f"   - distributed_type: {accelerator.distributed_type}")
+        print(f"   - mixed_precision: {accelerator.mixed_precision}")
+        print(f"   - num_processes: {accelerator.num_processes}")
+        print(f"   - gradient_accumulation_steps: {accelerator.gradient_accumulation_steps}")
+    
+    # 3. Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_name_or_path,
+        trust_remote_code=True,
+    )
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    # 4. 模型配置 & 初始化
+    model_cfg_dict = load_yaml(cfg.model_config_path)
+    model_cfg = Qwen3OmniMoeConfig(**model_cfg_dict)
+    
+    # =========================================================================
+    # Tensor Parallelism 初始化 (在模型创建之前)
+    # =========================================================================
+    if use_tensor_parallel and tensor_parallel_size > 1:
+        from qwen3_omni_pretrain.training.distributed import init_tensor_parallel
+        init_tensor_parallel(
+            tensor_parallel_size=tensor_parallel_size,
+            pipeline_parallel_size=pipeline_parallel_size,
+        )
+        # 更新模型配置以启用 TP
+        model_cfg.thinker_config.use_tensor_parallel = True
+        model_cfg.thinker_config.tensor_parallel_size = tensor_parallel_size
+        if accelerator.is_main_process:
+            print(f">> Tensor Parallelism enabled: TP={tensor_parallel_size}, PP={pipeline_parallel_size}")
+    
+    # 对于 DeepSpeed ZeRO-3，使用 zero.Init 上下文
+    init_ctx = nullcontext()
+    if accelerator.distributed_type == DistributedType.DEEPSPEED:
+        # DeepSpeed ZeRO-3 初始化
+        if accelerator.state.deepspeed_plugin is not None:
+            from accelerate.utils import is_deepspeed_available
+            if is_deepspeed_available():
+                import deepspeed
+                ds_config = accelerator.state.deepspeed_plugin.deepspeed_config
+                if isinstance(ds_config, dict):
+                    def _to_int(value, default):
+                        try:
+                            return int(value)
+                        except (TypeError, ValueError):
+                            return default
+
+                    micro_bs = ds_config.get("train_micro_batch_size_per_gpu") or ds_config.get("train_batch_size_per_gpu")
+                    # Force gradient accumulation to align with Accelerator config to avoid DS/Accelerate mismatch
+                    grad_acc = accelerator.gradient_accumulation_steps
+
+                    micro_bs = _to_int(micro_bs, cfg.batch_size)
+                    grad_acc = _to_int(grad_acc, accelerator.gradient_accumulation_steps)
+
+                    ds_config["train_micro_batch_size_per_gpu"] = micro_bs
+                    ds_config["gradient_accumulation_steps"] = grad_acc
+                    ds_config["train_batch_size"] = micro_bs * accelerator.num_processes * grad_acc
+
+                init_ctx = deepspeed.zero.Init(config_dict_or_path=ds_config)
+                if accelerator.is_main_process:
+                    print(">> Initializing model with DeepSpeed ZeRO-3 Context")
+    
+    # 选择模型类型：TP 模型或标准模型
+    with init_ctx:
+        if use_tensor_parallel and tensor_parallel_size > 1:
+            from qwen3_omni_pretrain.models.qwen3_omni_moe.modeling_thinker_text_tp import (
+                Qwen3OmniMoeThinkerTextModelTP,
+            )
+            model = Qwen3OmniMoeThinkerTextModelTP(model_cfg)
+        else:
+            model = Qwen3OmniMoeThinkerTextModel(model_cfg)
+    if accelerator.is_main_process:
+        first_param_device = next(model.parameters()).device
+        print(f">> Model initial device: {first_param_device}")
+    
+    # 激活检查点
+    if cfg.gradient_checkpointing or accel_cfg.gradient_checkpointing:
+        if hasattr(model, "thinker_cfg"):
+            model.thinker_cfg.gradient_checkpointing = True
+        try:
+            model.gradient_checkpointing_enable()
+        except ValueError:
+            # 某些 TP 模型未实现 supports_gradient_checkpointing；直接打开标志即可
+            if hasattr(model, "gradient_checkpointing"):
+                model.gradient_checkpointing = True
+            if accelerator.is_main_process:
+                print(
+                    ">> Gradient checkpointing flag enabled (manual) for model without built-in support"
+                )
+    
+    # 5. 数据集
+    if cfg.use_packed_dataset:
+        assert cfg.packed_train_bin_path is not None
+        assert cfg.packed_val_bin_path is not None
+        train_dataset = PackedTokenDataset(
+            bin_path=cfg.packed_train_bin_path,
+            seq_length=cfg.packed_seq_length or cfg.max_seq_length,
+        )
+        val_dataset = PackedTokenDataset(
+            bin_path=cfg.packed_val_bin_path,
+            seq_length=cfg.packed_seq_length or cfg.max_seq_length,
+        )
+        collator = PackedCausalLMCollator(pad_token_id=tokenizer.pad_token_id)
+    else:
+        train_dataset = _build_text_dataset(cfg.train_corpus_paths, tokenizer, cfg.max_seq_length)
+        val_dataset = _build_text_dataset(cfg.val_corpus_paths, tokenizer, cfg.max_seq_length)
+        collator = TextCausalLMCollator(tokenizer, cfg.max_seq_length)
+
+    # 6. DataLoader - 为 TP 分组的 DP 切分数据
+    train_sampler = None
+    val_sampler = None
+    if use_tensor_parallel and tensor_parallel_size > 1 and torch.distributed.is_initialized():
+        dp_world_size = torch.distributed.get_world_size() // tensor_parallel_size
+        dp_rank = torch.distributed.get_rank() // tensor_parallel_size
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=dp_world_size,
+            rank=dp_rank,
+            shuffle=cfg.shuffle,
+            drop_last=False,
+        )
+        val_sampler = DistributedSampler(
+            val_dataset,
+            num_replicas=dp_world_size,
+            rank=dp_rank,
+            shuffle=False,
+            drop_last=False,
+        )
+
+    loader_kwargs = {
+        "num_workers": cfg.num_workers,
+        "collate_fn": collator,
+        "pin_memory": True,
+    }
+    if cfg.num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 4
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=cfg.batch_size,
+        sampler=train_sampler,
+        shuffle=(train_sampler is None and cfg.shuffle),
+        **loader_kwargs,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=cfg.batch_size,
+        sampler=val_sampler,
+        shuffle=False,
+        **loader_kwargs,
+    )
+    
+    # 7. 计算总步数
+    num_update_steps_per_epoch = len(train_loader) // accelerator.gradient_accumulation_steps
+    if cfg.max_steps > 0:
+        num_training_steps = cfg.max_steps
+        cfg.num_epochs = (cfg.max_steps // num_update_steps_per_epoch) + 1
+    else:
+        num_training_steps = num_update_steps_per_epoch * cfg.num_epochs
+    num_warmup_steps = int(num_training_steps * cfg.warmup_ratio)
+    
+    # 8. 优化器
+    no_decay = ["bias", "norm", "layernorm", "ln"]
+    optimizer_grouped_parameters = [
+        {
+            "params": [p for n, p in model.named_parameters() if not any(nd in n.lower() for nd in no_decay)],
+            "weight_decay": cfg.weight_decay,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if any(nd in n.lower() for nd in no_decay)],
+            "weight_decay": 0.0,
+        },
+    ]
+    
+    optimizer = torch.optim.AdamW(
+        optimizer_grouped_parameters,
+        lr=cfg.learning_rate,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+    )
+    
+    # 9. Scheduler
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=num_training_steps,
+    )
+    
+    # 10. Accelerator prepare (封装 model, optimizer, scheduler, dataloaders)
+    model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
+        model, optimizer, train_loader, val_loader, scheduler
+    )
+    
+    # 11. 恢复检查点
+    start_epoch = 0
+    global_step = 0
+    best_val_loss = float("inf")
+    resume_path = resume_from_checkpoint or cfg.resume_from_checkpoint
+    
+    if resume_path:
+        start_epoch, global_step, best_val_loss = load_accelerator_checkpoint(accelerator, resume_path)
+        if accelerator.is_main_process:
+            print(f"Resumed from {resume_path}: epoch={start_epoch}, step={global_step}, best_val_loss={best_val_loss}")
+    
+    # 12. TensorBoard (通过 Accelerator 的 tracker)
+    if enable_tensorboard and accelerator.is_main_process:
+        run_name = f"{cfg.experiment_name}_stage1" + time.strftime("-%Y%m%d-%H%M%S")
+        def _sanitize_for_tracker(obj: Any) -> Dict[str, Any]:
+            safe_dict: Dict[str, Any] = {}
+            for k, v in vars(obj).items():
+                if isinstance(v, (int, float, bool, str)):
+                    safe_dict[k] = v
+                elif v is None:
+                    continue
+                else:
+                    safe_dict[k] = str(v)
+            return safe_dict
+
+        tracker_cfg = _sanitize_for_tracker(cfg)
+        accelerator.init_trackers(run_name, config=tracker_cfg)
+    
+    # 13. 训练状态
+    current_epoch = start_epoch
+    
+    def save_full_checkpoint(tag: str):
+        """保存完整检查点"""
+        save_path = os.path.join(cfg.output_dir, tag)
+        save_accelerator_checkpoint(
+            accelerator=accelerator,
+            checkpoint_dir=save_path,
+            epoch=current_epoch,
+            global_step=global_step,
+            best_val_loss=best_val_loss,
+            tokenizer=tokenizer,
+        )
+        if accelerator.is_main_process:
+            print(f"Saved checkpoint to {save_path}")
+    
+    # --- graceful stop handling ---
+    stop_requested = False
+    received_signal = None
+
+    def _request_stop(sig, frame):
+        nonlocal stop_requested, received_signal
+        if stop_requested:
+            return
+        stop_requested = True
+        received_signal = sig
+        if accelerator.is_main_process:
+            print(f"Received signal {sig}, will save and exit after current step.")
+
+    old_sigint = signal.getsignal(signal.SIGINT)
+    old_sigterm = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGINT, _request_stop)
+    signal.signal(signal.SIGTERM, _request_stop)
+
+    def _maybe_exit_gracefully():
+        nonlocal stop_requested, received_signal
+        if not stop_requested:
+            return
+        accelerator.wait_for_everyone()
+        tag = f"interrupted_step_{global_step}"
+        if accelerator.is_main_process:
+            print(f"Saving emergency checkpoint: {tag}")
+        save_full_checkpoint(tag)
+        accelerator.wait_for_everyone()
+        signal.signal(signal.SIGINT, old_sigint)
+        signal.signal(signal.SIGTERM, old_sigterm)
+        raise SystemExit(0)
+    
+    # 14. 训练循环
+    train_start_time = time.time()
+    
+    try:
+        for epoch in range(start_epoch, cfg.num_epochs):
+            current_epoch = epoch
+            
+            if accelerator.is_main_process:
+                print(f"\nEpoch {epoch} / {cfg.num_epochs - 1}")
+            
+            # 训练一个 epoch
+            train_loss, steps_this_epoch = train_one_epoch_accelerator(
+                accelerator=accelerator,
+                model=model,
+                dataloader=train_loader,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                cfg=cfg,
+                global_step_offset=global_step,
+                log_fn=lambda step, loss, ce, aux, lr: _log_step(
+                    accelerator, step, loss, ce, aux, lr, cfg.logging_steps, train_start_time, num_training_steps
+                ),
+                eval_fn=lambda step, m: _eval_and_save(
+                    accelerator, m, val_loader, step, cfg, save_full_checkpoint, best_val_loss
+                ),
+                should_stop_fn=lambda: stop_requested,
+            )
+            
+            global_step += steps_this_epoch
+            
+            if accelerator.is_main_process:
+                print(f"Epoch {epoch} train_loss={train_loss:.4f}")
+                accelerator.log({"epoch/train_loss": train_loss}, step=global_step)
+            
+            # 评估
+            val_loss = evaluate_accelerator(accelerator, model, val_loader)
+            
+            _maybe_exit_gracefully()
+            
+            if accelerator.is_main_process:
+                print(f"Epoch {epoch} val_loss={val_loss:.4f}")
+                accelerator.log({"epoch/val_loss": val_loss, "epoch/epoch": epoch}, step=global_step)
+                
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    save_full_checkpoint(f"best_epoch{epoch}")
+        
+        if accelerator.is_main_process:
+            print("Saving final model to latest")
+            save_full_checkpoint("latest")
+    
+    except KeyboardInterrupt:
+        if accelerator.is_main_process:
+            print("KeyboardInterrupt, saving emergency checkpoint...")
+            save_full_checkpoint(f"interrupted_step_{global_step}")
+        raise
+    finally:
+        signal.signal(signal.SIGINT, old_sigint)
+        signal.signal(signal.SIGTERM, old_sigterm)
+        accelerator.end_training()
+
+
+def _log_step(accelerator, step, loss, ce_loss, aux_loss, lr, logging_steps, start_time, total_steps):
+    """训练步骤日志"""
+    if not accelerator.is_main_process:
+        return
+    if step % logging_steps == 0:
+        msg = f"[step {step}] loss={loss:.4f}"
+        if ce_loss is not None:
+            msg += f" ce={ce_loss:.4f}"
+        if aux_loss is not None:
+            msg += f" aux={aux_loss:.4f}"
+        if lr is not None:
+            msg += f" lr={lr:.6f}"
+        
+        elapsed = time.time() - start_time
+        if total_steps > 0 and step > 0:
+            eta = (elapsed / step) * (total_steps - step)
+            hrs, rem = divmod(eta, 3600)
+            mins, secs = divmod(rem, 60)
+            msg += f" eta={int(hrs):02d}:{int(mins):02d}:{int(secs):02d}"
+        
+        print(msg)
+    
+    accelerator.log({
+        "train/loss": loss,
+        "train/ce_loss": ce_loss,
+        "train/aux_loss": aux_loss,
+        "train/lr": lr,
+    }, step=step)
+
+
+def _eval_and_save(accelerator, model, val_loader, step, cfg, save_fn, best_val_loss):
+    """评估并保存最佳模型"""
+    from qwen3_omni_pretrain.training.loop_accelerator import evaluate_accelerator
+    
+    if cfg.eval_steps > 0 and step % cfg.eval_steps == 0:
+        val_loss = evaluate_accelerator(accelerator, model, val_loader)
+        
+        if accelerator.is_main_process:
+            print(f"[step {step}] val_loss={val_loss:.4f}")
+            accelerator.log({"step/val_loss": val_loss}, step=step)
+            
+            if val_loss < best_val_loss:
+                save_fn(f"best_step_{step}")
+                return val_loss
+    
+    return best_val_loss
+
+
 def train_thinker_stage1(
     config_path: str,
     tokenizer_name_or_path: str = "Qwen/Qwen2.5-7B",
@@ -208,18 +672,42 @@ def train_thinker_stage1(
     log_dir: str = "./runs",
     resume_from_checkpoint: Optional[str] = None,
     deepspeed_config: Optional[str] = None,
+    accelerator_config_path: Optional[str] = None,
+    use_tensor_parallel: bool = False,
+    tensor_parallel_size: int = 1,
+    pipeline_parallel_size: int = 1,
 ):
     # 1. 加载配置
     cfg = build_trainer_config(config_path)
     if deepspeed_config:
         cfg.deepspeed = deepspeed_config
+    if accelerator_config_path:
+        cfg.accelerator_config_path = accelerator_config_path
+        cfg.use_accelerator = True
     os.makedirs(cfg.output_dir, exist_ok=True)
 
     set_seed(cfg.seed)
 
+    # =========================================================================
+    # 分布式策略优先级：Accelerator > DeepSpeed > DDP
+    # =========================================================================
+    use_accelerator = cfg.use_accelerator and ACCELERATE_AVAILABLE
+    use_deepspeed = cfg.deepspeed is not None and not use_accelerator
+    use_ddp = (cfg.ddp and ddp_available()) and (not use_deepspeed) and (not use_accelerator)
+
+    # =========================================================================
+    # Accelerator 模式
+    # =========================================================================
+    if use_accelerator:
+        _train_with_accelerator(
+            cfg, tokenizer_name_or_path, enable_tensorboard, log_dir, resume_from_checkpoint,
+            use_tensor_parallel=use_tensor_parallel,
+            tensor_parallel_size=tensor_parallel_size,
+            pipeline_parallel_size=pipeline_parallel_size,
+        )
+        return
+
     # DeepSpeed 有自己的分布式初始化；DDP 仅在未使用 DeepSpeed 时启用
-    use_deepspeed = cfg.deepspeed is not None
-    use_ddp = (cfg.ddp and ddp_available()) and (not use_deepspeed)
 
     # -------------------------------------------------------------------------
     # [FIX] 预加载 DeepSpeed Config，用于后续的 zero.Init
@@ -527,7 +1015,7 @@ def train_thinker_stage1(
         current_epoch = start_epoch
 
         def save_full_checkpoint(tag: str):
-            """Persist full trainer state."""
+            """Persist full trainer state with atomic write protection."""
             if not is_main_process():
                 # DeepSpeed 只有 rank 0 负责协调，但所有进程都要参与 save_checkpoint 调用
                 if use_deepspeed:
@@ -536,6 +1024,8 @@ def train_thinker_stage1(
                      return
 
             save_path = os.path.join(cfg.output_dir, tag)
+            temp_path = save_path + ".tmp"
+            backup_path = save_path + ".backup"
             
             client_state = {
                 'step': global_step,
@@ -544,14 +1034,44 @@ def train_thinker_stage1(
             }
 
             if use_deepspeed and model_engine is not None:
+                # DeepSpeed 模式：使用临时目录进行原子写入
+                # 清理可能存在的临时目录
+                if is_main_process() and os.path.exists(temp_path):
+                    import shutil
+                    shutil.rmtree(temp_path)
+                
+                # 同步所有进程
+                if dist.is_available() and dist.is_initialized():
+                    dist.barrier()
+                
                 # DeepSpeed save_checkpoint 需要所有进程调用
-                model_engine.save_checkpoint(save_path, client_state=client_state)
+                model_engine.save_checkpoint(temp_path, client_state=client_state)
+                
                 # Scheduler 如果没托管给 DS，需要单独存
                 if is_main_process():
-                    tokenizer.save_pretrained(save_path)
-                    torch.save(scheduler.state_dict(), os.path.join(save_path, "scheduler.pt"))
+                    tokenizer.save_pretrained(temp_path)
+                    torch.save(scheduler.state_dict(), os.path.join(temp_path, "scheduler.pt"))
+                    
+                    # 验证 checkpoint 完整性
+                    scheduler_path = os.path.join(temp_path, "scheduler.pt")
+                    try:
+                        torch.load(scheduler_path, map_location="cpu")
+                    except Exception as e:
+                        import shutil
+                        shutil.rmtree(temp_path)
+                        raise RuntimeError(f"Checkpoint verification failed: {e}")
+                    
+                    # 原子替换：备份旧的，rename 新的
+                    import shutil
+                    if os.path.exists(backup_path):
+                        shutil.rmtree(backup_path)
+                    if os.path.exists(save_path):
+                        os.rename(save_path, backup_path)
+                    os.rename(temp_path, save_path)
+                    
+                    # 保留备份以防万一（下次保存时会被清理）
             else:
-                # DDP 模式仅主进程保存
+                # DDP 模式仅主进程保存（save_checkpoint 已经实现原子写入）
                 if is_main_process():
                     save_checkpoint(
                         checkpoint_dir=save_path,

@@ -1,0 +1,57 @@
+# configs/accelerate/deepspeed_config.yaml
+# Accelerate DeepSpeed 配置文件
+# 用于 Accelerator 的 DeepSpeed 策略
+
+# ============================================================================
+# DeepSpeed ZeRO 优化配置
+# ============================================================================
+zero_stage: 3                         # ZeRO 阶段: 0, 1, 2, 3
+                                       # - 0: 禁用 ZeRO
+                                       # - 1: 优化器状态分片
+                                       # - 2: 优化器状态 + 梯度分片
+                                       # - 3: 优化器状态 + 梯度 + 参数分片
+
+# ============================================================================
+# 梯度配置
+# ============================================================================
+gradient_accumulation_steps: 8        # 梯度累积步数
+gradient_clipping: 1.0                # 梯度裁剪阈值
+
+# ============================================================================
+# Offload 配置 (节省显存)
+# ============================================================================
+offload_optimizer_device: none        # 优化器 offload: none, cpu, nvme
+offload_param_device: none            # 参数 offload: none, cpu, nvme
+offload_optimizer_nvme_path: null     # NVMe offload 路径 (仅 nvme 时需要)
+offload_param_nvme_path: null         # NVMe offload 路径 (仅 nvme 时需要)
+
+# ============================================================================
+# ZeRO-3 特定配置
+# ============================================================================
+zero3_init_flag: true                 # 使用 ZeRO-3 初始化模型（防止 OOM）
+zero3_save_16bit_model: true          # 保存时聚合为 16-bit 模型
+
+# ============================================================================
+# 通信优化
+# ============================================================================
+overlap_comm: true                    # 通信与计算重叠
+reduce_scatter: true                  # 使用 reduce_scatter
+reduce_bucket_size: 500000000         # reduce bucket 大小 (500M)
+allgather_bucket_size: 500000000      # allgather bucket 大小 (500M)
+
+# ============================================================================
+# 量化配置 (可选，节省带宽)
+# ============================================================================
+zero_quantized_weights: false         # 量化权重通信
+zero_quantized_gradients: false       # 量化梯度通信
+
+# ============================================================================
+# 其他优化
+# ============================================================================
+stage3_prefetch_bucket_size: 500000000      # Stage3 预取 bucket 大小
+stage3_param_persistence_threshold: 100000  # Stage3 参数持久化阈值
+stage3_max_live_parameters: 1000000000      # Stage3 最大活跃参数
+stage3_max_reuse_distance: 1000000000       # Stage3 最大重用距离
+sub_group_size: 1000000000                  # 子组大小
+contiguous_gradients: true                  # 连续梯度内存
+round_robin_gradients: true                 # 轮询梯度

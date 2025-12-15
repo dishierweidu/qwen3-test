@@ -46,3 +46,16 @@ train:
   ddp: true              # 先做单卡/单机，后面再加 FSDP / DeepSpeed
   # 显存不够时可打开，激活检查点（前向重算换显存）。对长序列/大模型建议开启。
   gradient_checkpointing: false
+  
+  # =========================================================================
+  # Accelerator 配置 (可选，与原有 deepspeed/ddp 共存)
+  # =========================================================================
+  # 启用 Accelerator 统一接口 (支持 DDP/DeepSpeed/FSDP)
+  use_accelerator: false
+  # Accelerator 配置文件路径 (可选，不指定则使用默认配置)
+  # 可选配置文件:
+  #   - configs/accelerate/multi_gpu_ddp.yaml      (纯 DDP)
+  #   - configs/accelerate/deepspeed_zero3.yaml   (DeepSpeed ZeRO-3)
+  #   - configs/accelerate/deepspeed_zero3_offload.yaml (ZeRO-3 + CPU Offload)
+  #   - configs/accelerate/fsdp_full_shard.yaml   (FSDP 完全分片)
+  accelerator_config_path: null

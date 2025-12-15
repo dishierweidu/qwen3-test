@@ -1,0 +1,21 @@
+# configs/accelerate/tp_ddp.yaml
+# Tensor Parallel + DDP (no DeepSpeed)
+
+compute_environment: LOCAL_MACHINE
+debug: false
+
+distributed_type: MULTI_GPU
+num_machines: 1
+num_processes: 8  # will be overridden by accelerate launch --num_processes
+machine_rank: 0
+main_process_ip: null
+main_process_port: 29500
+
+gpu_ids: all
+same_network: true
+
+mixed_precision: bf16
+
+# These keys are not supported by this accelerate version; removed for compatibility
+
+# no deepspeed section -> disables ZeRO

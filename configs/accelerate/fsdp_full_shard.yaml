@@ -1,0 +1,34 @@
+# configs/accelerate/fsdp_full_shard.yaml
+# FSDP 完全分片配置
+# 适用于：大模型训练，PyTorch 原生方案 (不依赖 DeepSpeed)
+
+compute_environment: LOCAL_MACHINE
+debug: false
+
+distributed_type: FSDP
+num_machines: 1
+num_processes: 8
+machine_rank: 0
+main_process_ip: null
+main_process_port: 29500
+
+gpu_ids: all
+same_network: true
+
+mixed_precision: bf16
+downcast_bf16: 'no'
+
+fsdp_config:
+  fsdp_sharding_strategy: FULL_SHARD            # 完全分片 (类似 ZeRO-3)
+  fsdp_offload_params: false                    # 不 offload 参数
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP # 按 Transformer 层自动封装
+  fsdp_backward_prefetch: BACKWARD_PRE          # 后向传播时预取参数
+  fsdp_state_dict_type: SHARDED_STATE_DICT      # 分片保存状态字典
+  fsdp_cpu_ram_efficient_loading: true          # CPU 高效加载
+  fsdp_sync_module_states: true                 # 同步模块状态
+  fsdp_forward_prefetch: true                   # 前向传播时预取参数
+  fsdp_use_orig_params: true                    # 使用原始参数
+  fsdp_activation_checkpointing: false          # 激活检查点 (显存不足时可开启)
+
+rng_types:
+  - generator
