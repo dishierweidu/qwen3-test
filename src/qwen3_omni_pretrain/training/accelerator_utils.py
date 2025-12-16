@@ -327,37 +327,22 @@ def save_tp_sharded_checkpoint(
     sched_sd = scheduler.state_dict() if scheduler is not None else None
     print(f"[rank{rank}] >>> save: after state_dict", flush=True)
 
-    # 每 rank 各写一份 shard
-    torch.save(model_sd, os.path.join(checkpoint_dir, f"model.rank{rank}.pt"))
-    if optim_sd is not None:
-        torch.save(optim_sd, os.path.join(checkpoint_dir, f"optim.rank{rank}.pt"))
-    if sched_sd is not None:
-        torch.save(sched_sd, os.path.join(checkpoint_dir, f"sched.rank{rank}.pt"))
-
     accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
-        manifest = {
-            "world_size": world,
-            "tp_size": tp_size,
+        # 写单文件 train.pt，包含模型权重与基本训练状态
+        train_payload = {
+            "model": model_sd,
             "epoch": epoch,
             "global_step": global_step,
             "best_val_loss": best_val_loss,
-            "files": {
-                "model": [f"model.rank{i}.pt" for i in range(world)],
-                "optim": [f"optim.rank{i}.pt" for i in range(world)] if optim_sd is not None else None,
-                "sched": [f"sched.rank{i}.pt" for i in range(world)] if sched_sd is not None else None,
-            },
         }
-        with open(os.path.join(checkpoint_dir, "manifest.json"), "w") as f:
-            json.dump(manifest, f, indent=2)
+        if optim_sd is not None:
+            train_payload["optimizer"] = optim_sd
+        if sched_sd is not None:
+            train_payload["scheduler"] = sched_sd
 
-        state = {
-            "epoch": epoch,
-            "global_step": global_step,
-            "best_val_loss": best_val_loss,
-        }
-        torch.save(state, os.path.join(checkpoint_dir, "trainer_state.pt"))
+        torch.save(train_payload, os.path.join(checkpoint_dir, "train.pt"))
 
         if tokenizer is not None:
             tokenizer.save_pretrained(checkpoint_dir)
@@ -417,25 +402,48 @@ def save_accelerator_checkpoint(
 def load_accelerator_checkpoint(
     accelerator: "Accelerator",
     checkpoint_dir: str,
+    model: Optional[torch.nn.Module] = None,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
 ) -> Tuple[int, int, float]:
     """
-    使用 Accelerator 加载检查点
-    
-    Returns:
-        (start_epoch, global_step, best_val_loss)
+    加载检查点：TP>1 且存在 train.pt 时走自定义加载，否则使用 accelerator.load_state。
     """
-    # 加载 accelerator 状态
+    accelerator.wait_for_everyone()
+
+    tp = get_tensor_model_parallel_world_size() if dist.is_initialized() else 1
+    train_pt = os.path.join(checkpoint_dir, "train.pt")
+
+    if tp > 1 and os.path.exists(train_pt) and model is not None:
+        payload = torch.load(train_pt, map_location="cpu")
+        unwrapped = accelerator.unwrap_model(model)
+        unwrapped.load_state_dict(payload.get("model", {}), strict=False)
+
+        if optimizer is not None and payload.get("optimizer") is not None:
+            optimizer.load_state_dict(payload["optimizer"])
+        if scheduler is not None and payload.get("scheduler") is not None:
+            scheduler.load_state_dict(payload["scheduler"])
+
+        start_epoch = int(payload.get("epoch", 0))
+        global_step = int(payload.get("global_step", 0))
+        best_val_loss = float(payload.get("best_val_loss", float("inf")))
+
+        accelerator.wait_for_everyone()
+        return start_epoch, global_step, best_val_loss
+
+    # 非 TP 或未找到 train.pt，回退到 Accelerator 内置状态加载
     accelerator.load_state(checkpoint_dir)
     
-    # 加载 trainer 状态
     trainer_state_path = os.path.join(checkpoint_dir, "trainer_state.pt")
     if os.path.exists(trainer_state_path):
         state = torch.load(trainer_state_path, map_location="cpu")
         start_epoch = int(state.get("epoch", 0))
         global_step = int(state.get("global_step", 0))
         best_val_loss = float(state.get("best_val_loss", float("inf")))
+        accelerator.wait_for_everyone()
         return start_epoch, global_step, best_val_loss
     
+    accelerator.wait_for_everyone()
     return 0, 0, float("inf")
 
 

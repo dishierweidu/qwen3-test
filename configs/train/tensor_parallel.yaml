@@ -21,7 +21,7 @@
 experiment_name: "qwen3_omni_stage1_text_tp"
 
 model:
-  config_path: configs/model/qwen3_omni_14b_moe.yaml
+  config_path: configs/model/qwen3_omni_30b_moe.yaml
 
 data:
   # 支持单路径或多路径

@@ -507,7 +507,13 @@ def _train_with_accelerator(
     resume_path = resume_from_checkpoint or cfg.resume_from_checkpoint
     
     if resume_path:
-        start_epoch, global_step, best_val_loss = load_accelerator_checkpoint(accelerator, resume_path)
+        start_epoch, global_step, best_val_loss = load_accelerator_checkpoint(
+            accelerator,
+            resume_path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+        )
         if accelerator.is_main_process:
             print(f"Resumed from {resume_path}: epoch={start_epoch}, step={global_step}, best_val_loss={best_val_loss}")
     

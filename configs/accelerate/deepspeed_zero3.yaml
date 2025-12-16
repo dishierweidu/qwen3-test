@@ -20,6 +20,7 @@ downcast_bf16: 'no'
 
 deepspeed_config:
   zero_stage: 3
+  ignore_unused_parameters: true
   # gradient_accumulation_steps: use training config via Accelerator; keep here as 1 to avoid conflict
   gradient_accumulation_steps: 1
   gradient_clipping: 1.0

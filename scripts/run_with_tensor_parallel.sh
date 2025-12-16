@@ -52,6 +52,8 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_DEBUG=WARN
 export NCCL_IB_DISABLE=0
 export NCCL_NET_GDR_LEVEL=2
+export TORCH_NCCL_BLOCKING_WAIT=1
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
 # Launch with Accelerate
 accelerate launch \
@@ -65,4 +67,5 @@ accelerate launch \
     --accelerator_config "$ACCELERATE_CONFIG" \
     --use_tensor_parallel \
     --tp_size "$TP_SIZE" \
-    --tensorboard
+    --tensorboard \
+    # --resume_from_checkpoint outputs/stage1_text_tp-20251216-211759/interrupted_step_45

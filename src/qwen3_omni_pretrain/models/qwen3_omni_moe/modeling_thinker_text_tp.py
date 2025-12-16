@@ -325,10 +325,14 @@ class TensorParallelMoeMLP(nn.Module):
         nt = B * T
         x_flat = x.view(nt, H)
         
-        # Router
-        # Use fp32 for router to avoid bf16 overflow/underflow
-        gate_logits = self.gate(x_flat.float())
-        gate_probs = torch.softmax(gate_logits, dim=-1, dtype=torch.float32)
+        # Router: keep matmul in bf16, softmax/topk in fp32 for stability
+        gate_logits = self.gate(x_flat)
+        gate_probs = torch.softmax(gate_logits.float(), dim=-1)
+
+        if dist.is_initialized():
+            rank = dist.get_rank()
+            if rank == 0:
+                print("[moe] router ok", flush=True)
         
         # Top-k selection
         k = self.num_experts_per_tok
@@ -359,9 +363,14 @@ class TensorParallelMoeMLP(nn.Module):
             sel_token_idx = token_indices[mask]
             sel_scores = topk_vals_flat[mask]
             
-            x_sel = x_flat[sel_token_idx].float()
-            out_sel = expert(x_sel)
-            out_sel = out_sel.float()
+            # Keep input dtype aligned with expert weights (bf16 under ZeRO-3/TP)
+            x_sel = x_flat[sel_token_idx]
+            out_sel = expert(x_sel).float()
+
+            if dist.is_initialized():
+                rank = dist.get_rank()
+                if rank == 0 and e_id == 0:
+                    print("[moe] expert0 ok", flush=True)
             
             weighted_out = out_sel * sel_scores.unsqueeze(-1).float()
             if weighted_out.dtype != y_flat.dtype:
@@ -370,8 +379,8 @@ class TensorParallelMoeMLP(nn.Module):
         
         # Shared expert
         if self.shared_expert is not None:
-            shared_out = self.shared_expert(x_flat.float())
-            y_flat = y_flat + shared_out.float()
+            shared_out = self.shared_expert(x_flat).float()
+            y_flat = y_flat + shared_out
         
         y = y_flat.view(B, T, H).to(x.dtype)
         return y, aux_loss
