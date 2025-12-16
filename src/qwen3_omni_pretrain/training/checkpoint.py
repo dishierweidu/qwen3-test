@@ -6,6 +6,7 @@ import glob
 from typing import Optional, Tuple, TYPE_CHECKING
 
 import torch
+import torch.distributed as dist
 from transformers.modeling_utils import load_sharded_checkpoint
 
 if TYPE_CHECKING:
@@ -444,18 +445,27 @@ def save_model_only_accelerator(
 		保存路径
 	"""
 	accelerator.wait_for_everyone()
-	
-	# 获取未封装的模型
+
+	rank = dist.get_rank() if dist.is_initialized() else 0
 	unwrapped_model = accelerator.unwrap_model(model)
-	
-	# 仅在主进程保存
+	print(f"[rank{rank}] >>> save_only_model: before state_dict", flush=True)
+	state_dict = accelerator.get_state_dict(unwrapped_model)
+	print(f"[rank{rank}] >>> save_only_model: after state_dict", flush=True)
+
+	accelerator.wait_for_everyone()
+
 	if accelerator.is_main_process:
 		os.makedirs(save_dir, exist_ok=True)
+		print("[rank0] >>> save_only_model: before save_pretrained", flush=True)
 		unwrapped_model.save_pretrained(
 			save_dir,
+			state_dict=state_dict,
 			safe_serialization=safe_serialization,
+			max_shard_size="2GB",
 		)
-	
+		print("[rank0] >>> save_only_model: after save_pretrained", flush=True)
+
 	accelerator.wait_for_everyone()
+	print(f"[rank{rank}] >>> save_only_model: done", flush=True)
 	return save_dir
 

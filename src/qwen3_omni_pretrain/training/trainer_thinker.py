@@ -261,6 +261,8 @@ def _train_with_accelerator(
     # 1. 加载 Accelerator 配置
     if cfg.accelerator_config_path:
         accel_cfg = load_accelerator_config(cfg.accelerator_config_path)
+        # 统一以训练配置为准，避免多处累积步不一致
+        accel_cfg.gradient_accumulation_steps = cfg.gradient_accumulation_steps
     else:
         # 使用默认配置
         accel_cfg = AcceleratorConfig(
@@ -355,24 +357,44 @@ def _train_with_accelerator(
             model = Qwen3OmniMoeThinkerTextModelTP(model_cfg)
         else:
             model = Qwen3OmniMoeThinkerTextModel(model_cfg)
+
+    # 在非 DeepSpeed 模式下，尽早将参数迁移到 GPU 并降精度，降低 CPU 常驻占用
+    if accelerator.distributed_type != DistributedType.DEEPSPEED:
+        target_dtype = None
+        if accelerator.mixed_precision == "bf16":
+            target_dtype = torch.bfloat16
+        elif accelerator.mixed_precision == "fp16":
+            target_dtype = torch.float16
+
+        model.to(device=accelerator.device, dtype=target_dtype)
+
     if accelerator.is_main_process:
         first_param_device = next(model.parameters()).device
         print(f">> Model initial device: {first_param_device}")
     
-    # 激活检查点
-    if cfg.gradient_checkpointing or accel_cfg.gradient_checkpointing:
+    # 激活检查点（TP 场景下默认关闭以避免 checkpoint 错配）
+    enable_ckpt = (cfg.gradient_checkpointing or accel_cfg.gradient_checkpointing) and not (
+        use_tensor_parallel and tensor_parallel_size > 1
+    )
+    if enable_ckpt:
         if hasattr(model, "thinker_cfg"):
             model.thinker_cfg.gradient_checkpointing = True
         try:
             model.gradient_checkpointing_enable()
         except ValueError:
-            # 某些 TP 模型未实现 supports_gradient_checkpointing；直接打开标志即可
             if hasattr(model, "gradient_checkpointing"):
                 model.gradient_checkpointing = True
             if accelerator.is_main_process:
                 print(
                     ">> Gradient checkpointing flag enabled (manual) for model without built-in support"
                 )
+    else:
+        if hasattr(model, "gradient_checkpointing"):
+            model.gradient_checkpointing = False
+        if hasattr(model, "thinker_cfg"):
+            model.thinker_cfg.gradient_checkpointing = False
+        if accelerator.is_main_process:
+            print(">> Gradient checkpointing disabled for TP run to avoid checkpoint mismatch")
     
     # 5. 数据集
     if cfg.use_packed_dataset:
@@ -510,7 +532,7 @@ def _train_with_accelerator(
     current_epoch = start_epoch
     
     def save_full_checkpoint(tag: str):
-        """保存完整检查点"""
+        """保存完整检查点（所有 rank 都调用，内部仅 rank0 写 manifest/tokenizer）。"""
         save_path = os.path.join(cfg.output_dir, tag)
         save_accelerator_checkpoint(
             accelerator=accelerator,
@@ -519,6 +541,9 @@ def _train_with_accelerator(
             global_step=global_step,
             best_val_loss=best_val_loss,
             tokenizer=tokenizer,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
         )
         if accelerator.is_main_process:
             print(f"Saved checkpoint to {save_path}")
@@ -597,14 +622,16 @@ def _train_with_accelerator(
             if accelerator.is_main_process:
                 print(f"Epoch {epoch} val_loss={val_loss:.4f}")
                 accelerator.log({"epoch/val_loss": val_loss, "epoch/epoch": epoch}, step=global_step)
-                
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    save_full_checkpoint(f"best_epoch{epoch}")
+            
+            # 所有 rank 同步是否保存最佳
+            save_best_flag = torch.tensor(1 if val_loss < best_val_loss else 0, device=accelerator.device)
+            save_best_flag = accelerator.reduce(save_best_flag, reduction="max")
+            if save_best_flag.item() > 0:
+                best_val_loss = val_loss if val_loss < best_val_loss else best_val_loss
+                save_full_checkpoint(f"best_epoch{epoch}")
         
-        if accelerator.is_main_process:
-            print("Saving final model to latest")
-            save_full_checkpoint("latest")
+        # 保存 latest（所有 rank 都进入，内部仅 rank0 写磁盘）
+        save_full_checkpoint("latest")
     
     except KeyboardInterrupt:
         if accelerator.is_main_process:
@@ -657,11 +684,13 @@ def _eval_and_save(accelerator, model, val_loader, step, cfg, save_fn, best_val_
         if accelerator.is_main_process:
             print(f"[step {step}] val_loss={val_loss:.4f}")
             accelerator.log({"step/val_loss": val_loss}, step=step)
-            
-            if val_loss < best_val_loss:
-                save_fn(f"best_step_{step}")
-                return val_loss
-    
+
+        save_flag = torch.tensor(1 if val_loss < best_val_loss else 0, device=accelerator.device)
+        save_flag = accelerator.reduce(save_flag, reduction="max")
+        if save_flag.item() > 0:
+            best_val_loss = val_loss if val_loss < best_val_loss else best_val_loss
+            save_fn(f"best_step_{step}")
+
     return best_val_loss
 
 

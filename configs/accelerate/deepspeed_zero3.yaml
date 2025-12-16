@@ -20,7 +20,8 @@ downcast_bf16: 'no'
 
 deepspeed_config:
   zero_stage: 3
-  gradient_accumulation_steps: 8
+  # gradient_accumulation_steps: use training config via Accelerator; keep here as 1 to avoid conflict
+  gradient_accumulation_steps: 1
   gradient_clipping: 1.0
   offload_optimizer_device: none     # 纯 GPU 模式
   offload_param_device: none         # 纯 GPU 模式

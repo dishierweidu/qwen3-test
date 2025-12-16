@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, Union, Tuple
 
 import torch
+import torch.distributed as dist
 from torch.utils.data import DataLoader
 
 try:
@@ -29,6 +30,10 @@ except ImportError:
     ProjectConfiguration = None
 
 from qwen3_omni_pretrain.utils.config_utils import load_yaml
+from qwen3_omni_pretrain.parallel.initialize import (
+    get_tensor_model_parallel_world_size,
+    get_tensor_model_parallel_rank,
+)
 
 
 @dataclass
@@ -224,6 +229,14 @@ def create_accelerator(
     elif dist_type == "FSDP":
         fsdp_plugin = _build_fsdp_plugin(accelerator_config.fsdp_config_path)
     
+    # DDP 参数：MoE/TP 可能存在未参与 loss 的参数，需要开启 find_unused_parameters
+    ddp_kwargs = None
+    try:
+        from accelerate.utils import DistributedDataParallelKwargs
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    except Exception:
+        ddp_kwargs = None
+
     # 创建 Accelerator
     # 注意: dispatch_batches 和 even_batches 参数在某些版本中可能不支持
     accelerator_kwargs = {
@@ -236,6 +249,8 @@ def create_accelerator(
         "split_batches": accelerator_config.split_batches,
         "step_scheduler_with_optimizer": accelerator_config.step_scheduler_with_optimizer,
     }
+    if ddp_kwargs is not None:
+        accelerator_kwargs["kwargs_handlers"] = [ddp_kwargs]
     
     # 可选参数（根据 accelerate 版本）
     try:
@@ -280,6 +295,78 @@ def prepare_model_optimizer_dataloader(
     return model, optimizer, scheduler, train_dataloader, val_dataloader
 
 
+def save_tp_sharded_checkpoint(
+    accelerator: "Accelerator",
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler],
+    checkpoint_dir: str,
+    epoch: int,
+    global_step: int,
+    best_val_loss: float,
+    tokenizer=None,
+) -> str:
+    """TP 安全的分片检查点保存：每个 rank 写自己 shard，rank0 写 manifest。"""
+
+    accelerator.wait_for_everyone()
+
+    if accelerator.is_main_process:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+    accelerator.wait_for_everyone()
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world = accelerator.num_processes
+    tp_size = get_tensor_model_parallel_world_size() if dist.is_initialized() else 1
+    tp_rank = get_tensor_model_parallel_rank() if dist.is_initialized() else 0
+
+    # 所有 rank 都获取 state_dict，确保 TP 内部 collective 对齐
+    unwrapped = accelerator.unwrap_model(model)
+    print(f"[rank{rank}] >>> save: before state_dict (tp_rank={tp_rank})", flush=True)
+    model_sd = unwrapped.state_dict()
+    optim_sd = optimizer.state_dict() if optimizer is not None else None
+    sched_sd = scheduler.state_dict() if scheduler is not None else None
+    print(f"[rank{rank}] >>> save: after state_dict", flush=True)
+
+    # 每 rank 各写一份 shard
+    torch.save(model_sd, os.path.join(checkpoint_dir, f"model.rank{rank}.pt"))
+    if optim_sd is not None:
+        torch.save(optim_sd, os.path.join(checkpoint_dir, f"optim.rank{rank}.pt"))
+    if sched_sd is not None:
+        torch.save(sched_sd, os.path.join(checkpoint_dir, f"sched.rank{rank}.pt"))
+
+    accelerator.wait_for_everyone()
+
+    if accelerator.is_main_process:
+        manifest = {
+            "world_size": world,
+            "tp_size": tp_size,
+            "epoch": epoch,
+            "global_step": global_step,
+            "best_val_loss": best_val_loss,
+            "files": {
+                "model": [f"model.rank{i}.pt" for i in range(world)],
+                "optim": [f"optim.rank{i}.pt" for i in range(world)] if optim_sd is not None else None,
+                "sched": [f"sched.rank{i}.pt" for i in range(world)] if sched_sd is not None else None,
+            },
+        }
+        with open(os.path.join(checkpoint_dir, "manifest.json"), "w") as f:
+            json.dump(manifest, f, indent=2)
+
+        state = {
+            "epoch": epoch,
+            "global_step": global_step,
+            "best_val_loss": best_val_loss,
+        }
+        torch.save(state, os.path.join(checkpoint_dir, "trainer_state.pt"))
+
+        if tokenizer is not None:
+            tokenizer.save_pretrained(checkpoint_dir)
+
+    accelerator.wait_for_everyone()
+    print(f"[rank{rank}] >>> save: done", flush=True)
+    return checkpoint_dir
+
+
 def save_accelerator_checkpoint(
     accelerator: "Accelerator",
     checkpoint_dir: str,
@@ -287,41 +374,42 @@ def save_accelerator_checkpoint(
     global_step: int,
     best_val_loss: float,
     tokenizer=None,
+    model: Optional[torch.nn.Module] = None,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
 ) -> str:
-    """
-    使用 Accelerator 保存检查点
-    
-    Args:
-        accelerator: Accelerator 实例
-        checkpoint_dir: 检查点保存目录
-        epoch: 当前 epoch
-        global_step: 全局步数
-        best_val_loss: 最佳验证损失
-        tokenizer: tokenizer（可选）
-    
-    Returns:
-        保存路径
-    """
-    # 等待所有进程
+    """通用保存：TP>1 走分片，其余保持原行为。"""
+
     accelerator.wait_for_everyone()
-    
-    # 保存 accelerator 状态（包含 model, optimizer, scheduler, scaler）
+
+    tp = get_tensor_model_parallel_world_size() if dist.is_initialized() else 1
+    if tp > 1:
+        assert model is not None and optimizer is not None, "TP checkpoint需要 model 与 optimizer"
+        return save_tp_sharded_checkpoint(
+            accelerator=accelerator,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            checkpoint_dir=checkpoint_dir,
+            epoch=epoch,
+            global_step=global_step,
+            best_val_loss=best_val_loss,
+            tokenizer=tokenizer,
+        )
+
+    # 非 TP：使用 Accelerate 内建保存
     accelerator.save_state(checkpoint_dir)
-    
-    # 主进程保存额外信息
+
     if accelerator.is_main_process:
-        # 保存 trainer 状态
         state = {
             "epoch": epoch,
             "global_step": global_step,
             "best_val_loss": best_val_loss,
         }
         torch.save(state, os.path.join(checkpoint_dir, "trainer_state.pt"))
-        
-        # 保存 tokenizer
         if tokenizer is not None:
             tokenizer.save_pretrained(checkpoint_dir)
-    
+
     accelerator.wait_for_everyone()
     return checkpoint_dir
 

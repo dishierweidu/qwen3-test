@@ -62,6 +62,7 @@ accelerate launch \
     -m qwen3_omni_pretrain.cli_train_thinker \
     --config "$CONFIG_PATH" \
     --use_accelerator \
+    --accelerator_config "$ACCELERATE_CONFIG" \
     --use_tensor_parallel \
     --tp_size "$TP_SIZE" \
     --tensorboard

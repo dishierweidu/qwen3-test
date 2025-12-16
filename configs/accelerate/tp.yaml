@@ -1,0 +1,18 @@
+# configs/accelerate/tp_ddp.yaml
+compute_environment: LOCAL_MACHINE
+debug: true   # 打开 DETAIL 日志更好排查
+
+distributed_type: MULTI_GPU
+num_machines: 1
+num_processes: 8
+machine_rank: 0
+main_process_ip: null
+main_process_port: 29500
+
+gpu_ids: all
+same_network: true
+
+mixed_precision: bf16
+downcast_bf16: 'no'
+
+# 注意：这里不要再写 deepspeed_config 字段

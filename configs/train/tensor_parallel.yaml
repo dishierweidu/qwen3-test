@@ -21,7 +21,7 @@
 experiment_name: "qwen3_omni_stage1_text_tp"
 
 model:
-  config_path: configs/model/qwen3_omni_30b_moe.yaml
+  config_path: configs/model/qwen3_omni_14b_moe.yaml
 
 data:
   # 支持单路径或多路径
@@ -32,8 +32,8 @@ data:
   val_corpus_paths:
     - "data/corpus/val_text.jsonl"
   max_seq_length: 2048
-  batch_size: 4  # Per-GPU batch size
-  num_workers: 4
+  batch_size: 1  # Per-GPU batch size
+  num_workers: 1
   shuffle: true
   
   # Packed dataset 选项 (可选)
@@ -56,7 +56,7 @@ train:
   
   # 日志和检查点
   logging_steps: 10
-  eval_steps: 500
+  eval_steps: 100
   save_steps: 1000
   output_dir: outputs/stage1_text_tp
   

@@ -73,6 +73,8 @@ python -m qwen3_omni_pretrain.cli_infer_thinker \
   --chat \
   --max_new_tokens 64
 
+CUDA_VISIBLE_DEVICES=0,1,2,3 ./scripts/run_with_tensor_parallel.sh 4 4 configs/train/tensor_parallel.yaml configs/accelerate/tp_ddp.yaml
+
 git config --global user.email eliot.zhao@finnox.cn
 git config --global user.name "Eliot Zhao"
 

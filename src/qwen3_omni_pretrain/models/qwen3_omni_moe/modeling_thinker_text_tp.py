@@ -198,13 +198,17 @@ class TensorParallelMultiHeadSelfAttention(nn.Module):
                 is_causal=False,
             )
         else:
-            scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)
+            q_f = q.float()
+            k_f = k.float()
+            v_f = v.float()
+            scores = torch.matmul(q_f, k_f.transpose(-1, -2)) / math.sqrt(self.head_dim)
             if attention_mask is not None:
                 if attention_mask.dtype != scores.dtype:
                     attention_mask = attention_mask.to(scores.dtype)
                 scores = scores + attention_mask
             attn = torch.softmax(scores, dim=-1)
-            out = torch.matmul(attn, v)
+            out = torch.matmul(attn, v_f)
+            out = out.to(v.dtype)
         
         # Apply gate
         if gate is not None:
@@ -322,8 +326,9 @@ class TensorParallelMoeMLP(nn.Module):
         x_flat = x.view(nt, H)
         
         # Router
-        gate_logits = self.gate(x_flat)
-        gate_probs = torch.softmax(gate_logits, dim=-1)
+        # Use fp32 for router to avoid bf16 overflow/underflow
+        gate_logits = self.gate(x_flat.float())
+        gate_probs = torch.softmax(gate_logits, dim=-1, dtype=torch.float32)
         
         # Top-k selection
         k = self.num_experts_per_tok
@@ -344,7 +349,7 @@ class TensorParallelMoeMLP(nn.Module):
         aux_loss = (importance * load).sum() * E
         
         # Sparse forward
-        y_flat = torch.zeros_like(x_flat)
+        y_flat = torch.zeros((nt, H), device=x.device, dtype=torch.float32)
         
         for e_id, expert in enumerate(self.experts):
             mask = (topk_idx_flat == e_id)
@@ -354,18 +359,21 @@ class TensorParallelMoeMLP(nn.Module):
             sel_token_idx = token_indices[mask]
             sel_scores = topk_vals_flat[mask]
             
-            x_sel = x_flat[sel_token_idx]
+            x_sel = x_flat[sel_token_idx].float()
             out_sel = expert(x_sel)
+            out_sel = out_sel.float()
             
-            weighted_out = out_sel * sel_scores.unsqueeze(-1)
+            weighted_out = out_sel * sel_scores.unsqueeze(-1).float()
+            if weighted_out.dtype != y_flat.dtype:
+                weighted_out = weighted_out.to(y_flat.dtype)
             y_flat.index_add_(0, sel_token_idx, weighted_out)
         
         # Shared expert
         if self.shared_expert is not None:
-            shared_out = self.shared_expert(x_flat)
-            y_flat = y_flat + shared_out
+            shared_out = self.shared_expert(x_flat.float())
+            y_flat = y_flat + shared_out.float()
         
-        y = y_flat.view(B, T, H)
+        y = y_flat.view(B, T, H).to(x.dtype)
         return y, aux_loss
 
 
@@ -639,13 +647,19 @@ class Qwen3OmniMoeThinkerTextModelTP(PreTrainedModel):
             if self.gradient_checkpointing and self.training:
                 def layer_forward(x, pos_ids):
                     return layer(x, attention_mask_full, pos_ids)
-                
-                hidden_states, layer_aux = torch.utils.checkpoint.checkpoint(
-                    layer_forward,
-                    hidden_states,
-                    position_ids,
-                    use_reentrant=False,
-                )
+                try:
+                    hidden_states, layer_aux = torch.utils.checkpoint.checkpoint(
+                        layer_forward,
+                        hidden_states,
+                        position_ids,
+                        use_reentrant=False,
+                        preserve_rng_state=False,
+                    )
+                except torch.utils.checkpoint.CheckpointError:
+                    # Fallback: disable checkpoint for this layer to avoid mismatch errors
+                    hidden_states, layer_aux = layer(
+                        hidden_states, attention_mask_full, position_ids
+                    )
             else:
                 hidden_states, layer_aux = layer(
                     hidden_states, attention_mask_full, position_ids
@@ -666,7 +680,7 @@ class Qwen3OmniMoeThinkerTextModelTP(PreTrainedModel):
         vocab_size = logits.size(-1)
         
         if labels is not None:
-            shift_logits = logits[:, :-1, :].contiguous()
+            shift_logits = logits[:, :-1, :].contiguous().float()
             shift_labels = labels[:, 1:].contiguous()
             
             valid_mask = (shift_labels != -100)
@@ -687,29 +701,22 @@ class Qwen3OmniMoeThinkerTextModelTP(PreTrainedModel):
                 ce_loss = ce_loss_raw * 0.0
             loss = ce_loss
         
-        if total_aux_loss is not None:
-            if labels is not None:
-                if "num_tokens" not in locals():
-                    valid_mask = (labels != -100)
-                    num_tokens = valid_mask.sum()
-                if num_tokens > 0:
-                    aux_loss = total_aux_loss / num_tokens
+            if total_aux_loss is not None:
+                if labels is not None:
+                    if "num_tokens" not in locals():
+                        valid_mask = (labels != -100)
+                        num_tokens = valid_mask.sum()
+                    if num_tokens > 0:
+                        aux_loss = total_aux_loss.float() / num_tokens
+                    else:
+                        aux_loss = total_aux_loss.float() * 0.0
                 else:
-                    aux_loss = total_aux_loss * 0.0
-            else:
-                aux_loss = total_aux_loss
+                    aux_loss = total_aux_loss.float()
             
             if loss is None:
                 loss = self.thinker_cfg.moe_aux_loss_coef * aux_loss
             else:
                 loss = loss + self.thinker_cfg.moe_aux_loss_coef * aux_loss
-        
-        if loss is not None:
-            loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
-        if ce_loss is not None:
-            ce_loss = torch.nan_to_num(ce_loss, nan=0.0, posinf=1e4, neginf=-1e4)
-        if aux_loss is not None:
-            aux_loss = torch.nan_to_num(aux_loss, nan=0.0, posinf=1e4, neginf=-1e4)
         
         output = {
             "logits": logits,

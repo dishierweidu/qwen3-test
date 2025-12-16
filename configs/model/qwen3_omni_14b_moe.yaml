@@ -28,5 +28,7 @@ thinker_config:
   moe_layer_indices: "4,8,12,16,20,24,28,32,36"
   moe_aux_loss_coef: 0.02
 
+  use_flash_attention: true
+
   vision_hidden_size: 1152
   audio_hidden_size: 1024

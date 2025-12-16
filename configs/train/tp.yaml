@@ -1,0 +1,62 @@
+experiment_name: "qwen3_omni_stage1_text_tp"
+
+model:
+  config_path: configs/model/qwen3_omni_14b_moe.yaml
+
+data:
+  # 支持单路径或多路径
+  train_corpus_paths:
+    - "data/corpus/train_text.jsonl"
+    # - "/ai/finnox/mobvoi_seq_monkey_general_open_corpus.jsonl"
+    - "/hpc2hdd/home/zzhao056/mobv/mobvoi_seq_monkey_general_open_corpus.jsonl"
+  val_corpus_paths:
+    - "data/corpus/val_text.jsonl"
+  max_seq_length: 2048
+  batch_size: 4  # Per-GPU batch size
+  num_workers: 4
+  shuffle: true
+  
+  # Packed dataset 选项 (可选)
+  use_packed_dataset: false
+  # packed_train_bin_path: data/packed/train.bin
+  # packed_val_bin_path: data/packed/val.bin
+  # packed_seq_length: 2048
+
+
+train:
+  num_epochs: 1
+  max_steps: -1
+  
+  learning_rate: 2.0e-4
+  weight_decay: 0.1
+  warmup_ratio: 0.03
+
+  # 关键：统一梯度累积
+  gradient_accumulation_steps: 8  # 和 accelerate 对齐
+
+  logging_steps: 10
+  eval_steps: 500
+  save_steps: 1000
+  output_dir: outputs/stage1_text_tp_debug
+
+  bf16: true
+  fp16: false
+
+  gradient_checkpointing: true
+
+  ddp: false                 # 由 Accelerate 接管
+
+  use_accelerator: true
+  accelerator_config_path: configs/accelerate/tp_ddp.yaml
+
+  # 暂时关闭 DeepSpeed
+  deepspeed: null
+
+  tensor_parallel:
+    enabled: true
+    tp_size: 2
+    gradient_sync_strategy: "allreduce"
+    weight_init_method: "megatron"
+    sequence_parallel: false
+
+  seed: 42
