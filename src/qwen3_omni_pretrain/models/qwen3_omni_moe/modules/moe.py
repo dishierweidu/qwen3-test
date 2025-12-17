@@ -133,20 +133,28 @@ class Qwen3OmniMoeMLP(nn.Module):
         for e_id, expert in enumerate(self.experts):
             # 找到属于该 expert 的 (token, gate) 条目
             mask = (expert_idx_flat == e_id)  # [NT * k]
-            if not mask.any():
-                continue
+            has_tokens = mask.any()
+            
+            # 重要：在 ZeRO-3 环境下，所有 rank 必须一起调用专家的前向传播
+            # 因为 ZeRO-3 需要在前向传播时收集参数，跳过会导致死锁
+            if has_tokens:
+                sel_token_idx = token_idx_flat[mask]  # [N_sel]
+                sel_scores = scores_flat[mask]        # [N_sel]
+                x_sel = x_flat[sel_token_idx]         # [N_sel, H]
+            else:
+                # Dummy forward to keep ZeRO-3 in sync across all ranks
+                sel_token_idx = None
+                sel_scores = None
+                x_sel = x_flat[:1]  # 使用一个 dummy token
 
-            sel_token_idx = token_idx_flat[mask]  # [N_sel]
-            sel_scores = scores_flat[mask]        # [N_sel]
-
-            x_sel = x_flat[sel_token_idx]         # [N_sel, H]
             out_sel = expert(x_sel)               # [N_sel, H]
 
-            # gate 权重加权，然后 scatter 回 y_flat
-            weighted_out = out_sel * sel_scores.unsqueeze(-1)  # [N_sel, H]
-
-            # 一个 token 可能被多个 expert 选中，因此用 index_add_ 累加
-            y_flat.index_add_(0, sel_token_idx, weighted_out)
+            # 只有实际有 token 的情况下才累加结果
+            if has_tokens:
+                # gate 权重加权，然后 scatter 回 y_flat
+                weighted_out = out_sel * sel_scores.unsqueeze(-1)  # [N_sel, H]
+                # 一个 token 可能被多个 expert 选中，因此用 index_add_ 累加
+                y_flat.index_add_(0, sel_token_idx, weighted_out)
 
         if self.shared_expert is not None:
             shared_out = self.shared_expert(x_flat)  # [NT, H]

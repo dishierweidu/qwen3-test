@@ -318,15 +318,37 @@ def _train_with_accelerator(
             print(f">> Tensor Parallelism enabled: TP={tensor_parallel_size}, PP={pipeline_parallel_size}")
     
     # 对于 DeepSpeed ZeRO-3，使用 zero.Init 上下文
+    # 注意：ZeRO-2 不需要 zero.Init，只有 ZeRO-3 需要
     init_ctx = nullcontext()
     if accelerator.distributed_type == DistributedType.DEEPSPEED:
-        # DeepSpeed ZeRO-3 初始化
+        # 检查 ZeRO stage
         if accelerator.state.deepspeed_plugin is not None:
             from accelerate.utils import is_deepspeed_available
             if is_deepspeed_available():
                 import deepspeed
                 ds_config = accelerator.state.deepspeed_plugin.deepspeed_config
+                
+                # 获取 ZeRO stage - 尝试多种方式
+                zero_stage = 0
                 if isinstance(ds_config, dict):
+                    zero_opt = ds_config.get("zero_optimization", {})
+                    if isinstance(zero_opt, dict):
+                        zero_stage = zero_opt.get("stage", 0)
+                
+                # 也检查 deepspeed_plugin 的 zero_stage 属性
+                plugin_zero_stage = getattr(accelerator.state.deepspeed_plugin, "zero_stage", None)
+                if accelerator.is_main_process:
+                    print(f">> DeepSpeed config zero_stage from dict: {zero_stage}")
+                    print(f">> DeepSpeed plugin zero_stage: {plugin_zero_stage}")
+                    print(f">> ds_config keys: {ds_config.keys() if isinstance(ds_config, dict) else 'not a dict'}")
+                
+                # 使用 plugin 的 zero_stage（更可靠）
+                if plugin_zero_stage is not None:
+                    zero_stage = plugin_zero_stage
+                
+                # 只有 ZeRO-3 才需要 zero.Init 上下文
+                # ZeRO-2 与 TP 兼容，不需要 zero.Init
+                if zero_stage == 3:
                     def _to_int(value, default):
                         try:
                             return int(value)
@@ -344,9 +366,12 @@ def _train_with_accelerator(
                     ds_config["gradient_accumulation_steps"] = grad_acc
                     ds_config["train_batch_size"] = micro_bs * accelerator.num_processes * grad_acc
 
-                init_ctx = deepspeed.zero.Init(config_dict_or_path=ds_config)
-                if accelerator.is_main_process:
-                    print(">> Initializing model with DeepSpeed ZeRO-3 Context")
+                    init_ctx = deepspeed.zero.Init(config_dict_or_path=ds_config)
+                    if accelerator.is_main_process:
+                        print(">> Initializing model with DeepSpeed ZeRO-3 Context")
+                else:
+                    if accelerator.is_main_process:
+                        print(f">> Using DeepSpeed ZeRO-{zero_stage} (no zero.Init context needed)")
     
     # 选择模型类型：TP 模型或标准模型
     with init_ctx:
@@ -436,9 +461,10 @@ def _train_with_accelerator(
         )
 
     effective_num_workers = cfg.num_workers
-    if use_tensor_parallel and tensor_parallel_size > 1:
-        # 避免 worker 异常/调度差异导致 TP 组步伐不一致，先用 0 worker 简化数据路径
-        effective_num_workers = 0
+    # 注意：TP 模式下训练循环使用 _tp_broadcast_batch_dynamic 同步数据，
+    # 只有 TP 组的 rank 0 实际读取数据，所以可以安全使用多 workers
+    # if use_tensor_parallel and tensor_parallel_size > 1:
+    #     effective_num_workers = 0
 
     loader_kwargs = {
         "num_workers": effective_num_workers,

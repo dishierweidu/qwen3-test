@@ -45,6 +45,7 @@ class AcceleratorConfig:
     
     # DeepSpeed 配置
     deepspeed_config_path: Optional[str] = None
+    deepspeed_config: Optional[Dict[str, Any]] = None  # 内嵌的 deepspeed 配置
     
     # FSDP 配置
     fsdp_config_path: Optional[str] = None
@@ -75,6 +76,7 @@ def load_accelerator_config(config_path: str) -> AcceleratorConfig:
         mixed_precision=str(cfg.get("mixed_precision", "bf16")),
         distributed_type=str(cfg.get("distributed_type", "MULTI_GPU")),
         deepspeed_config_path=cfg.get("deepspeed_config_path"),
+        deepspeed_config=cfg.get("deepspeed_config"),  # 内嵌的 deepspeed 配置
         fsdp_config_path=cfg.get("fsdp_config_path"),
         gradient_accumulation_steps=int(cfg.get("gradient_accumulation_steps", 8)),
         gradient_checkpointing=bool(cfg.get("gradient_checkpointing", False)),
@@ -87,13 +89,23 @@ def load_accelerator_config(config_path: str) -> AcceleratorConfig:
     )
 
 
-def _build_deepspeed_plugin(config_path: Optional[str], gradient_accumulation_steps: int) -> Optional["DeepSpeedPlugin"]:
-    """构建 DeepSpeed 插件"""
+def _build_deepspeed_plugin(
+    config_path: Optional[str], 
+    gradient_accumulation_steps: int,
+    deepspeed_config: Optional[Dict[str, Any]] = None
+) -> Optional["DeepSpeedPlugin"]:
+    """构建 DeepSpeed 插件
+    
+    优先级：
+    1. config_path (JSON 文件路径)
+    2. deepspeed_config (内嵌配置字典)
+    3. 默认 ZeRO-2 配置 (适用于 TP 训练)
+    """
     if not ACCELERATE_AVAILABLE or DeepSpeedPlugin is None:
         return None
     
+    # 优先级 1：从 JSON 文件加载
     if config_path and os.path.exists(config_path):
-        # 从 JSON 文件加载 DeepSpeed 配置
         with open(config_path, "r") as f:
             ds_config = json.load(f)
         return DeepSpeedPlugin(
@@ -101,25 +113,37 @@ def _build_deepspeed_plugin(config_path: Optional[str], gradient_accumulation_st
             gradient_accumulation_steps=gradient_accumulation_steps,
         )
     
-    # 从 YAML 配置构建
+    # 优先级 2：从内嵌配置构建 (例如 accelerate 配置文件中的 deepspeed_config)
+    if deepspeed_config and isinstance(deepspeed_config, dict):
+        return DeepSpeedPlugin(
+            zero_stage=deepspeed_config.get("zero_stage", 2),
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            gradient_clipping=deepspeed_config.get("gradient_clipping", 1.0),
+            offload_optimizer_device=deepspeed_config.get("offload_optimizer_device", "none"),
+            offload_param_device=deepspeed_config.get("offload_param_device", "none"),
+            zero3_init_flag=deepspeed_config.get("zero3_init_flag", False),
+            zero3_save_16bit_model=deepspeed_config.get("zero3_save_16bit_model", True),
+        )
+    
+    # 优先级 3：从 YAML 配置构建 (旧路径)
     if config_path and config_path.endswith(".yaml"):
         yaml_cfg = load_yaml(config_path)
         return DeepSpeedPlugin(
-            zero_stage=yaml_cfg.get("zero_stage", 3),
+            zero_stage=yaml_cfg.get("zero_stage", 2),
             gradient_accumulation_steps=gradient_accumulation_steps,
             gradient_clipping=yaml_cfg.get("gradient_clipping", 1.0),
             offload_optimizer_device=yaml_cfg.get("offload_optimizer_device", "none"),
             offload_param_device=yaml_cfg.get("offload_param_device", "none"),
-            zero3_init_flag=yaml_cfg.get("zero3_init_flag", True),
+            zero3_init_flag=yaml_cfg.get("zero3_init_flag", False),
             zero3_save_16bit_model=yaml_cfg.get("zero3_save_16bit_model", True),
         )
     
-    # 默认 ZeRO-3 配置
+    # 默认配置：使用 ZeRO-2 (兼容 TP)
     return DeepSpeedPlugin(
-        zero_stage=3,
+        zero_stage=2,
         gradient_accumulation_steps=gradient_accumulation_steps,
         gradient_clipping=1.0,
-        zero3_init_flag=True,
+        zero3_init_flag=False,
         zero3_save_16bit_model=True,
     )
 
@@ -209,6 +233,12 @@ def create_accelerator(
             "accelerate is not installed. Please install it with: pip install accelerate>=0.30.0"
         )
     
+    # 检查是否由 accelerate launch 启动
+    # 如果是，不要创建自己的插件，让 accelerate 使用其配置文件
+    launched_by_accelerate = os.environ.get("ACCELERATE_USE_DEEPSPEED", "false").lower() == "true" or \
+                             os.environ.get("USE_DEEPSPEED", "false").lower() == "true" or \
+                             os.environ.get("RANK") is not None
+    
     # 项目配置
     project_config = ProjectConfiguration(
         project_dir=accelerator_config.project_dir,
@@ -221,13 +251,17 @@ def create_accelerator(
     
     dist_type = accelerator_config.distributed_type.upper()
     
-    if dist_type == "DEEPSPEED":
-        deepspeed_plugin = _build_deepspeed_plugin(
-            accelerator_config.deepspeed_config_path,
-            accelerator_config.gradient_accumulation_steps,
-        )
-    elif dist_type == "FSDP":
-        fsdp_plugin = _build_fsdp_plugin(accelerator_config.fsdp_config_path)
+    # 只有在非 accelerate launch 环境下才构建插件
+    # 否则让 accelerate 使用其自己的配置
+    if not launched_by_accelerate:
+        if dist_type == "DEEPSPEED":
+            deepspeed_plugin = _build_deepspeed_plugin(
+                accelerator_config.deepspeed_config_path,
+                accelerator_config.gradient_accumulation_steps,
+                accelerator_config.deepspeed_config,  # 传递内嵌配置
+            )
+        elif dist_type == "FSDP":
+            fsdp_plugin = _build_fsdp_plugin(accelerator_config.fsdp_config_path)
     
     # DDP 参数：MoE/TP 可能存在未参与 loss 的参数，需要开启 find_unused_parameters
     ddp_kwargs = None
@@ -240,15 +274,19 @@ def create_accelerator(
     # 创建 Accelerator
     # 注意: dispatch_batches 和 even_batches 参数在某些版本中可能不支持
     accelerator_kwargs = {
-        "mixed_precision": accelerator_config.mixed_precision,
         "gradient_accumulation_steps": accelerator_config.gradient_accumulation_steps,
-        "deepspeed_plugin": deepspeed_plugin,
-        "fsdp_plugin": fsdp_plugin,
         "log_with": accelerator_config.log_with if accelerator_config.log_with else None,
         "project_config": project_config,
         "split_batches": accelerator_config.split_batches,
         "step_scheduler_with_optimizer": accelerator_config.step_scheduler_with_optimizer,
     }
+    
+    # 只有在非 accelerate launch 环境下才设置这些参数
+    if not launched_by_accelerate:
+        accelerator_kwargs["mixed_precision"] = accelerator_config.mixed_precision
+        accelerator_kwargs["deepspeed_plugin"] = deepspeed_plugin
+        accelerator_kwargs["fsdp_plugin"] = fsdp_plugin
+    
     if ddp_kwargs is not None:
         accelerator_kwargs["kwargs_handlers"] = [ddp_kwargs]
     

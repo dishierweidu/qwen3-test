@@ -346,7 +346,13 @@ def train_one_epoch_accelerator(
                     rank = dist.get_rank() if dist.is_initialized() else 0
                     print(f"[rank {rank}] loss shape: {loss.shape}, dtype: {loss.dtype}, requires_grad: {loss.requires_grad}", flush=True)
 
+                if dist.is_initialized() and dist.get_rank() == 0:
+                    print("[train] Starting backward...", flush=True)
+                
                 accelerator.backward(loss)
+                
+                if dist.is_initialized() and dist.get_rank() == 0:
+                    print("[train] Backward completed!", flush=True)
 
                 had_nonfinite_grad = _sanitize_gradients(model.parameters(), clamp_value=1e4)
                 if accelerator.num_processes > 1:

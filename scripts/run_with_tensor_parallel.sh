@@ -27,7 +27,8 @@ set -e
 TP_SIZE=${1:-2}
 NUM_GPUS=${2:-$(nvidia-smi -L | wc -l)}
 CONFIG_PATH=${3:-"configs/train/tensor_parallel.yaml"}
-ACCELERATE_CONFIG=${4:-"configs/accelerate/deepspeed_zero3.yaml"}
+# 注意：TP 模式必须使用 ZeRO-2，ZeRO-3 与 TP 不兼容！
+ACCELERATE_CONFIG=${4:-"configs/accelerate/deepspeed_zero2_tp.yaml"}
 
 # Validate TP_SIZE
 if [ $((NUM_GPUS % TP_SIZE)) -ne 0 ]; then
@@ -68,4 +69,4 @@ accelerate launch \
     --use_tensor_parallel \
     --tp_size "$TP_SIZE" \
     --tensorboard \
-    # --resume_from_checkpoint outputs/stage1_text_tp-20251216-211759/interrupted_step_45
+    # --resume_from_checkpoint outputs/stage1_text_tp-20251217-151835/interrupted_step_45
