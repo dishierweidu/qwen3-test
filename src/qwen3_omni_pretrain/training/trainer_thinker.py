@@ -435,12 +435,17 @@ def _train_with_accelerator(
             drop_last=False,
         )
 
+    effective_num_workers = cfg.num_workers
+    if use_tensor_parallel and tensor_parallel_size > 1:
+        # 避免 worker 异常/调度差异导致 TP 组步伐不一致，先用 0 worker 简化数据路径
+        effective_num_workers = 0
+
     loader_kwargs = {
-        "num_workers": cfg.num_workers,
+        "num_workers": effective_num_workers,
         "collate_fn": collator,
         "pin_memory": True,
     }
-    if cfg.num_workers > 0:
+    if effective_num_workers > 0:
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = 4
 

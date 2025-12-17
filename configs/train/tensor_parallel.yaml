@@ -43,7 +43,7 @@ data:
   # packed_seq_length: 2048
 
 train:
-  num_epochs: 1
+  num_epochs: 10
   max_steps: -1  # -1 表示按 epoch 训练
   
   # 优化器参数
@@ -56,8 +56,8 @@ train:
   
   # 日志和检查点
   logging_steps: 10
-  eval_steps: 100
-  save_steps: 1000
+  eval_steps: 1000
+  save_steps: 5000
   output_dir: outputs/stage1_text_tp
   
   # 精度

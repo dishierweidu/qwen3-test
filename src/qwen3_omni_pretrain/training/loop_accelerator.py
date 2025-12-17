@@ -4,7 +4,7 @@ Accelerator 专用训练循环
 使用 HuggingFace Accelerate 库的统一接口进行训练
 """
 
-from typing import Callable, Optional, Dict, Any, Tuple
+from typing import Callable, Optional, Dict, Any, Tuple, TYPE_CHECKING
 from contextlib import nullcontext
 
 import torch
@@ -17,6 +17,9 @@ try:
 except ImportError:
     ACCELERATE_AVAILABLE = False
     Accelerator = None
+
+if TYPE_CHECKING:
+    from accelerate import Accelerator
 
 from qwen3_omni_pretrain.parallel.initialize import (
     get_tensor_model_parallel_group,
@@ -65,6 +68,7 @@ def _tp_broadcast_batch_inplace(batch: Dict[str, Any], device: torch.device) -> 
     if tp_size <= 1:
         return batch
     group = get_tensor_model_parallel_group()
+    assert group is not None
     src_global = dist.get_global_rank(group, 0)
 
     for k, v in batch.items():
@@ -86,14 +90,17 @@ def _tp_broadcast_batch_dynamic(
         return batch if batch is not None else {}
 
     group = get_tensor_model_parallel_group()
+    assert group is not None
     src_global = dist.get_global_rank(group, 0)
     is_src = dist.get_rank() == src_global
 
     # 广播元信息
     meta = []
+    source_batch: Dict[str, Any] = {}
     if is_src:
         assert batch is not None
-        for k, v in batch.items():
+        source_batch: Dict[str, Any] = batch
+        for k, v in source_batch.items():
             if torch.is_tensor(v):
                 meta.append((k, True, v.dtype, tuple(v.shape)))
             else:
@@ -109,7 +116,7 @@ def _tp_broadcast_batch_dynamic(
         if is_tensor:
             _, _, dtype, shape = item
             if is_src:
-                t = batch[k]
+                t = source_batch[k]
                 if t.device != device:
                     t = t.to(device, non_blocking=True)
             else:
@@ -124,7 +131,7 @@ def _tp_broadcast_batch_dynamic(
 
 
 def _evaluate_with_tp_broadcast(
-    accelerator: "Accelerator",
+    accelerator: Any,
     model: torch.nn.Module,
     step: int,
     eval_fn: Callable[[int, torch.nn.Module], Any],
@@ -138,7 +145,7 @@ def _evaluate_with_tp_broadcast(
 
 
 def train_one_epoch_accelerator(
-    accelerator: "Accelerator",
+    accelerator: Any,
     model: torch.nn.Module,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
@@ -174,209 +181,417 @@ def train_one_epoch_accelerator(
         (avg_loss, num_updates): 平均损失和更新步数
     """
     model.train()
-    
     total_loss = 0.0
     total_ce = 0.0
     total_aux = 0.0
     num_updates = 0
-    
-    for batch_idx, batch in enumerate(dataloader):
-        # 检查是否需要停止
-        if should_stop_fn is not None and should_stop_fn():
-            break
-        
-        # Debug: 打印第一个 batch 的形状和有效 label 数
-        if batch_idx == 0 and accelerator.is_main_process:
-            if "input_ids" in batch:
-                msg = f"[Accelerator] First batch input_ids shape: {batch['input_ids'].shape}, device={batch['input_ids'].device}"
-                if "labels" in batch:
-                    valid = (batch["labels"] != -100).sum().item()
-                    msg += f", valid_labels={valid}"
-                print(msg)
-            else:
-                any_tensor = None
-                for v in batch.values():
-                    if isinstance(v, torch.Tensor):
-                        any_tensor = v
-                        break
-                dev = any_tensor.device if any_tensor is not None else "n/a"
-                print(f"[Accelerator] First batch keys: {list(batch.keys())}, device={dev}")
-        
-        # Accelerator 会自动处理设备放置，但确保 batch 在正确设备上
-        # 注意：经过 accelerator.prepare 的 dataloader 已经处理了设备放置
-        
-        # 使用 accumulate 上下文管理器处理梯度累积
-        # 这会自动处理 no_sync 和梯度同步
-        with accelerator.accumulate(model):
-            # 前向传播
-            batch = _tp_broadcast_batch_inplace(batch, accelerator.device)
 
-            # 可选：首个 batch 做 TP 组内一致性校验
-            if batch_idx == 0 and dist.is_initialized() and get_tensor_model_parallel_world_size() > 1:
+    tp_world = get_tensor_model_parallel_world_size() if dist.is_initialized() else 1
+    tp_group = get_tensor_model_parallel_group() if dist.is_initialized() else None
+    use_tp = tp_group is not None and tp_world > 1
+    if use_tp:
+        assert tp_group is not None
+        tp_src_global = dist.get_global_rank(tp_group, 0)
+    else:
+        tp_src_global = 0
+    is_tp_src = dist.get_rank() == tp_src_global if use_tp else True
+
+    def _log_first_batch(batch_idx: int, batch: Dict[str, Any]):
+        if batch_idx != 0:
+            return
+        if not accelerator.is_main_process:
+            return
+        if "input_ids" in batch:
+            msg = f"[Accelerator] First batch input_ids shape: {batch['input_ids'].shape}, device={batch['input_ids'].device}"
+            if "labels" in batch:
+                valid = (batch["labels"] != -100).sum().item()
+                msg += f", valid_labels={valid}"
+            print(msg)
+        else:
+            any_tensor = None
+            for v in batch.values():
+                if isinstance(v, torch.Tensor):
+                    any_tensor = v
+                    break
+            dev = any_tensor.device if any_tensor is not None else "n/a"
+            print(f"[Accelerator] First batch keys: {list(batch.keys())}, device={dev}")
+
+    if use_tp:
+        data_iter = iter(dataloader) if is_tp_src else None
+        step_idx = 0
+        while True:
+            stop_tensor = torch.zeros(1, device=accelerator.device, dtype=torch.int32)
+            if is_tp_src and should_stop_fn is not None and should_stop_fn():
+                stop_tensor.fill_(1)
+            dist.broadcast(stop_tensor, src=tp_src_global, group=tp_group)
+            if stop_tensor.item() == 1:
+                break
+
+            has_batch = torch.zeros(1, device=accelerator.device, dtype=torch.int32)
+            local_batch = None
+            if is_tp_src:
+                assert data_iter is not None
+                try:
+                    local_batch = next(data_iter)
+                    has_batch.fill_(1)
+                except StopIteration:
+                    has_batch.fill_(0)
+
+            dist.broadcast(has_batch, src=tp_src_global, group=tp_group)
+            if has_batch.item() == 0:
+                break
+
+            batch = _tp_broadcast_batch_dynamic(local_batch if is_tp_src else None, accelerator.device)
+            _log_first_batch(step_idx, batch)
+
+            if step_idx == 0 and dist.is_initialized() and get_tensor_model_parallel_world_size() > 1:
                 if "input_ids" in batch:
                     group = get_tensor_model_parallel_group()
+                    assert group is not None
                     checksum = batch["input_ids"].to(torch.int64).sum()
                     gathered = [torch.zeros_like(checksum) for _ in range(get_tensor_model_parallel_world_size())]
                     dist.all_gather(gathered, checksum, group=group)
                     if dist.get_rank() == dist.get_global_rank(group, 0):
                         print("[TP] input_ids checksums:", [x.item() for x in gathered])
 
-            outputs = model(**batch)
+            with accelerator.accumulate(model):
+                outputs = model(**batch)
 
-            if batch_idx < 5 and accelerator.is_main_process:
-                micro_valid = None
-                if "labels" in batch:
-                    micro_valid = (batch["labels"] != -100).sum().item()
-                micro_loss = outputs.get("loss", None)
-                micro_ce = outputs.get("ce_loss", None)
-                micro_aux = outputs.get("aux_loss", None)
-                log_msg = f"[Accelerator] micro batch {batch_idx}"
-                if micro_valid is not None:
-                    log_msg += f" valid_labels={micro_valid}"
-                if isinstance(micro_loss, torch.Tensor):
-                    log_msg += f" loss={micro_loss.detach().float().item():.6f}"
-                if isinstance(micro_ce, torch.Tensor):
-                    log_msg += f" ce={micro_ce.detach().float().item():.6f}"
-                if isinstance(micro_aux, torch.Tensor):
-                    log_msg += f" aux={micro_aux.detach().float().item():.6f}"
-                print(log_msg)
-
-            if batch_idx == 0 and accelerator.is_main_process:
-                loss_dbg = outputs.get("loss", None)
-                ce_dbg = outputs.get("ce_loss", None)
-                aux_dbg = outputs.get("aux_loss", None)
-                logits = outputs.get("logits", None)
-
-                msg = "[Accelerator] First batch loss stats:"
-                if isinstance(loss_dbg, torch.Tensor):
-                    msg += f" loss={loss_dbg.detach().float().item():.6f}"
-                    msg += f" finite={torch.isfinite(loss_dbg).item()}"
-                if isinstance(ce_dbg, torch.Tensor):
-                    msg += f" ce={ce_dbg.detach().float().item():.6f}"
-                    msg += f" ce_finite={torch.isfinite(ce_dbg).item()}"
-                if isinstance(aux_dbg, torch.Tensor):
-                    msg += f" aux={aux_dbg.detach().float().item():.6f}"
-                    msg += f" aux_finite={torch.isfinite(aux_dbg).item()}"
-                if isinstance(logits, torch.Tensor):
-                    finite_ratio = torch.isfinite(logits).float().mean().item()
-                    msg += f" logits_finite_ratio={finite_ratio:.4f}"
-                    msg += f" logits_min={logits.min().item():.3f} logits_max={logits.max().item():.3f}"
-                print(msg)
-            
-            loss = outputs["loss"]
-            ce_loss = outputs.get("ce_loss", None)
-            aux_loss = outputs.get("aux_loss", None)
-            
-            # NaN/Inf 检查 - 在分布式环境下需要同步
-            bad_loss = _is_bad_loss(loss)
-            if accelerator.num_processes > 1:
-                bad_flag = torch.tensor([1 if bad_loss else 0], device=accelerator.device)
-                bad_flag = accelerator.reduce(bad_flag, reduction="max")
-                bad_loss = bad_flag.item() > 0
-            
-            if bad_loss:
-                if accelerator.is_main_process:
-                    print(f"[train] NaN/Inf loss at batch {batch_idx + 1}, skip.")
+                if step_idx < 5 and accelerator.is_main_process:
+                    micro_valid = None
                     if "labels" in batch:
-                        valid = (batch["labels"] != -100).sum().item()
-                        print(f"[train] batch valid_labels={valid}")
-                    log_dbg = []
-                    for k in ("loss", "ce_loss", "aux_loss"):
-                        v = outputs.get(k, None)
-                        if isinstance(v, torch.Tensor):
-                            log_dbg.append(f"{k}={v.detach().float().item():.4f}")
-                    logits_dbg = outputs.get("logits", None)
-                    if isinstance(logits_dbg, torch.Tensor):
-                        finite_ratio = torch.isfinite(logits_dbg).float().mean().item()
-                        log_dbg.append(f"logits_finite_ratio={finite_ratio:.4f}")
-                        log_dbg.append(f"logits_min={logits_dbg.min().item():.3f}")
-                        log_dbg.append(f"logits_max={logits_dbg.max().item():.3f}")
-                    if log_dbg:
-                        print("[train] dbg " + " ".join(log_dbg))
-                optimizer.zero_grad()
-                continue
-            
-            # 反向传播 - Accelerator 自动处理混合精度和梯度缩放
-            accelerator.backward(loss)
+                        micro_valid = (batch["labels"] != -100).sum().item()
+                    micro_loss = outputs.get("loss", None)
+                    micro_ce = outputs.get("ce_loss", None)
+                    micro_aux = outputs.get("aux_loss", None)
+                    log_msg = f"[Accelerator] micro batch {step_idx}"
+                    if micro_valid is not None:
+                        log_msg += f" valid_labels={micro_valid}"
+                    if isinstance(micro_loss, torch.Tensor):
+                        log_msg += f" loss={micro_loss.detach().float().item():.6f}"
+                    if isinstance(micro_ce, torch.Tensor):
+                        log_msg += f" ce={micro_ce.detach().float().item():.6f}"
+                    if isinstance(micro_aux, torch.Tensor):
+                        log_msg += f" aux={micro_aux.detach().float().item():.6f}"
+                    print(log_msg)
 
-            # 梯度清理：去掉 NaN/Inf，并裁剪极值，避免后续 grad_norm 变非有限
-            had_nonfinite_grad = _sanitize_gradients(model.parameters(), clamp_value=1e4)
-            if accelerator.num_processes > 1:
-                flag_tensor = torch.tensor([1 if had_nonfinite_grad else 0], device=accelerator.device)
-                flag_tensor = accelerator.reduce(flag_tensor, reduction="max")
-                had_nonfinite_grad = flag_tensor.item() > 0
-            if had_nonfinite_grad:
-                if accelerator.is_main_process:
-                    print(f"[train] Found non-finite grads at batch {batch_idx + 1}, zeroed/clamped. Skip step (synced across ranks).")
-                optimizer.zero_grad()
-                continue
-            
-            # 梯度裁剪 - 使用 accelerator.clip_grad_norm_
-            if accelerator.sync_gradients:
-                grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                grad_norm_tensor = torch.as_tensor(grad_norm, device=accelerator.device)
-                if accelerator.num_processes > 1:
-                    # 同步判断梯度范数是否有限
-                    finite_flag = accelerator.reduce(torch.isfinite(grad_norm_tensor).int(), reduction="min")
-                    finite_norm = finite_flag.item() > 0
-                else:
-                    finite_norm = torch.isfinite(grad_norm_tensor).item()
-                if not finite_norm:
+                if step_idx == 0 and accelerator.is_main_process:
+                    loss_dbg = outputs.get("loss", None)
+                    ce_dbg = outputs.get("ce_loss", None)
+                    aux_dbg = outputs.get("aux_loss", None)
+                    logits = outputs.get("logits", None)
+
+                    msg = "[Accelerator] First batch loss stats:"
+                    if isinstance(loss_dbg, torch.Tensor):
+                        msg += f" loss={loss_dbg.detach().float().item():.6f}"
+                        msg += f" finite={torch.isfinite(loss_dbg).item()}"
+                    if isinstance(ce_dbg, torch.Tensor):
+                        msg += f" ce={ce_dbg.detach().float().item():.6f}"
+                        msg += f" ce_finite={torch.isfinite(ce_dbg).item()}"
+                    if isinstance(aux_dbg, torch.Tensor):
+                        msg += f" aux={aux_dbg.detach().float().item():.6f}"
+                        msg += f" aux_finite={torch.isfinite(aux_dbg).item()}"
+                    if isinstance(logits, torch.Tensor):
+                        finite_ratio = torch.isfinite(logits).float().mean().item()
+                        msg += f" logits_finite_ratio={finite_ratio:.4f}"
+                        msg += f" logits_min={logits.min().item():.3f} logits_max={logits.max().item():.3f}"
+                    print(msg)
+
+                loss = outputs.get("loss", None)
+                if loss is None or not torch.is_tensor(loss):
                     if accelerator.is_main_process:
-                        print(f"[train] Non-finite grad norm at batch {batch_idx + 1}, skip step.")
+                        print(f"[train] loss is None or non-tensor at batch {step_idx + 1}, skip.")
+                    optimizer.zero_grad()
+                    step_idx += 1
+                    continue
+                if loss.dim() != 0:
+                    if accelerator.is_main_process:
+                        print(f"[train] loss is not scalar (shape {tuple(loss.shape)}) at batch {step_idx + 1}, skip.")
+                    optimizer.zero_grad()
+                    step_idx += 1
+                    continue
+                ce_loss = outputs.get("ce_loss", None)
+                aux_loss = outputs.get("aux_loss", None)
+
+                bad_loss = _is_bad_loss(loss)
+                if accelerator.num_processes > 1:
+                    bad_flag = torch.tensor([1 if bad_loss else 0], device=accelerator.device)
+                    bad_flag = accelerator.reduce(bad_flag, reduction="max")
+                    bad_loss = bad_flag.item() > 0
+
+                if bad_loss:
+                    if accelerator.is_main_process:
+                        print(f"[train] NaN/Inf loss at batch {step_idx + 1}, skip.")
+                        if "labels" in batch:
+                            valid = (batch["labels"] != -100).sum().item()
+                            print(f"[train] batch valid_labels={valid}")
+                        log_dbg = []
+                        for k in ("loss", "ce_loss", "aux_loss"):
+                            v = outputs.get(k, None)
+                            if isinstance(v, torch.Tensor):
+                                log_dbg.append(f"{k}={v.detach().float().item():.4f}")
+                        logits_dbg = outputs.get("logits", None)
+                        if isinstance(logits_dbg, torch.Tensor):
+                            finite_ratio = torch.isfinite(logits_dbg).float().mean().item()
+                            log_dbg.append(f"logits_finite_ratio={finite_ratio:.4f}")
+                            log_dbg.append(f"logits_min={logits_dbg.min().item():.3f}")
+                            log_dbg.append(f"logits_max={logits_dbg.max().item():.3f}")
+                        if log_dbg:
+                            print("[train] dbg " + " ".join(log_dbg))
                     optimizer.zero_grad()
                     continue
-            
-            # 优化器步进仅在同步梯度时执行
+
+                # Debug: check loss shape before backward
+                if step_idx < 3:
+                    rank = dist.get_rank() if dist.is_initialized() else 0
+                    print(f"[rank {rank}] loss shape: {loss.shape}, dtype: {loss.dtype}, requires_grad: {loss.requires_grad}", flush=True)
+
+                accelerator.backward(loss)
+
+                had_nonfinite_grad = _sanitize_gradients(model.parameters(), clamp_value=1e4)
+                if accelerator.num_processes > 1:
+                    flag_tensor = torch.tensor([1 if had_nonfinite_grad else 0], device=accelerator.device)
+                    flag_tensor = accelerator.reduce(flag_tensor, reduction="max")
+                    had_nonfinite_grad = flag_tensor.item() > 0
+                if had_nonfinite_grad:
+                    if accelerator.is_main_process:
+                        print(f"[train] Found non-finite grads at batch {step_idx + 1}, zeroed/clamped. Skip step (synced across ranks).")
+                    optimizer.zero_grad()
+                    continue
+
+                if accelerator.sync_gradients:
+                    grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    grad_norm_tensor = torch.as_tensor(grad_norm, device=accelerator.device)
+                    if accelerator.num_processes > 1:
+                        finite_flag = accelerator.reduce(torch.isfinite(grad_norm_tensor).int(), reduction="min")
+                        finite_norm = finite_flag.item() > 0
+                    else:
+                        finite_norm = torch.isfinite(grad_norm_tensor).item()
+                    if not finite_norm:
+                        if accelerator.is_main_process:
+                            print(f"[train] Non-finite grad norm at batch {step_idx + 1}, skip step.")
+                        optimizer.zero_grad()
+                        continue
+
+                if accelerator.sync_gradients:
+                    optimizer.step()
+                    if scheduler is not None:
+                        scheduler.step()
+                    optimizer.zero_grad()
+
             if accelerator.sync_gradients:
-                optimizer.step()
-                if scheduler is not None:
-                    scheduler.step()
-                optimizer.zero_grad()
-        
-        # 只在同步梯度后（即实际更新参数后）记录统计
-        if accelerator.sync_gradients:
-            num_updates += 1
-            current_step = global_step_offset + num_updates
-            
-            # 统计损失
-            step_loss = loss.detach().item()
-            total_loss += step_loss
-            
-            if isinstance(ce_loss, torch.Tensor):
-                total_ce += ce_loss.detach().item()
-            if isinstance(aux_loss, torch.Tensor):
-                total_aux += aux_loss.detach().item()
-            
-            # 获取当前学习率
-            current_lr = None
-            if optimizer.param_groups:
-                current_lr = optimizer.param_groups[0].get("lr", None)
-            
-            # 日志回调
-            if log_fn is not None:
-                log_fn(
-                    current_step,
-                    step_loss,
-                    ce_loss.detach().item() if isinstance(ce_loss, torch.Tensor) else None,
-                    aux_loss.detach().item() if isinstance(aux_loss, torch.Tensor) else None,
-                    current_lr,
-                )
-            
-            # 评估回调（如 step-based eval/save）
-            if eval_fn is not None:
-                _evaluate_with_tp_broadcast(
-                    accelerator=accelerator,
-                    model=model,
-                    step=current_step,
-                    eval_fn=eval_fn,
-                    log_fn=log_fn,
-                    is_first_step=current_step == 0,
-                )
-            
-            # 检查是否需要停止
+                num_updates += 1
+                current_step = global_step_offset + num_updates
+
+                step_loss = loss.detach().item()
+                total_loss += step_loss
+
+                if isinstance(ce_loss, torch.Tensor):
+                    total_ce += ce_loss.detach().item()
+                if isinstance(aux_loss, torch.Tensor):
+                    total_aux += aux_loss.detach().item()
+
+                current_lr = None
+                if optimizer.param_groups:
+                    current_lr = optimizer.param_groups[0].get("lr", None)
+
+                if log_fn is not None:
+                    log_fn(
+                        current_step,
+                        step_loss,
+                        ce_loss.detach().item() if isinstance(ce_loss, torch.Tensor) else None,
+                        aux_loss.detach().item() if isinstance(aux_loss, torch.Tensor) else None,
+                        current_lr,
+                    )
+
+                if eval_fn is not None:
+                    _evaluate_with_tp_broadcast(
+                        accelerator=accelerator,
+                        model=model,
+                        step=current_step,
+                        eval_fn=eval_fn,
+                        log_fn=log_fn,
+                        is_first_step=current_step == 0,
+                    )
+
+                if should_stop_fn is not None and should_stop_fn():
+                    break
+
+            step_idx += 1
+    else:
+        for batch_idx, batch in enumerate(dataloader):
             if should_stop_fn is not None and should_stop_fn():
                 break
+
+            _log_first_batch(batch_idx, batch)
+
+            batch = _tp_broadcast_batch_inplace(batch, accelerator.device)
+
+            if batch_idx == 0 and dist.is_initialized() and get_tensor_model_parallel_world_size() > 1:
+                if "input_ids" in batch:
+                    group = get_tensor_model_parallel_group()
+                    assert group is not None
+                    checksum = batch["input_ids"].to(torch.int64).sum()
+                    gathered = [torch.zeros_like(checksum) for _ in range(get_tensor_model_parallel_world_size())]
+                    dist.all_gather(gathered, checksum, group=group)
+                    if dist.get_rank() == dist.get_global_rank(group, 0):
+                        print("[TP] input_ids checksums:", [x.item() for x in gathered])
+
+            with accelerator.accumulate(model):
+                outputs = model(**batch)
+
+                if batch_idx < 5 and accelerator.is_main_process:
+                    micro_valid = None
+                    if "labels" in batch:
+                        micro_valid = (batch["labels"] != -100).sum().item()
+                    micro_loss = outputs.get("loss", None)
+                    micro_ce = outputs.get("ce_loss", None)
+                    micro_aux = outputs.get("aux_loss", None)
+                    log_msg = f"[Accelerator] micro batch {batch_idx}"
+                    if micro_valid is not None:
+                        log_msg += f" valid_labels={micro_valid}"
+                    if isinstance(micro_loss, torch.Tensor):
+                        log_msg += f" loss={micro_loss.detach().float().item():.6f}"
+                    if isinstance(micro_ce, torch.Tensor):
+                        log_msg += f" ce={micro_ce.detach().float().item():.6f}"
+                    if isinstance(micro_aux, torch.Tensor):
+                        log_msg += f" aux={micro_aux.detach().float().item():.6f}"
+                    print(log_msg)
+
+                if batch_idx == 0 and accelerator.is_main_process:
+                    loss_dbg = outputs.get("loss", None)
+                    ce_dbg = outputs.get("ce_loss", None)
+                    aux_dbg = outputs.get("aux_loss", None)
+                    logits = outputs.get("logits", None)
+
+                    msg = "[Accelerator] First batch loss stats:"
+                    if isinstance(loss_dbg, torch.Tensor):
+                        msg += f" loss={loss_dbg.detach().float().item():.6f}"
+                        msg += f" finite={torch.isfinite(loss_dbg).item()}"
+                    if isinstance(ce_dbg, torch.Tensor):
+                        msg += f" ce={ce_dbg.detach().float().item():.6f}"
+                        msg += f" ce_finite={torch.isfinite(ce_dbg).item()}"
+                    if isinstance(aux_dbg, torch.Tensor):
+                        msg += f" aux={aux_dbg.detach().float().item():.6f}"
+                        msg += f" aux_finite={torch.isfinite(aux_dbg).item()}"
+                    if isinstance(logits, torch.Tensor):
+                        finite_ratio = torch.isfinite(logits).float().mean().item()
+                        msg += f" logits_finite_ratio={finite_ratio:.4f}"
+                        msg += f" logits_min={logits.min().item():.3f} logits_max={logits.max().item():.3f}"
+                    print(msg)
+
+                loss = outputs.get("loss", None)
+                if loss is None or not torch.is_tensor(loss):
+                    if accelerator.is_main_process:
+                        print(f"[train] loss is None or non-tensor at batch {batch_idx + 1}, skip.")
+                    optimizer.zero_grad()
+                    continue
+                if loss.dim() != 0:
+                    if accelerator.is_main_process:
+                        print(f"[train] loss is not scalar (shape {tuple(loss.shape)}) at batch {batch_idx + 1}, skip.")
+                    optimizer.zero_grad()
+                    continue
+                ce_loss = outputs.get("ce_loss", None)
+                aux_loss = outputs.get("aux_loss", None)
+
+                bad_loss = _is_bad_loss(loss)
+                if accelerator.num_processes > 1:
+                    bad_flag = torch.tensor([1 if bad_loss else 0], device=accelerator.device)
+                    bad_flag = accelerator.reduce(bad_flag, reduction="max")
+                    bad_loss = bad_flag.item() > 0
+
+                if bad_loss:
+                    if accelerator.is_main_process:
+                        print(f"[train] NaN/Inf loss at batch {batch_idx + 1}, skip.")
+                        if "labels" in batch:
+                            valid = (batch["labels"] != -100).sum().item()
+                            print(f"[train] batch valid_labels={valid}")
+                        log_dbg = []
+                        for k in ("loss", "ce_loss", "aux_loss"):
+                            v = outputs.get(k, None)
+                            if isinstance(v, torch.Tensor):
+                                log_dbg.append(f"{k}={v.detach().float().item():.4f}")
+                        logits_dbg = outputs.get("logits", None)
+                        if isinstance(logits_dbg, torch.Tensor):
+                            finite_ratio = torch.isfinite(logits_dbg).float().mean().item()
+                            log_dbg.append(f"logits_finite_ratio={finite_ratio:.4f}")
+                            log_dbg.append(f"logits_min={logits_dbg.min().item():.3f}")
+                            log_dbg.append(f"logits_max={logits_dbg.max().item():.3f}")
+                        if log_dbg:
+                            print("[train] dbg " + " ".join(log_dbg))
+                    optimizer.zero_grad()
+                    continue
+
+                accelerator.backward(loss)
+
+                had_nonfinite_grad = _sanitize_gradients(model.parameters(), clamp_value=1e4)
+                if accelerator.num_processes > 1:
+                    flag_tensor = torch.tensor([1 if had_nonfinite_grad else 0], device=accelerator.device)
+                    flag_tensor = accelerator.reduce(flag_tensor, reduction="max")
+                    had_nonfinite_grad = flag_tensor.item() > 0
+                if had_nonfinite_grad:
+                    if accelerator.is_main_process:
+                        print(f"[train] Found non-finite grads at batch {batch_idx + 1}, zeroed/clamped. Skip step (synced across ranks).")
+                    optimizer.zero_grad()
+                    continue
+
+                if accelerator.sync_gradients:
+                    grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    grad_norm_tensor = torch.as_tensor(grad_norm, device=accelerator.device)
+                    if accelerator.num_processes > 1:
+                        finite_flag = accelerator.reduce(torch.isfinite(grad_norm_tensor).int(), reduction="min")
+                        finite_norm = finite_flag.item() > 0
+                    else:
+                        finite_norm = torch.isfinite(grad_norm_tensor).item()
+                    if not finite_norm:
+                        if accelerator.is_main_process:
+                            print(f"[train] Non-finite grad norm at batch {batch_idx + 1}, skip step.")
+                        optimizer.zero_grad()
+                        continue
+
+                if accelerator.sync_gradients:
+                    optimizer.step()
+                    if scheduler is not None:
+                        scheduler.step()
+                    optimizer.zero_grad()
+
+            if accelerator.sync_gradients:
+                num_updates += 1
+                current_step = global_step_offset + num_updates
+
+                step_loss = loss.detach().item()
+                total_loss += step_loss
+
+                if isinstance(ce_loss, torch.Tensor):
+                    total_ce += ce_loss.detach().item()
+                if isinstance(aux_loss, torch.Tensor):
+                    total_aux += aux_loss.detach().item()
+
+                current_lr = None
+                if optimizer.param_groups:
+                    current_lr = optimizer.param_groups[0].get("lr", None)
+
+                if log_fn is not None:
+                    log_fn(
+                        current_step,
+                        step_loss,
+                        ce_loss.detach().item() if isinstance(ce_loss, torch.Tensor) else None,
+                        aux_loss.detach().item() if isinstance(aux_loss, torch.Tensor) else None,
+                        current_lr,
+                    )
+
+                if eval_fn is not None:
+                    _evaluate_with_tp_broadcast(
+                        accelerator=accelerator,
+                        model=model,
+                        step=current_step,
+                        eval_fn=eval_fn,
+                        log_fn=log_fn,
+                        is_first_step=current_step == 0,
+                    )
+
+                if should_stop_fn is not None and should_stop_fn():
+                    break
     
     if num_updates == 0:
         return float("nan"), 0
@@ -386,7 +601,7 @@ def train_one_epoch_accelerator(
 
 
 def evaluate_accelerator(
-    accelerator: "Accelerator",
+    accelerator: Any,
     model: torch.nn.Module,
     dataloader: DataLoader,
 ) -> float:
@@ -410,7 +625,11 @@ def evaluate_accelerator(
     tp_world = get_tensor_model_parallel_world_size() if dist.is_initialized() else 1
     tp_group = get_tensor_model_parallel_group() if dist.is_initialized() else None
     use_tp = tp_group is not None and tp_world > 1
-    tp_src_global = dist.get_global_rank(tp_group, 0) if use_tp else 0
+    if use_tp:
+        assert tp_group is not None
+        tp_src_global = dist.get_global_rank(tp_group, 0)
+    else:
+        tp_src_global = 0
     is_tp_src = dist.get_rank() == tp_src_global if use_tp else True
 
     with torch.no_grad():
@@ -429,9 +648,11 @@ def evaluate_accelerator(
         else:
             data_iter = iter(dataloader) if is_tp_src else None
             step_idx = 0
+            batch = None
             while True:
                 has_batch = torch.zeros(1, device=accelerator.device)
                 if is_tp_src:
+                    assert data_iter is not None
                     try:
                         batch = next(data_iter)
                         has_batch.fill_(1)
@@ -476,7 +697,7 @@ def evaluate_accelerator(
 
 
 def train_one_epoch_accelerator_simple(
-    accelerator: "Accelerator",
+    accelerator: Any,
     model: torch.nn.Module,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
@@ -484,9 +705,8 @@ def train_one_epoch_accelerator_simple(
     max_grad_norm: float = 1.0,
 ) -> float:
     """
-    简化版 Accelerator 训练循环（无回调）
-    
-    适用于简单训练场景
+    Simplified Accelerator training loop (no callbacks).
+    Suitable for simple training scenarios.
     """
     model.train()
     total_loss = 0.0

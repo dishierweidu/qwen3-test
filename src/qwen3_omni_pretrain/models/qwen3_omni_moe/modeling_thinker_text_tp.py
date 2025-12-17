@@ -27,6 +27,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from transformers import PreTrainedModel
 
 from .configuration_qwen3_omni_moe import Qwen3OmniMoeConfig, Qwen3OmniMoeThinkerConfig
@@ -544,7 +545,7 @@ class Qwen3OmniMoeThinkerTextModelTP(PreTrainedModel):
         
         # Parse layer indices
         moe_layer_set = None
-        if getattr(thinker_cfg, "moe_layer_indices", None) is not None:
+        if getattr(thinker_cfg, "use_moe", False) and getattr(thinker_cfg, "moe_layer_indices", None):
             indices_str = thinker_cfg.moe_layer_indices
             if isinstance(indices_str, str) and indices_str.strip():
                 moe_layer_set = set(
@@ -565,7 +566,7 @@ class Qwen3OmniMoeThinkerTextModelTP(PreTrainedModel):
         # Build layers
         layers = []
         for layer_idx in range(thinker_cfg.num_hidden_layers):
-            use_moe_layer = thinker_cfg.use_moe
+            use_moe_layer = bool(thinker_cfg.use_moe)
             if moe_layer_set is not None:
                 use_moe_layer = layer_idx in moe_layer_set
             
@@ -627,6 +628,8 @@ class Qwen3OmniMoeThinkerTextModelTP(PreTrainedModel):
         output_hidden_states: bool = False,
         inputs_embeds: Optional[torch.Tensor] = None,
     ):
+        if dist.is_initialized() and dist.get_rank() == 0:
+            print("[model] forward start", flush=True)
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
             device = hidden_states.device
@@ -641,6 +644,8 @@ class Qwen3OmniMoeThinkerTextModelTP(PreTrainedModel):
             position_ids = torch.arange(
                 seq_len, dtype=torch.long, device=device
             ).unsqueeze(0).expand(bsz, -1)
+        if dist.is_initialized() and dist.get_rank() == 0:
+            print("[model] after embed", flush=True)
         
         attention_mask_full = self._prepare_attention_mask(
             attention_mask, (bsz, seq_len), device
@@ -673,6 +678,8 @@ class Qwen3OmniMoeThinkerTextModelTP(PreTrainedModel):
                 hidden_states, layer_aux = layer(
                     hidden_states, attention_mask_full, position_ids
                 )
+            if dist.is_initialized() and dist.get_rank() == 0 and layer_aux is not None:
+                print("[model] layer aux ok", flush=True)
             
             if layer_aux is not None:
                 if total_aux_loss is None:
@@ -681,6 +688,8 @@ class Qwen3OmniMoeThinkerTextModelTP(PreTrainedModel):
                     total_aux_loss = total_aux_loss + layer_aux
         
         hidden_states = self.norm(hidden_states)
+        if dist.is_initialized() and dist.get_rank() == 0:
+            print("[model] after layers", flush=True)
         logits = self.lm_head(hidden_states)
         
         loss = None
@@ -693,7 +702,7 @@ class Qwen3OmniMoeThinkerTextModelTP(PreTrainedModel):
             shift_labels = labels[:, 1:].contiguous()
             
             valid_mask = (shift_labels != -100)
-            num_tokens = valid_mask.sum()
+            num_tokens = valid_mask.sum().float()
             
             loss_fct = nn.CrossEntropyLoss(
                 ignore_index=-100,
@@ -714,18 +723,19 @@ class Qwen3OmniMoeThinkerTextModelTP(PreTrainedModel):
                 if labels is not None:
                     if "num_tokens" not in locals():
                         valid_mask = (labels != -100)
-                        num_tokens = valid_mask.sum()
+                        num_tokens = valid_mask.sum().float()
                     if num_tokens > 0:
                         aux_loss = total_aux_loss.float() / num_tokens
                     else:
                         aux_loss = total_aux_loss.float() * 0.0
                 else:
                     aux_loss = total_aux_loss.float()
-            
-            if loss is None:
-                loss = self.thinker_cfg.moe_aux_loss_coef * aux_loss
-            else:
-                loss = loss + self.thinker_cfg.moe_aux_loss_coef * aux_loss
+                
+                # 将 aux_loss 加到 loss 上（仅当 aux_loss 被计算时）
+                if loss is None:
+                    loss = self.thinker_cfg.moe_aux_loss_coef * aux_loss
+                else:
+                    loss = loss + self.thinker_cfg.moe_aux_loss_coef * aux_loss
         
         output = {
             "logits": logits,

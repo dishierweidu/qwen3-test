@@ -22,6 +22,7 @@ from qwen3_omni_pretrain.parallel.initialize import (
 )
 from qwen3_omni_pretrain.parallel.tensor_parallel import (
     reduce_from_tensor_model_parallel_region,
+    gather_from_tensor_model_parallel_region,
 )
 
 
@@ -190,14 +191,8 @@ class ParallelLMHead(nn.Module):
         if tp_world_size == 1:
             return output_parallel
         
-        # Gather logits from all ranks along vocabulary dimension
-        tp_group = get_tensor_model_parallel_group()
-        
-        # All-gather along last dimension
-        output_list = [torch.empty_like(output_parallel) for _ in range(tp_world_size)]
-        dist.all_gather(output_list, output_parallel.contiguous(), group=tp_group)
-        
-        output = torch.cat(output_list, dim=-1)
+        # Use differentiable all-gather to preserve gradients
+        output = gather_from_tensor_model_parallel_region(output_parallel)
         
         return output
 
