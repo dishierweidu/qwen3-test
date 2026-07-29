@@ -87,23 +87,15 @@ class Qwen3OmniMoeMLP(nn.Module):
             raise ValueError(
                 "gate_probs must have shape [num_tokens, num_experts]"
             )
-        if not torch.isfinite(gate_probs).all():
-            raise FloatingPointError(
-                "MoE router probabilities contain non-finite values"
-            )
-
         num_tokens = gate_probs.size(0)
         topk_values, topk_indices = gate_probs.topk(
             k=self.num_experts_per_tok, dim=-1
         )
         if self.renormalize_topk:
             denominator = topk_values.sum(dim=-1, keepdim=True)
-            if not torch.isfinite(denominator).all() or torch.any(
-                denominator <= 0
-            ):
-                raise FloatingPointError(
-                    "MoE selected router weights have a non-finite or zero sum"
-                )
+            # Keep this branch free of rank-local numerical exceptions. Any
+            # NaN/Inf propagates into model outputs and is handled by the
+            # trainer's synchronized non-finite check.
             topk_values = topk_values / denominator
 
         token_indices = (
@@ -127,11 +119,6 @@ class Qwen3OmniMoeMLP(nn.Module):
         x_flat = x.reshape(batch_size * sequence_length, hidden_size)
         gate_logits = self.gate(x_flat)
         gate_probs = torch.softmax(gate_logits, dim=-1)
-        if not torch.isfinite(gate_probs).all():
-            raise FloatingPointError(
-                "MoE router probabilities contain non-finite values"
-            )
-
         token_indices, expert_indices, scores = self._dispatch_tokens(gate_probs)
 
         importance = gate_probs.mean(dim=0)
@@ -147,9 +134,6 @@ class Qwen3OmniMoeMLP(nn.Module):
         )
         load = load / max(1, expert_indices.numel())
         aux_loss = (importance * load).sum() * self.num_experts
-        if not torch.isfinite(aux_loss):
-            raise FloatingPointError("MoE router auxiliary loss is non-finite")
-
         y_flat = torch.zeros_like(x_flat)
         for expert_id, expert in enumerate(self.experts):
             selected = expert_indices == expert_id
