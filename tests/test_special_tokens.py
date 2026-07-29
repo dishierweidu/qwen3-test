@@ -130,3 +130,42 @@ def test_padded_embedding_vocab_remains_valid():
         config, FakeTokenizer(length=6)
     )
     assert config.vocab_size == 16
+
+
+MODEL_CONFIGS = sorted(
+    Path("configs/model").glob("qwen3_omni_*_moe.yaml")
+)
+EXPECTED_TOKEN_STRINGS = {
+    "image_token_id": "<|image_pad|>",
+    "video_token_id": "<|video_pad|>",
+    "audio_token_id": "<|audio_pad|>",
+    "audio_start_token_id": "<|audio_start|>",
+    "audio_end_token_id": "<|audio_end|>",
+}
+
+
+@pytest.fixture(scope="module")
+def qwen3_tokenizer():
+    return AutoTokenizer.from_pretrained(
+        "src/tokenizer/Qwen3",
+        local_files_only=True,
+        use_fast=True,
+    )
+
+
+@pytest.mark.parametrize("config_path", MODEL_CONFIGS, ids=lambda p: p.stem)
+def test_model_yaml_defers_numeric_ids_to_tokenizer(
+    config_path, qwen3_tokenizer
+):
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert set(EXPECTED_TOKEN_STRINGS).isdisjoint(raw)
+
+    config = Qwen3OmniMoeConfig(**raw)
+    resolved = subject.reconcile_multimodal_token_ids(
+        config, qwen3_tokenizer
+    )
+    vocab = qwen3_tokenizer.get_vocab()
+    assert resolved == {
+        field: int(vocab[token])
+        for field, token in EXPECTED_TOKEN_STRINGS.items()
+    }

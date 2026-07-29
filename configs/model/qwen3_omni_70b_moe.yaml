@@ -11,13 +11,6 @@ num_attention_heads: 64
 num_key_value_heads: 8    # 使用 GQA：64 / 8 = 8 heads per KV
 max_position_embeddings: 4096
 
-# 多模态相关占位（与 7B 版本对齐）
-image_token_id: 151857
-audio_token_id: 151858
-video_token_id: 151859
-audio_start_token_id: 151860
-audio_end_token_id: 151861
-
 # RoPE（保持大 theta 但加上统一的 scaling 字段）
 rope_theta: 1000000.0
 rope_scaling:
