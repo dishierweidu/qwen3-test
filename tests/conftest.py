@@ -1,0 +1,71 @@
+from __future__ import annotations
+
+import sys
+import types
+
+import torch
+
+
+try:
+    import transformers  # noqa: F401
+except ImportError:
+    transformers = types.ModuleType("transformers")
+
+    class PretrainedConfig:
+        def __init__(self, **kwargs):
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
+        def to_dict(self):
+            return dict(self.__dict__)
+
+    class PreTrainedModel(torch.nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+
+        def post_init(self):
+            return None
+
+    transformers.PretrainedConfig = PretrainedConfig
+    transformers.PreTrainedModel = PreTrainedModel
+    sys.modules["transformers"] = transformers
+
+
+class TinyTokenizer:
+    pad_token_id = 0
+    eos_token_id = 2
+
+    @staticmethod
+    def _encode(text: str) -> list[int]:
+        return [3 + (ord(ch) % 50) for ch in text]
+
+    def __call__(
+        self,
+        texts,
+        *,
+        padding=False,
+        truncation=False,
+        max_length=None,
+        return_tensors=None,
+        add_special_tokens=True,
+    ):
+        single = isinstance(texts, str)
+        text_list = [texts] if single else list(texts)
+        encoded = [self._encode(text) for text in text_list]
+        if truncation and max_length is not None:
+            encoded = [ids[:max_length] for ids in encoded]
+        if return_tensors == "pt":
+            width = max((len(ids) for ids in encoded), default=0) if padding else max_length
+            if width is None:
+                width = max((len(ids) for ids in encoded), default=0)
+            input_ids = torch.full((len(encoded), width), self.pad_token_id, dtype=torch.long)
+            attention_mask = torch.zeros((len(encoded), width), dtype=torch.long)
+            for i, ids in enumerate(encoded):
+                n = min(len(ids), width)
+                if n:
+                    input_ids[i, :n] = torch.tensor(ids[:n], dtype=torch.long)
+                    attention_mask[i, :n] = 1
+            return {"input_ids": input_ids, "attention_mask": attention_mask}
+        result_ids = encoded[0] if single else encoded
+        return {"input_ids": result_ids}
