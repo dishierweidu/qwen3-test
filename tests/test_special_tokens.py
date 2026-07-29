@@ -78,3 +78,55 @@ def test_reconciled_ids_survive_config_round_trip(tmp_path):
         field: getattr(reloaded, field) for field in EXPECTED_IDS
     } == EXPECTED_IDS
     assert reloaded.vocab_size == 16
+
+
+def test_missing_token_is_rejected_without_partial_mutation():
+    config = tiny_config(image_token_id=9)
+    tokenizer = FakeTokenizer({"<|image_pad|>": 1})
+
+    with pytest.raises(ValueError, match="missing required multimodal token"):
+        subject.reconcile_multimodal_token_ids(config, tokenizer)
+
+    assert config.image_token_id == 9
+
+
+def test_duplicate_ids_are_rejected():
+    tokenizer = FakeTokenizer(
+        {token: 1 for token in TOKEN_IDS},
+        length=2,
+    )
+    with pytest.raises(ValueError, match="distinct IDs"):
+        subject.reconcile_multimodal_token_ids(tiny_config(), tokenizer)
+
+
+def test_out_of_range_id_is_rejected():
+    vocab = dict(TOKEN_IDS)
+    vocab["<|audio_end|>"] = 16
+    with pytest.raises(ValueError, match="outside model vocab_size"):
+        subject.reconcile_multimodal_token_ids(
+            tiny_config(), FakeTokenizer(vocab, length=6)
+        )
+
+
+def test_tokenizer_larger_than_embedding_is_rejected():
+    with pytest.raises(ValueError, match="exceeds model vocab_size"):
+        subject.reconcile_multimodal_token_ids(
+            tiny_config(), FakeTokenizer(length=17)
+        )
+
+
+def test_legacy_mismatch_warns_and_tokenizer_wins():
+    config = tiny_config(image_token_id=9)
+    with pytest.warns(RuntimeWarning, match="image_token_id"):
+        resolved = subject.reconcile_multimodal_token_ids(
+            config, FakeTokenizer()
+        )
+    assert config.image_token_id == resolved["image_token_id"] == 1
+
+
+def test_padded_embedding_vocab_remains_valid():
+    config = tiny_config()
+    subject.reconcile_multimodal_token_ids(
+        config, FakeTokenizer(length=6)
+    )
+    assert config.vocab_size == 16
