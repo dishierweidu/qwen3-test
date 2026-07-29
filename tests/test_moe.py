@@ -52,6 +52,7 @@ def test_nonfinite_router_probabilities_propagate_to_global_output_check():
 
     assert not torch.isfinite(output).all()
     assert not torch.isfinite(aux_loss)
+    assert bool(moe._nonfinite_diagnostic.item())
 
 
 def test_config_rejects_legacy_internal_shared_expert():
