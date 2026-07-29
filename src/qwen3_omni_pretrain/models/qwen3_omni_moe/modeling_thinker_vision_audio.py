@@ -1,6 +1,4 @@
-# src/qwen3_omni_pretrain/models/qwen3_omni_moe/modeling_thinker_vision_audio.py
-
-from typing import Optional, Dict, Any
+from typing import Any, Dict
 
 import torch
 import torch.nn as nn
@@ -12,43 +10,57 @@ from .configuration_qwen3_omni_moe import Qwen3OmniMoeConfig
 from .modeling_thinker_text import Qwen3OmniMoeThinkerTextModel
 
 
-class SimpleVisionEncoder(nn.Module):
-    """
-    稳定版 Vision encoder：
-    - 像素拉平 -> Linear -> Tanh -> LayerNorm
-    - 输出 [B, 1, H]
-    """
+def _require_finite_tensor(tensor: torch.Tensor, name: str) -> torch.Tensor:
+    if not torch.isfinite(tensor).all():
+        non_finite = int((~torch.isfinite(tensor)).sum().item())
+        raise FloatingPointError(
+            f"{name} contains {non_finite} non-finite value(s)"
+        )
+    return tensor
 
+
+def _build_multimodal_attention_mask(
+    text_attention_mask: torch.Tensor,
+    has_image: torch.Tensor,
+    has_audio: torch.Tensor,
+) -> torch.Tensor:
+    if text_attention_mask.dim() != 2:
+        raise ValueError("text_attention_mask must have shape [B, T]")
+    batch_size = text_attention_mask.size(0)
+    if has_image.numel() != batch_size or has_audio.numel() != batch_size:
+        raise ValueError("modality presence masks must match the text batch size")
+    device = text_attention_mask.device
+    dtype = text_attention_mask.dtype
+    prefix = torch.stack(
+        [
+            has_image.to(device=device, dtype=dtype).reshape(batch_size),
+            has_audio.to(device=device, dtype=dtype).reshape(batch_size),
+        ],
+        dim=1,
+    )
+    return torch.cat([prefix, text_attention_mask], dim=1)
+
+
+class SimpleVisionEncoder(nn.Module):
     def __init__(self, hidden_size: int, image_size: int = 224):
         super().__init__()
         self.image_size = image_size
-        in_dim = 3 * image_size * image_size
-        self.proj = nn.Linear(in_dim, hidden_size)
+        self.proj = nn.Linear(3 * image_size * image_size, hidden_size)
         self.act = nn.Tanh()
         self.norm = nn.LayerNorm(hidden_size)
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        # [B,3,H,W] -> resize -> flatten
         x = F.interpolate(
             pixel_values,
             size=(self.image_size, self.image_size),
             mode="bilinear",
             align_corners=False,
-        )  # [B,3,H,W]
-        x = x.reshape(x.size(0), -1)  # [B, 3*H*W]
-        x = self.proj(x)              # [B, H]
-        x = self.act(x)
-        x = self.norm(x)
-        return x.unsqueeze(1)         # [B,1,H]
+        )
+        x = x.reshape(x.size(0), -1)
+        return self.norm(self.act(self.proj(x))).unsqueeze(1)
 
 
 class SimpleAudioEncoder(nn.Module):
-    """
-    稳定版 Audio encoder：
-    - wav 向量 -> Linear -> Tanh -> LayerNorm
-    - 输入长度由 collator 保证固定（max_audio_len）
-    """
-
     def __init__(self, hidden_size: int, max_audio_len: int = 32000):
         super().__init__()
         self.max_audio_len = max_audio_len
@@ -57,38 +69,22 @@ class SimpleAudioEncoder(nn.Module):
         self.norm = nn.LayerNorm(hidden_size)
 
     def forward(self, audio_values: torch.Tensor) -> torch.Tensor:
-        # audio_values: [B, max_audio_len] 或 [B,1,max_audio_len]
         if audio_values.dim() == 3:
             audio_values = audio_values.squeeze(1)
-        x = self.proj(audio_values)   # [B,H]
-        x = self.act(x)
-        x = self.norm(x)
-        return x.unsqueeze(1)         # [B,1,H]
+        return self.norm(self.act(self.proj(audio_values))).unsqueeze(1)
 
 
 class Qwen3OmniMoeThinkerVisionAudioModel(PreTrainedModel):
-    """
-    Omni Thinker (Stage2 多模态版)：
-    - Vision / Audio -> 各 1 个 token
-    - 拼接: [vis_token] [aud_token] [text_tokens...] -> 喂进文本 Thinker。
-    """
+    """Stage-2 wrapper that prepends one vision and one audio token."""
+
     config_class = Qwen3OmniMoeConfig
 
     def __init__(self, config: Qwen3OmniMoeConfig):
         super().__init__(config)
-
         self.thinker = Qwen3OmniMoeThinkerTextModel(config)
         hidden_size = config.thinker_config.hidden_size
-
-        self.vision_encoder = SimpleVisionEncoder(
-            hidden_size=hidden_size,
-            image_size=224,
-        )
-        self.audio_encoder = SimpleAudioEncoder(
-            hidden_size=hidden_size,
-            max_audio_len=32000,
-        )
-
+        self.vision_encoder = SimpleVisionEncoder(hidden_size, image_size=224)
+        self.audio_encoder = SimpleAudioEncoder(hidden_size, max_audio_len=32000)
         self.post_init()
 
     def forward(
@@ -103,57 +99,33 @@ class Qwen3OmniMoeThinkerVisionAudioModel(PreTrainedModel):
         output_hidden_states: bool = False,
         **kwargs: Any,
     ) -> Dict[str, torch.Tensor]:
-        """
-        input_ids: [B, T_text]
-        pixel_values: [B,3,H,W]
-        audio_values: [B,max_audio_len]
-        has_image/has_audio: [B]
-        """
-
         device = input_ids.device
-        B, T_text = input_ids.size()
-
-        # 文本 embedding
-        text_embeds = self.thinker.embed_tokens(input_ids)  # [B,T,H]
-
-        # vision/audio token
-        vis_token = self.vision_encoder(pixel_values.to(device))    # [B,1,H]
-        aud_token = self.audio_encoder(audio_values.to(device))     # [B,1,H]
-        
-        # 把可能出现的 nan / inf 清理掉
-        vis_token = torch.nan_to_num(vis_token, nan=0.0, posinf=1e4, neginf=-1e4)
-        aud_token = torch.nan_to_num(aud_token, nan=0.0, posinf=1e4, neginf=-1e4)
-
-        # 对于没有图像/音频的样本，把对应 token 置 0，并 mask 掉
-        has_image_f = has_image.to(device).view(B, 1, 1).float()
-        has_audio_f = has_audio.to(device).view(B, 1, 1).float()
-
-        vis_token = vis_token * has_image_f          # [B,1,H]
-        aud_token = aud_token * has_audio_f          # [B,1,H]
-
-        # 拼接序列：[vis][aud][text...]
-        inputs_embeds = torch.cat([vis_token, aud_token, text_embeds], dim=1)  # [B,T+2,H]
-        T_total = inputs_embeds.size(1)
-
-        # attention_mask：没有的模态对应 token mask=0
-        attn_full = torch.ones(B, T_total, device=device, dtype=attention_mask.dtype)
-        # 没有 image 的，把 position 0 mask 掉
-        attn_full[:, 0] = has_image.to(device)
-        # 没有 audio 的，把 position 1 mask 掉
-        attn_full[:, 1] = has_audio.to(device)
-
-        # labels 对齐：前两个 multimodal token 不参与 loss，设为 -100
-        labels_full = torch.full(
-            (B, T_total), fill_value=-100, dtype=labels.dtype, device=device
+        batch_size = input_ids.size(0)
+        text_embeds = self.thinker.embed_tokens(input_ids)
+        vis_token = _require_finite_tensor(
+            self.vision_encoder(pixel_values.to(device)), "vision features"
         )
-        labels_full[:, 2:] = labels  # 文本部分照抄
+        aud_token = _require_finite_tensor(
+            self.audio_encoder(audio_values.to(device)), "audio features"
+        )
 
-        outputs = self.thinker(
+        vis_token = vis_token * has_image.to(device).view(batch_size, 1, 1).float()
+        aud_token = aud_token * has_audio.to(device).view(batch_size, 1, 1).float()
+        inputs_embeds = torch.cat([vis_token, aud_token, text_embeds], dim=1)
+        attn_full = _build_multimodal_attention_mask(
+            attention_mask, has_image, has_audio
+        )
+        labels_full = torch.full(
+            (batch_size, inputs_embeds.size(1)),
+            fill_value=-100,
+            dtype=labels.dtype,
+            device=device,
+        )
+        labels_full[:, 2:] = labels
+        return self.thinker(
             input_ids=None,
             attention_mask=attn_full,
             labels=labels_full,
             inputs_embeds=inputs_embeds,
             output_hidden_states=output_hidden_states,
         )
-
-        return outputs
