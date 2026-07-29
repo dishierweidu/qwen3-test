@@ -10,15 +10,6 @@ from .configuration_qwen3_omni_moe import Qwen3OmniMoeConfig
 from .modeling_thinker_text import Qwen3OmniMoeThinkerTextModel
 
 
-def _require_finite_tensor(tensor: torch.Tensor, name: str) -> torch.Tensor:
-    if not torch.isfinite(tensor).all():
-        non_finite = int((~torch.isfinite(tensor)).sum().item())
-        raise FloatingPointError(
-            f"{name} contains {non_finite} non-finite value(s)"
-        )
-    return tensor
-
-
 def _build_multimodal_attention_mask(
     text_attention_mask: torch.Tensor,
     has_image: torch.Tensor,
@@ -102,12 +93,11 @@ class Qwen3OmniMoeThinkerVisionAudioModel(PreTrainedModel):
         device = input_ids.device
         batch_size = input_ids.size(0)
         text_embeds = self.thinker.embed_tokens(input_ids)
-        vis_token = _require_finite_tensor(
-            self.vision_encoder(pixel_values.to(device)), "vision features"
-        )
-        aud_token = _require_finite_tensor(
-            self.audio_encoder(audio_values.to(device)), "audio features"
-        )
+        # Do not raise inside the forward graph: one distributed rank could
+        # exit before peers reach the same collective. Non-finite values are
+        # allowed to propagate to the synchronized output check in the trainer.
+        vis_token = self.vision_encoder(pixel_values.to(device))
+        aud_token = self.audio_encoder(audio_values.to(device))
 
         vis_token = vis_token * has_image.to(device).view(batch_size, 1, 1).float()
         aud_token = aud_token * has_audio.to(device).view(batch_size, 1, 1).float()
