@@ -79,6 +79,12 @@ class Qwen3OmniMoeMLP(nn.Module):
         )
         # Kept for compatibility with parameter-inspection code and old callers.
         self.shared_expert = None
+        self.register_buffer(
+            "_nonfinite_diagnostic", torch.tensor(False), persistent=False
+        )
+        self._nonfinite_diagnostic_reason = (
+            "MoE router probabilities or auxiliary loss are non-finite"
+        )
 
     def _dispatch_tokens(
         self, gate_probs: torch.Tensor
@@ -134,6 +140,9 @@ class Qwen3OmniMoeMLP(nn.Module):
         )
         load = load / max(1, expert_indices.numel())
         aux_loss = (importance * load).sum() * self.num_experts
+        self._nonfinite_diagnostic = (
+            (~torch.isfinite(gate_probs).all()) | (~torch.isfinite(aux_loss))
+        ).detach()
         y_flat = torch.zeros_like(x_flat)
         for expert_id, expert in enumerate(self.experts):
             selected = expert_indices == expert_id
