@@ -1,8 +1,8 @@
 # Omni Architecture Roadmap Design
 
 Date: 2026-07-29
-Status: Approved design, pending written-spec review
-Local baseline: `391d0186cb225f41f8e47aa600c36da0bc6b21e4`
+Status: Approved design, detailed implementation plans complete
+Local implementation baseline: `dc71e7ca1d03666798ecdbee5143e132e49210f7`
 
 ## 1. Purpose
 
@@ -97,19 +97,29 @@ The documentation phase produces:
 
 1. three evidence-backed research reports;
 2. this unified architecture design;
-3. one detailed implementation plan after written-spec review.
+3. seven dependency-ordered implementation plans covering profile contracts,
+   media/positions, decoder state, Qwen3 reference runtime, Qwen3.5-inspired
+   runtime, MiMo experiments, and stage training/evaluation/serving.
+
+Plan set, in execution order:
+
+1. [Profile contracts and Qwen3 oracle](../plans/2026-07-29-profile-contracts-and-qwen3-oracle.md)
+2. [Media sequences and TM-RoPE](../plans/2026-07-29-media-sequences-and-tm-rope.md)
+3. [Decoder cache and streaming state](../plans/2026-07-29-decoder-cache-and-streaming-state.md)
+4. [Qwen3-Omni reference runtime](../plans/2026-07-29-qwen3-omni-reference-runtime.md)
+5. [Qwen3.5-Omni-inspired runtime](../plans/2026-07-29-qwen35-omni-inspired.md)
+6. [MiMo-V2.5-inspired experiments](../plans/2026-07-29-mimo-v25-experiments.md)
+7. [Stage training, evaluation and serving](../plans/2026-07-29-stage-training-evaluation-and-serving.md)
 
 The implementation phase produces, in dependency order:
 
-1. identity and profile contracts;
-2. official Qwen3-Omni oracle tests;
-3. sequence-preserving media and multimodal assembly;
-4. position and cache infrastructure;
-5. official-structure Qwen3-Omni modules;
-6. Talker/codec streaming;
-7. Qwen3.5-inspired modules;
-8. MiMo-style experiments;
-9. stage-aware training and evaluation.
+1. identity, manifest, checkpoint metadata and official config oracle;
+2. sequence-preserving media, sample-level AV assembly and TM-RoPE;
+3. request-owned decoder/cache state and typed prefill/decode;
+4. official Qwen3-Omni runtime plus opt-in compatibility evidence;
+5. Qwen3.5-inspired public-backbone/AuT/ARIA/Talker prototype;
+6. MiMo-style SWA/MoE/EP/MTP experiments;
+7. stage-aware training, evaluation, context gates and serving.
 
 ## 6. Architecture profiles
 
@@ -175,6 +185,7 @@ sources:
 assumptions:
   codec: qwen3-omni predecessor proxy
 exact_official_checkpoint_compatible: false
+validated_context_length: 0
 ```
 
 The manifest is validated on load and round-tripped through checkpoint saves.
@@ -228,7 +239,10 @@ Responsibilities:
 - build Qwen3-Omni TM-RoPE T/H/W positions;
 - support explicit timestamp tokens for the Qwen3.5-inspired profile;
 - support profile-specific rotary dimensions and bases;
-- guarantee monotonic, non-conflicting cross-modal positions.
+- validate shape, dtype, non-negativity and profile-specific cross-modal
+  semantics; require monotonicity only for one-axis text positions, because
+  spatial axes legitimately reset and timestamped modalities may reuse a time
+  ID.
 
 It accepts assembled sequence metadata and returns position IDs without
 mutating media or tokenizer state.
@@ -449,7 +463,10 @@ Requirements:
 - official weights load without unexplained missing/unexpected keys;
 - fixed FP32 processor outputs and logits pass a documented tolerance;
 - cached and uncached decode agree;
-- generation interfaces and output shapes match.
+- offline text and speech generation interfaces/output shapes match;
+- the exact checkpoint, fixtures, package versions and implementation commit
+  are bound into one verified evidence artifact before manifest, runtime and
+  architecture summary are promoted together.
 
 Within this roadmap, only the Qwen3-Omni reference profile targets this level.
 MiMo also has open artifacts, but `mimo_v25_experimental` intentionally tests
@@ -608,6 +625,8 @@ The design phase is complete when:
 - work is decomposed into dependency-ordered phases;
 - error handling and tests cover architecture, training, and streaming;
 - the user reviews the written specification;
-- a detailed implementation plan is produced with `writing-plans`.
+- the seven detailed implementation plans are produced with `writing-plans`
+  and pass static/cross-plan review.
 
-Implementation starts only after the written-spec review gate.
+Code implementation starts only after the written-spec review gate and an
+explicit execution-mode handoff.
