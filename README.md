@@ -19,15 +19,79 @@ those modules are replaced.
 
 ## Environment
 
+Use Python 3.10 and keep the prototype and official-reference dependencies in
+separate virtual environments. Do not use an ambient `python`: a mismatched
+Torch/TorchVision/TorchAudio trio can import Python packages successfully but
+fail later while loading compiled extensions.
+
+### Prototype profile (CUDA 12.8)
+
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-# Install the PyTorch build matching the host CUDA version first.
-pip install -r requirements.txt
-pip install -e .
+python3.10 -m venv .venv-prototype
+.venv-prototype/bin/python -m pip install --upgrade pip
+.venv-prototype/bin/python -m pip install \
+  torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 \
+  --index-url https://download.pytorch.org/whl/cu128
+.venv-prototype/bin/python -m pip install \
+  -c constraints/prototype-py310.txt -r requirements.txt -e .
 ```
 
-Python 3.10 or newer is required.
+For a CPU-only test host, replace the CUDA index URL with
+`https://download.pytorch.org/whl/cpu`.
+
+Verify both distribution metadata and compiled-extension imports:
+
+```bash
+.venv-prototype/bin/python - <<'PY'
+import importlib.metadata as metadata
+for package in ("torch", "torchvision", "torchaudio", "transformers"):
+    print(f"{package}=={metadata.version(package)}")
+import torch
+import torchvision
+import torchaudio
+import transformers
+PY
+```
+
+### Official Qwen3-Omni reference profile (CUDA 12.8)
+
+The reference profile is intentionally separate because it pins a newer
+Transformers release and the official multimodal utility package. FFmpeg must
+also be available on `PATH`.
+
+```bash
+python3.10 -m venv .venv-qwen-reference
+.venv-qwen-reference/bin/python -m pip install --upgrade pip
+.venv-qwen-reference/bin/python -m pip install \
+  torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 \
+  --index-url https://download.pytorch.org/whl/cu128
+.venv-qwen-reference/bin/python -m pip install \
+  -c constraints/qwen3-omni-reference-py310.txt \
+  -r requirements-qwen3-omni-reference.txt -e .
+```
+
+Use `https://download.pytorch.org/whl/cpu` instead on CPU-only test hosts.
+Verify the reference interpreter independently:
+
+```bash
+.venv-qwen-reference/bin/python - <<'PY'
+import importlib.metadata as metadata
+for package in (
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "transformers",
+    "qwen-omni-utils",
+):
+    print(f"{package}=={metadata.version(package)}")
+import torch
+import torchvision
+import torchaudio
+import transformers
+from qwen_omni_utils import process_mm_info
+assert callable(process_mm_info)
+PY
+```
 
 ## Tests
 

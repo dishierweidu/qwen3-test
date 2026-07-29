@@ -1,0 +1,2 @@
+-r requirements.txt
+qwen-omni-utils==0.0.9
