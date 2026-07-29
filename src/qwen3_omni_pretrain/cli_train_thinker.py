@@ -1,6 +1,7 @@
 # src/qwen3_omni_pretrain/cli_train_thinker.py
 
 import argparse
+import os
 import sys
 
 from qwen3_omni_pretrain.training.trainer_thinker import (
@@ -9,6 +10,10 @@ from qwen3_omni_pretrain.training.trainer_thinker import (
 )
 from qwen3_omni_pretrain.utils.config_utils import load_yaml
 from qwen3_omni_pretrain.training.distributed import distributed_context, ddp_cleanup
+from qwen3_omni_pretrain.training.stage2_config import (
+    Stage2RuntimeConfig,
+    normalize_stage2_config,
+)
 
 
 def parse_args():
@@ -98,8 +103,50 @@ def parse_args():
     return parser.parse_args()
 
 
+def _stage2_cli_runtime(args) -> Stage2RuntimeConfig:
+    launched_distributed = (
+        "LOCAL_RANK" in os.environ
+        or "RANK" in os.environ
+        or int(os.environ.get("WORLD_SIZE", "1")) > 1
+    )
+    unsupported = (
+        launched_distributed
+        or args.use_accelerator
+        or args.accelerator_config is not None
+        or args.deepspeed is not None
+        or args.use_tensor_parallel
+        or args.tp_size > 1
+        or args.pp_size > 1
+        or args.local_rank is not None
+    )
+    if unsupported:
+        raise NotImplementedError(
+            "Stage2 distributed execution is not implemented in this P0"
+        )
+    overrides = {}
+    if args.resume_from_checkpoint is not None:
+        overrides["resume_from_checkpoint"] = (
+            args.resume_from_checkpoint
+        )
+    return normalize_stage2_config(
+        load_yaml(args.config),
+        overrides=overrides,
+    )
+
+
 def main():
     args = parse_args()
+
+    if args.stage == "stage2":
+        runtime = _stage2_cli_runtime(args)
+        train_thinker_stage2(
+            cfg=runtime,
+            tokenizer_name_or_path=args.tokenizer_name_or_path,
+            enable_tensorboard=args.tensorboard,
+            log_dir=args.log_dir,
+            resume_from_checkpoint=None,
+        )
+        return
 
     # 如果使用 Accelerator，不需要手动管理 distributed context
     # Accelerator 会自动处理
@@ -112,28 +159,18 @@ def main():
 
     if use_accelerator:
         # Accelerator 模式 - 不需要 distributed_context
-        if args.stage == "stage1":
-            train_thinker_stage1(
-                args.config,
-                tokenizer_name_or_path=args.tokenizer_name_or_path,
-                enable_tensorboard=args.tensorboard,
-                log_dir=args.log_dir,
-                resume_from_checkpoint=args.resume_from_checkpoint,
-                deepspeed_config=args.deepspeed,
-                accelerator_config_path=args.accelerator_config,
-                use_tensor_parallel=use_tensor_parallel,
-                tensor_parallel_size=tp_size,
-                pipeline_parallel_size=pp_size,
-            )
-        else:
-            cfg = load_yaml(args.config)
-            train_thinker_stage2(
-                cfg=cfg,
-                tokenizer_name_or_path=args.tokenizer_name_or_path,
-                enable_tensorboard=args.tensorboard,
-                log_dir=args.log_dir,
-                resume_from_checkpoint=args.resume_from_checkpoint,
-            )
+        train_thinker_stage1(
+            args.config,
+            tokenizer_name_or_path=args.tokenizer_name_or_path,
+            enable_tensorboard=args.tensorboard,
+            log_dir=args.log_dir,
+            resume_from_checkpoint=args.resume_from_checkpoint,
+            deepspeed_config=args.deepspeed,
+            accelerator_config_path=args.accelerator_config,
+            use_tensor_parallel=use_tensor_parallel,
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=pp_size,
+        )
     else:
         # 传统模式 - 使用 distributed_context 管理 DDP/DeepSpeed
         # 如果启用了 Tensor Parallel，需要使用特殊的 context
@@ -147,27 +184,17 @@ def main():
             context_manager = distributed_context()
         
         with context_manager:
-            if args.stage == "stage1":
-                train_thinker_stage1(
-                    args.config,
-                    tokenizer_name_or_path=args.tokenizer_name_or_path,
-                    enable_tensorboard=args.tensorboard,
-                    log_dir=args.log_dir,
-                    resume_from_checkpoint=args.resume_from_checkpoint,
-                    deepspeed_config=args.deepspeed,
-                    use_tensor_parallel=use_tensor_parallel,
-                    tensor_parallel_size=tp_size,
-                    pipeline_parallel_size=pp_size,
-                )
-            else:
-                cfg = load_yaml(args.config)
-                train_thinker_stage2(
-                    cfg=cfg,
-                    tokenizer_name_or_path=args.tokenizer_name_or_path,
-                    enable_tensorboard=args.tensorboard,
-                    log_dir=args.log_dir,
-                    resume_from_checkpoint=args.resume_from_checkpoint,
-                )
+            train_thinker_stage1(
+                args.config,
+                tokenizer_name_or_path=args.tokenizer_name_or_path,
+                enable_tensorboard=args.tensorboard,
+                log_dir=args.log_dir,
+                resume_from_checkpoint=args.resume_from_checkpoint,
+                deepspeed_config=args.deepspeed,
+                use_tensor_parallel=use_tensor_parallel,
+                tensor_parallel_size=tp_size,
+                pipeline_parallel_size=pp_size,
+            )
 
 
 if __name__ == "__main__":

@@ -65,6 +65,11 @@ from qwen3_omni_pretrain.data.datasets.text_dataset import TextJsonlDataset, Pac
 from qwen3_omni_pretrain.data.collators import TextCausalLMCollator, PackedCausalLMCollator
 from qwen3_omni_pretrain.training.loop import train_one_epoch, evaluate, _move_batch_to_device, _is_global_bad_loss
 from qwen3_omni_pretrain.training.checkpoint import save_checkpoint, load_checkpoint
+from qwen3_omni_pretrain.training.stage2_config import (
+    Stage2RuntimeConfig,
+    Stage2TrainConfig,
+    normalize_stage2_config,
+)
 # from qwen3_omni_pretrain.utils.seed import set_seed
 
 
@@ -110,32 +115,6 @@ class TrainerThinkerConfig:
     packed_val_bin_path: Optional[str] = None
     packed_seq_length: Optional[int] = None
     
-@dataclass
-class Stage2TrainConfig:
-    stage1_init_ckpt: str
-    model_config_path: str
-    train_corpus_path: str
-    val_corpus_path: str
-    image_root: str
-    audio_root: str
-
-    output_dir: str
-
-    resume_from_checkpoint: Optional[str] = None
-
-    num_epochs: int = 1
-    batch_size: int = 2
-    max_seq_length: int = 1024
-    learning_rate: float = 1e-4
-    weight_decay: float = 0.01
-    warmup_ratio: float = 0.03
-    gradient_accumulation_steps: int = 1
-    logging_steps: int = 10
-    eval_steps: int = 200
-    num_workers: int = 4
-    seed: int = 42
-
-
 def _build_text_dataset(paths, tokenizer, max_seq_length):
     """
     支持：
@@ -1454,8 +1433,24 @@ def train_thinker_stage1(
             if writer is not None:
                 writer.close()
 
+def _prepare_stage2_runtime(
+    cfg,
+    resume_from_checkpoint: Optional[str] = None,
+) -> Stage2RuntimeConfig:
+    overrides = {}
+    if resume_from_checkpoint is not None:
+        overrides["resume_from_checkpoint"] = resume_from_checkpoint
+    runtime = normalize_stage2_config(cfg, overrides=overrides)
+    set_seed(runtime.seed)
+    return runtime
+
+
 def train_thinker_stage2(
-    cfg: Union[Stage2TrainConfig, Dict[str, Any]],
+    cfg: Union[
+        Stage2RuntimeConfig,
+        Stage2TrainConfig,
+        Dict[str, Any],
+    ],
     tokenizer_name_or_path: str,
     enable_tensorboard: bool = False,
     log_dir: str = "./runs",
@@ -1464,43 +1459,30 @@ def train_thinker_stage2(
     """
     Stage2: Omni 多模态 AuT 训练入口。
     """
+    runtime = _prepare_stage2_runtime(cfg, resume_from_checkpoint)
     import yaml
 
-    # --- 统一把 cfg 变成 dict ---
-    if isinstance(cfg, dict):
-        c = cfg
-    else:
-        # dataclass 或其它对象，转成 dict
-        c = vars(cfg)
-
-    # 安全取配置，给一些默认值
-    seed = c.get("seed", 42)
-    set_seed(seed)
-    stage1_init_ckpt = c["stage1_init_ckpt"]
-    model_config_path = c["model"]["model_config_path"]
-    train_corpus_path = c["data"]["train_corpus_path"]
-    val_corpus_path = c["data"]["val_corpus_path"]
-    image_root = c["data"]["image_root"]
-    audio_root = c["data"]["audio_root"]
-    output_dir = c["train"]["output_dir"] + time.strftime("-%Y%m%d-%H%M%S")
-    resume_path = resume_from_checkpoint or c.get("resume_from_checkpoint") or c.get("train", {}).get("resume_from_checkpoint")
-
-    train_cfg = c.get("train", {}) if isinstance(c, dict) else {}
-
-    num_epochs = c.get("num_epochs", train_cfg.get("num_epochs", 1))
-    batch_size = c.get("batch_size", train_cfg.get("batch_size", 2))
-    max_seq_length = c.get("max_seq_length", train_cfg.get("max_seq_length", 1024))
-    learning_rate = c.get("learning_rate", train_cfg.get("learning_rate", 1e-4))
-    weight_decay = c.get("weight_decay", train_cfg.get("weight_decay", 0.01))
-    warmup_ratio = c.get("warmup_ratio", train_cfg.get("warmup_ratio", 0.03))
-    grad_accum = c.get("gradient_accumulation_steps", train_cfg.get("gradient_accumulation_steps", 1))
-    logging_steps = c.get("logging_steps", train_cfg.get("logging_steps", 10))
-    num_workers = c.get("num_workers", train_cfg.get("num_workers", 4))
-    fp16 = bool(c.get("fp16", train_cfg.get("fp16", False)))
-    bf16 = bool(c.get("bf16", train_cfg.get("bf16", False)))
-    fp8 = bool(c.get("fp8", train_cfg.get("fp8", False)))
-    int8_optimizer = bool(c.get("int8_optimizer", train_cfg.get("int8_optimizer", False)))
-    # --- 以上 cfg 处理结束 ---
+    stage1_init_ckpt = runtime.stage1_init_ckpt
+    model_config_path = runtime.model_config_path
+    train_corpus_path = runtime.train_corpus_path
+    val_corpus_path = runtime.val_corpus_path
+    image_root = runtime.image_root
+    audio_root = runtime.audio_root
+    output_dir = runtime.output_dir + time.strftime("-%Y%m%d-%H%M%S")
+    resume_path = runtime.resume_from_checkpoint
+    num_epochs = runtime.num_epochs
+    batch_size = runtime.batch_size
+    max_seq_length = runtime.max_seq_length
+    learning_rate = runtime.learning_rate
+    weight_decay = runtime.weight_decay
+    warmup_ratio = runtime.warmup_ratio
+    grad_accum = runtime.gradient_accumulation_steps
+    logging_steps = runtime.logging_steps
+    num_workers = runtime.num_workers
+    fp16 = runtime.fp16
+    bf16 = runtime.bf16
+    fp8 = runtime.fp8
+    int8_optimizer = runtime.int8_optimizer
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -1631,7 +1613,11 @@ def train_thinker_stage2(
 
     writer = None
     if enable_tensorboard and is_main_process():
-        run_name = os.path.join(log_dir, f"{c.get('experiment_name', 'thinker_stage2')}_stage2" + time.strftime("-%Y%m%d-%H%M%S"))
+        run_name = os.path.join(
+            log_dir,
+            f"{runtime.experiment_name}_stage2"
+            + time.strftime("-%Y%m%d-%H%M%S"),
+        )
         writer = SummaryWriter(log_dir=run_name)
 
     train_start_time = time.time()
