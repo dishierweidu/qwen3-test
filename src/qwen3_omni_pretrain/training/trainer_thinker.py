@@ -1445,6 +1445,34 @@ def _prepare_stage2_runtime(
     return runtime
 
 
+def _build_stage2_collator(runtime, tokenizer):
+    return OmniStage2Collator(
+        tokenizer=tokenizer,
+        max_seq_length=runtime.max_seq_length,
+        skip_bad_media=runtime.skip_bad_media,
+    )
+
+
+def _build_stage2_dataloaders(
+    runtime, train_dataset, val_dataset, collator
+):
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=runtime.batch_size,
+        shuffle=runtime.shuffle,
+        num_workers=runtime.num_workers,
+        collate_fn=collator,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=runtime.batch_size,
+        shuffle=False,
+        num_workers=runtime.num_workers,
+        collate_fn=collator,
+    )
+    return train_loader, val_loader
+
+
 def train_thinker_stage2(
     cfg: Union[
         Stage2RuntimeConfig,
@@ -1471,14 +1499,11 @@ def train_thinker_stage2(
     output_dir = runtime.output_dir + time.strftime("-%Y%m%d-%H%M%S")
     resume_path = runtime.resume_from_checkpoint
     num_epochs = runtime.num_epochs
-    batch_size = runtime.batch_size
-    max_seq_length = runtime.max_seq_length
     learning_rate = runtime.learning_rate
     weight_decay = runtime.weight_decay
     warmup_ratio = runtime.warmup_ratio
     grad_accum = runtime.gradient_accumulation_steps
     logging_steps = runtime.logging_steps
-    num_workers = runtime.num_workers
     fp16 = runtime.fp16
     bf16 = runtime.bf16
     fp8 = runtime.fp8
@@ -1544,24 +1569,12 @@ def train_thinker_stage2(
         audio_root=audio_root,
     )
 
-    collator = OmniStage2Collator(
-        tokenizer=tokenizer,
-        max_seq_length=max_seq_length,
-    )
-
-    train_loader = DataLoader(
+    collator = _build_stage2_collator(runtime, tokenizer)
+    train_loader, val_loader = _build_stage2_dataloaders(
+        runtime,
         train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        collate_fn=collator,
-    )
-    val_loader = DataLoader(
         val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        collate_fn=collator,
+        collator,
     )
 
     # 5. optimizer & scheduler (简单版)

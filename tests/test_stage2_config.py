@@ -339,3 +339,38 @@ def test_stage2_ddp_fails_before_seed_or_tokenizer(monkeypatch):
         trainer_thinker.train_thinker_stage2(
             raw, tokenizer_name_or_path="unused"
         )
+
+
+def test_checked_in_yaml_reaches_seed_collator_and_dataloaders(monkeypatch):
+    from qwen3_omni_pretrain.training import trainer_thinker
+    from qwen3_omni_pretrain.utils.config_utils import load_yaml
+
+    raw = load_yaml("configs/train/stage2_omni_vision_audio.yaml")
+    calls = []
+    seeds = []
+
+    class SpyDataLoader:
+        def __init__(self, dataset, **kwargs):
+            calls.append(kwargs)
+
+    monkeypatch.setattr(trainer_thinker, "DataLoader", SpyDataLoader)
+    monkeypatch.setattr(trainer_thinker, "set_seed", seeds.append)
+    runtime = trainer_thinker._prepare_stage2_runtime(raw)
+    collator = trainer_thinker._build_stage2_collator(
+        runtime, TinyTokenizer()
+    )
+    trainer_thinker._build_stage2_dataloaders(
+        runtime, object(), object(), collator
+    )
+
+    assert seeds == [42]
+    assert runtime.max_steps == -1
+    assert runtime.gradient_accumulation_steps == 8
+    assert runtime.eval_steps == 200
+    assert runtime.save_steps == 200
+    assert runtime.ddp is False
+    assert collator.max_seq_length == 1024
+    assert calls[0]["batch_size"] == 2
+    assert calls[0]["num_workers"] == 4
+    assert calls[0]["shuffle"] is False
+    assert calls[1]["shuffle"] is False
