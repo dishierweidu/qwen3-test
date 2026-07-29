@@ -1,4 +1,4 @@
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -82,7 +82,7 @@ class Qwen3OmniMoeThinkerVisionAudioModel(PreTrainedModel):
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        labels: torch.Tensor,
+        labels: Optional[torch.Tensor],
         pixel_values: torch.Tensor,
         audio_values: torch.Tensor,
         has_image: torch.Tensor,
@@ -105,13 +105,15 @@ class Qwen3OmniMoeThinkerVisionAudioModel(PreTrainedModel):
         attn_full = _build_multimodal_attention_mask(
             attention_mask, has_image, has_audio
         )
-        labels_full = torch.full(
-            (batch_size, inputs_embeds.size(1)),
-            fill_value=-100,
-            dtype=labels.dtype,
-            device=device,
-        )
-        labels_full[:, 2:] = labels
+        labels_full: Optional[torch.Tensor] = None
+        if labels is not None:
+            labels_full = torch.full(
+                (batch_size, inputs_embeds.size(1)),
+                fill_value=-100,
+                dtype=labels.dtype,
+                device=device,
+            )
+            labels_full[:, 2:] = labels.to(device)
         return self.thinker(
             input_ids=None,
             attention_mask=attn_full,
