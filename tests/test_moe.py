@@ -37,7 +37,7 @@ def test_internal_shared_expert_is_rejected():
         )
 
 
-def test_nonfinite_router_probabilities_raise():
+def test_nonfinite_router_probabilities_propagate_to_global_output_check():
     moe = Qwen3OmniMoeMLP(
         hidden_size=4,
         intermediate_size=8,
@@ -48,8 +48,10 @@ def test_nonfinite_router_probabilities_raise():
     with torch.no_grad():
         moe.gate.weight.fill_(float("nan"))
 
-    with pytest.raises(FloatingPointError, match="router probabilities"):
-        moe(torch.ones(1, 1, 4))
+    output, aux_loss = moe(torch.ones(1, 1, 4))
+
+    assert not torch.isfinite(output).all()
+    assert not torch.isfinite(aux_loss)
 
 
 def test_config_rejects_legacy_internal_shared_expert():
