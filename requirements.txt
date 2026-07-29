@@ -1,21 +1,21 @@
-# 核心深度学习 & Transformers extra-index-url https://download.pytorch.org/whl/cu121
+# Core deep learning stack. Install the appropriate CUDA PyTorch wheels first.
 torch>=2.6.0
 torchvision>=0.21.0
 torchaudio>=2.6.0
 transformers>=4.45.0
 tensorboard>=2.16.0
-# galore-torch
 
-# 配置 & 工具
+# Configuration and utilities
 deepspeed
 pyyaml>=6.0.0
 tqdm>=4.66.0
-pyyaml>=6.0.0
 
-# Qwen 系 tokenizer 常用依赖
+# Qwen tokenizer dependencies
 sentencepiece>=0.1.99
 tokenizers>=0.15.0
 
-# 分布式训练加速
+# Distributed training
 accelerate>=0.30.0
-# bitsandbytes>=0.43.0
+
+# Tests
+pytest>=8.0.0
