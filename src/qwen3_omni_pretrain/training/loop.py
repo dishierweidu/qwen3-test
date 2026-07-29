@@ -85,6 +85,35 @@ def _find_non_finite_output(outputs: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
+def _find_non_finite_module_diagnostic(
+    model: torch.nn.Module, device: torch.device
+) -> Optional[str]:
+    diagnostics = []
+    modules = []
+    for name, module in model.named_modules():
+        flag = getattr(module, "_nonfinite_diagnostic", None)
+        if not isinstance(flag, torch.Tensor):
+            continue
+        diagnostics.append(flag.detach().to(device=device, dtype=torch.bool).any())
+        modules.append((name, module, flag))
+
+    if not diagnostics:
+        return None
+    if not bool(torch.stack(diagnostics).any().item()):
+        return None
+
+    for name, module, flag in modules:
+        if bool(flag.detach().to(dtype=torch.bool).any().item()):
+            reason = getattr(
+                module,
+                "_nonfinite_diagnostic_reason",
+                "internal module state is non-finite",
+            )
+            module_name = name or module.__class__.__name__
+            return f"module {module_name!r}: {reason}"
+    return "internal module state is non-finite"
+
+
 def _find_non_finite_gradient(model: torch.nn.Module) -> Optional[str]:
     for name, parameter in model.named_parameters():
         gradient = parameter.grad
@@ -213,13 +242,15 @@ def train_one_epoch(
             aux_loss = outputs.get("aux_loss")
 
             output_reason = _find_non_finite_output(outputs)
+            module_reason = _find_non_finite_module_diagnostic(model, loss.device)
+            failure_reason = output_reason or module_reason
             global_output_bad = _is_global_bad_flag(
-                output_reason is not None, loss.device
+                failure_reason is not None, loss.device
             )
             if global_output_bad:
                 optimizer.zero_grad(set_to_none=True)
                 _raise_non_finite(
-                    reason=output_reason,
+                    reason=failure_reason,
                     global_bad=True,
                     batch_idx=batch_idx,
                     metadata=metadata,
@@ -334,7 +365,9 @@ def evaluate(
             if not isinstance(outputs, Mapping) or "loss" not in outputs:
                 raise TypeError("model.forward must return a mapping containing 'loss'")
             loss = outputs["loss"]
-            reason = _find_non_finite_output(outputs)
+            output_reason = _find_non_finite_output(outputs)
+            module_reason = _find_non_finite_module_diagnostic(model, loss.device)
+            reason = output_reason or module_reason
             global_bad = _is_global_bad_flag(reason is not None, loss.device)
             _raise_non_finite(
                 reason=reason,
