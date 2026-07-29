@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
 import torch
 from PIL import Image
@@ -35,6 +36,86 @@ class MediaLoadError(RuntimeError):
             "error_type": type(self.cause).__name__,
             "error": str(self.cause),
         }
+
+
+@dataclass(frozen=True)
+class MediaLoadResult:
+    tensor: torch.Tensor
+    present: int
+    error: Optional[Dict[str, str]] = None
+
+
+class Stage2MediaLoader:
+    def __init__(
+        self,
+        image_size: int = 224,
+        max_audio_len: int = 32000,
+        *,
+        skip_bad_media: bool = False,
+    ) -> None:
+        self.image_size = int(image_size)
+        self.max_audio_len = int(max_audio_len)
+        self.skip_bad_media = bool(skip_bad_media)
+
+    def _zero(self, modality: str) -> torch.Tensor:
+        if modality == "image":
+            return torch.zeros(3, self.image_size, self.image_size)
+        if modality == "audio":
+            return torch.zeros(self.max_audio_len)
+        raise ValueError(f"unsupported modality: {modality}")
+
+    def _load_image(self, path: str) -> torch.Tensor:
+        with Image.open(path) as image:
+            image = image.convert("RGB")
+            image = image.resize((self.image_size, self.image_size))
+            data = bytearray(image.tobytes())
+        tensor = torch.frombuffer(data, dtype=torch.uint8).clone()
+        tensor = tensor.view(self.image_size, self.image_size, 3)
+        return tensor.permute(2, 0, 1).float().div_(255.0)
+
+    def _load_audio(self, path: str) -> torch.Tensor:
+        waveform, sample_rate = torchaudio.load(path)
+        if waveform.size(0) > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        if sample_rate != 16000:
+            waveform = torchaudio.functional.resample(
+                waveform, sample_rate, 16000
+            )
+        waveform = waveform.squeeze(0)
+        if waveform.size(0) >= self.max_audio_len:
+            return waveform[: self.max_audio_len]
+        return torch.nn.functional.pad(
+            waveform, (0, self.max_audio_len - waveform.size(0))
+        )
+
+    def load_optional(
+        self,
+        *,
+        modality: str,
+        path: Optional[str],
+        sample_id: str,
+    ) -> MediaLoadResult:
+        if modality not in {"image", "audio"}:
+            raise ValueError(f"unsupported modality: {modality}")
+        if path is None:
+            return MediaLoadResult(self._zero(modality), 0)
+        loader = self._load_image if modality == "image" else self._load_audio
+        try:
+            return MediaLoadResult(loader(path), 1)
+        except Exception as cause:
+            error = MediaLoadError(
+                modality=modality,
+                path=path,
+                sample_id=sample_id,
+                cause=cause,
+            )
+            if not self.skip_bad_media:
+                raise error from cause
+            return MediaLoadResult(
+                self._zero(modality),
+                0,
+                error.to_dict(),
+            )
 
 
 class TextCausalLMCollator:
@@ -100,9 +181,14 @@ class OmniStage2Collator:
     ) -> None:
         self.tokenizer = tokenizer
         self.max_seq_length = int(max_seq_length)
-        self.image_size = int(image_size)
-        self.max_audio_len = int(max_audio_len)
-        self.skip_bad_media = bool(skip_bad_media)
+        self.media_loader = Stage2MediaLoader(
+            image_size=image_size,
+            max_audio_len=max_audio_len,
+            skip_bad_media=skip_bad_media,
+        )
+        self.image_size = self.media_loader.image_size
+        self.max_audio_len = self.media_loader.max_audio_len
+        self.skip_bad_media = self.media_loader.skip_bad_media
 
         pad_id = tokenizer.pad_token_id
         if pad_id is None:
@@ -119,55 +205,6 @@ class OmniStage2Collator:
         if ids and isinstance(ids[0], list):
             ids = ids[0]
         return [int(token_id) for token_id in ids]
-
-    def _load_image(self, path: str) -> torch.Tensor:
-        with Image.open(path) as image:
-            image = image.convert("RGB")
-            image = image.resize((self.image_size, self.image_size))
-            data = bytearray(image.tobytes())
-        tensor = torch.frombuffer(data, dtype=torch.uint8).clone()
-        tensor = tensor.view(self.image_size, self.image_size, 3)
-        return tensor.permute(2, 0, 1).float().div_(255.0)
-
-    def _load_audio(self, path: str) -> torch.Tensor:
-        waveform, sample_rate = torchaudio.load(path)
-        if waveform.size(0) > 1:
-            waveform = waveform.mean(dim=0, keepdim=True)
-        if sample_rate != 16000:
-            waveform = torchaudio.functional.resample(
-                waveform, sample_rate, 16000
-            )
-        waveform = waveform.squeeze(0)
-        if waveform.size(0) >= self.max_audio_len:
-            return waveform[: self.max_audio_len]
-        return torch.nn.functional.pad(
-            waveform, (0, self.max_audio_len - waveform.size(0))
-        )
-
-    def _load_or_handle(
-        self,
-        *,
-        modality: str,
-        path: str,
-        sample_id: str,
-        errors: List[Dict[str, str]],
-    ) -> tuple[torch.Tensor, int]:
-        loader = self._load_image if modality == "image" else self._load_audio
-        try:
-            return loader(path), 1
-        except Exception as cause:
-            error = MediaLoadError(
-                modality=modality,
-                path=path,
-                sample_id=sample_id,
-                cause=cause,
-            )
-            if not self.skip_bad_media:
-                raise error from cause
-            errors.append(error.to_dict())
-            if modality == "image":
-                return torch.zeros(3, self.image_size, self.image_size), 0
-            return torch.zeros(self.max_audio_len), 0
 
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         sequences: List[List[int]] = []
@@ -197,32 +234,26 @@ class OmniStage2Collator:
             sequence_labels.append(labels)
 
             image_path = example.get("image_path")
-            if image_path:
-                image, has_image = self._load_or_handle(
-                    modality="image",
-                    path=str(image_path),
-                    sample_id=sample_id,
-                    errors=media_errors,
-                )
-            else:
-                image = torch.zeros(3, self.image_size, self.image_size)
-                has_image = 0
-            images.append(image)
-            has_image_flags.append(has_image)
+            image_result = self.media_loader.load_optional(
+                modality="image",
+                path=str(image_path) if image_path else None,
+                sample_id=sample_id,
+            )
+            images.append(image_result.tensor)
+            has_image_flags.append(image_result.present)
+            if image_result.error is not None:
+                media_errors.append(image_result.error)
 
             audio_path = example.get("audio_path")
-            if audio_path:
-                audio, has_audio = self._load_or_handle(
-                    modality="audio",
-                    path=str(audio_path),
-                    sample_id=sample_id,
-                    errors=media_errors,
-                )
-            else:
-                audio = torch.zeros(self.max_audio_len)
-                has_audio = 0
-            audios.append(audio)
-            has_audio_flags.append(has_audio)
+            audio_result = self.media_loader.load_optional(
+                modality="audio",
+                path=str(audio_path) if audio_path else None,
+                sample_id=sample_id,
+            )
+            audios.append(audio_result.tensor)
+            has_audio_flags.append(audio_result.present)
+            if audio_result.error is not None:
+                media_errors.append(audio_result.error)
 
         width = min(
             self.max_seq_length,

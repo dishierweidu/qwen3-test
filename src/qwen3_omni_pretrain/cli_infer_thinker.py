@@ -18,7 +18,7 @@ from qwen3_omni_pretrain.models.qwen3_omni_moe.configuration_qwen3_omni_moe impo
 from qwen3_omni_pretrain.multimodal.tokenization.special_tokens import (
     reconcile_multimodal_token_ids,
 )
-from qwen3_omni_pretrain.data.collators import OmniStage2Collator
+from qwen3_omni_pretrain.data.collators import Stage2MediaLoader
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,6 +84,14 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=2048,
         help="Tokenization max length for prompts.",
+    )
+    parser.add_argument(
+        "--skip_bad_media",
+        action="store_true",
+        help=(
+            "Treat referenced invalid media as absent and report "
+            "structured errors."
+        ),
     )
     parser.add_argument(
         "--chat",
@@ -168,6 +176,19 @@ def _load_reconciled_stage2_model(
     )
 
 
+def _build_stage2_media_loader(
+    args: argparse.Namespace,
+) -> Stage2MediaLoader:
+    return Stage2MediaLoader(skip_bad_media=args.skip_bad_media)
+
+
+def _emit_stage2_media_errors(
+    errors: List[Dict[str, str]],
+) -> None:
+    for error in errors:
+        print(json.dumps({"media_error": error}, ensure_ascii=False))
+
+
 def greedy_decode_stage1(
     model: Qwen3OmniMoeThinkerTextModel,
     tokenizer: AutoTokenizer,
@@ -222,7 +243,7 @@ def greedy_decode_stage1(
 def greedy_decode_stage2(
     model: Qwen3OmniMoeThinkerVisionAudioModel,
     tokenizer: AutoTokenizer,
-    collator: OmniStage2Collator,
+    media_loader: Stage2MediaLoader,
     device: torch.device,
     sample: Dict[str, Any],
     max_new_tokens: int,
@@ -243,34 +264,31 @@ def greedy_decode_stage2(
     input_ids = encoded["input_ids"].to(device)
     attention_mask = encoded.get("attention_mask", torch.ones_like(input_ids)).to(device)
 
-    # multimodal pieces
-    image_path = _resolve_path(sample.get("image"), image_root)
-    audio_path = _resolve_path(sample.get("audio"), audio_root)
+    sample_id = str(sample.get("id", "inference-sample"))
+    image_result = media_loader.load_optional(
+        modality="image",
+        path=_resolve_path(sample.get("image"), image_root),
+        sample_id=sample_id,
+    )
+    audio_result = media_loader.load_optional(
+        modality="audio",
+        path=_resolve_path(sample.get("audio"), audio_root),
+        sample_id=sample_id,
+    )
+    media_errors = [
+        error
+        for error in (image_result.error, audio_result.error)
+        if error is not None
+    ]
 
-    pixel = torch.zeros(3, collator.image_size, collator.image_size)
-    has_image = torch.tensor([0], dtype=torch.long)
-    if image_path and os.path.exists(image_path):
-        try:
-            pixel = collator._load_image(image_path)
-            has_image = torch.tensor([1], dtype=torch.long)
-        except Exception:
-            pixel = torch.zeros(3, collator.image_size, collator.image_size)
-            has_image = torch.tensor([0], dtype=torch.long)
-    pixel_values = pixel.unsqueeze(0).to(device)
-
-    audio = torch.zeros(collator.max_audio_len)
-    has_audio = torch.tensor([0], dtype=torch.long)
-    if audio_path and os.path.exists(audio_path):
-        try:
-            audio = collator._load_audio(audio_path)
-            has_audio = torch.tensor([1], dtype=torch.long)
-        except Exception:
-            audio = torch.zeros(collator.max_audio_len)
-            has_audio = torch.tensor([0], dtype=torch.long)
-    audio_values = audio.unsqueeze(0).to(device)
-
-    has_image = has_image.to(device)
-    has_audio = has_audio.to(device)
+    pixel_values = image_result.tensor.unsqueeze(0).to(device)
+    audio_values = audio_result.tensor.unsqueeze(0).to(device)
+    has_image = torch.tensor(
+        [image_result.present], dtype=torch.long, device=device
+    )
+    has_audio = torch.tensor(
+        [audio_result.present], dtype=torch.long, device=device
+    )
 
     generated = input_ids
     input_len = generated.size(1)
@@ -290,7 +308,9 @@ def greedy_decode_stage2(
                 has_audio=has_audio,
             )
             logits = out["logits"]
-            next_token = torch.argmax(logits[:, -1, :], dim=-1)
+            next_token = torch.argmax(
+                logits[:, -1, :], dim=-1
+            ).to(generated.device)
             generated = torch.cat([generated, next_token.unsqueeze(-1)], dim=-1)
             attention_mask = torch.ones_like(generated, device=device)
             if eos_id is not None and next_token.item() == eos_id:
@@ -307,7 +327,11 @@ def greedy_decode_stage2(
         "output_toks_per_sec": (new_tokens.numel() / elapsed) if elapsed > 0 else float("inf"),
         "total_toks_per_sec": ((input_len + new_tokens.numel()) / elapsed) if elapsed > 0 else float("inf"),
     }
-    return {"text": completion, "stats": stats}
+    return {
+        "text": completion,
+        "stats": stats,
+        "media_errors": media_errors,
+    }
 
 
 def _print_stats(prefix: str, stats: Dict[str, Any]):
@@ -383,7 +407,7 @@ def run_stage2(args: argparse.Namespace):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = _get_dtype(args.dtype)
     tokenizer = _ensure_tokenizer(args.tokenizer_name_or_path, args.checkpoint)
-    collator = OmniStage2Collator(tokenizer=tokenizer, max_seq_length=args.max_seq_length)
+    media_loader = _build_stage2_media_loader(args)
 
     load_kwargs: Dict[str, Any] = {}
     if dtype is not None:
@@ -408,7 +432,7 @@ def run_stage2(args: argparse.Namespace):
         result = greedy_decode_stage2(
             model=model,
             tokenizer=tokenizer,
-            collator=collator,
+            media_loader=media_loader,
             device=device,
             sample=sample,
             max_new_tokens=args.max_new_tokens,
@@ -416,6 +440,7 @@ def run_stage2(args: argparse.Namespace):
             audio_root=args.audio_root,
             max_seq_length=args.max_seq_length,
         )
+        _emit_stage2_media_errors(result["media_errors"])
         target = sample.get("target_text") or ""
         print("=" * 40)
         print(f"[Stage2 Sample {idx}] input_text: {sample.get('input_text') or sample.get('text')}")
