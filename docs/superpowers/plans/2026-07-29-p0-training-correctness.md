@@ -35,9 +35,9 @@
 
 ### Task 4: Numerical fail-fast behavior
 
-- [ ] Reject non-finite loss, logits, and gradients before optimizer updates.
+- [x] Reject non-finite loss, logits, and gradients before optimizer updates.
 
 ### Task 5: Parameter accounting and documentation
 
-- [ ] Add total/trainable/active parameter reports.
-- [ ] Add reproducible setup and test instructions.
+- [x] Add total/trainable/active parameter reports.
+- [x] Add reproducible setup and test instructions.
