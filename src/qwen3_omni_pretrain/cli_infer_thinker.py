@@ -1,7 +1,7 @@
 import argparse
 import json
 import os
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Mapping
 
 import torch
 from transformers import AutoTokenizer
@@ -11,6 +11,12 @@ from qwen3_omni_pretrain.models.qwen3_omni_moe.modeling_thinker_text import (
 )
 from qwen3_omni_pretrain.models.qwen3_omni_moe.modeling_thinker_vision_audio import (
     Qwen3OmniMoeThinkerVisionAudioModel,
+)
+from qwen3_omni_pretrain.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+    Qwen3OmniMoeConfig,
+)
+from qwen3_omni_pretrain.multimodal.tokenization.special_tokens import (
+    reconcile_multimodal_token_ids,
 )
 from qwen3_omni_pretrain.data.collators import OmniStage2Collator
 
@@ -145,6 +151,21 @@ def _ensure_tokenizer(tokenizer_name_or_path: Optional[str], checkpoint: str):
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     return tokenizer
+
+
+def _load_reconciled_stage2_model(
+    checkpoint: str,
+    tokenizer: Any,
+    *,
+    load_kwargs: Optional[Mapping[str, Any]] = None,
+) -> Qwen3OmniMoeThinkerVisionAudioModel:
+    model_config = Qwen3OmniMoeConfig.from_pretrained(checkpoint)
+    reconcile_multimodal_token_ids(model_config, tokenizer)
+    return Qwen3OmniMoeThinkerVisionAudioModel.from_pretrained(
+        checkpoint,
+        config=model_config,
+        **dict(load_kwargs or {}),
+    )
 
 
 def greedy_decode_stage1(
@@ -368,7 +389,11 @@ def run_stage2(args: argparse.Namespace):
     if dtype is not None:
         load_kwargs["torch_dtype"] = dtype
     try:
-        model = Qwen3OmniMoeThinkerVisionAudioModel.from_pretrained(args.checkpoint, **load_kwargs)
+        model = _load_reconciled_stage2_model(
+            args.checkpoint,
+            tokenizer,
+            load_kwargs=load_kwargs,
+        )
     except ValueError as exc:
         msg = str(exc)
         if "torch.load" in msg or "CVE-2025-32434" in msg:

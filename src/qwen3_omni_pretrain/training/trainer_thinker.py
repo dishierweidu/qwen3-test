@@ -71,6 +71,9 @@ from qwen3_omni_pretrain.training.stage2_config import (
     Stage2TrainConfig,
     normalize_stage2_config,
 )
+from qwen3_omni_pretrain.multimodal.tokenization.special_tokens import (
+    reconcile_multimodal_token_ids,
+)
 # from qwen3_omni_pretrain.utils.seed import set_seed
 
 
@@ -1590,6 +1593,14 @@ def _run_stage2_epoch(
     )
 
 
+def _build_reconciled_stage2_model(
+    model_config: Qwen3OmniMoeConfig,
+    tokenizer: Any,
+) -> Qwen3OmniMoeThinkerVisionAudioModel:
+    reconcile_multimodal_token_ids(model_config, tokenizer)
+    return Qwen3OmniMoeThinkerVisionAudioModel(model_config)
+
+
 def train_thinker_stage2(
     cfg: Union[
         Stage2RuntimeConfig,
@@ -1658,7 +1669,7 @@ def train_thinker_stage2(
     model_config = Qwen3OmniMoeConfig(**model_conf_dict)
 
     # 3. model
-    model = Qwen3OmniMoeThinkerVisionAudioModel(model_config)
+    model = _build_reconciled_stage2_model(model_config, tokenizer)
     # ✅ 从 Stage1 ckpt 初始化 Thinker 权重（仅在不从已有 stage2 ckpt 恢复时）
     if stage1_init_ckpt and not resume_path:
         print(f"Loading Stage1 checkpoint from {stage1_init_ckpt}")
