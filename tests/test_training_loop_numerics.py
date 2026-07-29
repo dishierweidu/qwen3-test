@@ -80,3 +80,48 @@ def test_nonfinite_gradient_raises_before_optimizer_step():
         train_one_epoch(model, dataloader, optimizer, None, torch.device("cpu"))
 
     assert model.weight.item() == 0.0
+
+
+class NonFiniteMoeModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        from qwen3_omni_pretrain.models.qwen3_omni_moe.modules.moe import (
+            Qwen3OmniMoeMLP,
+        )
+
+        self.moe = Qwen3OmniMoeMLP(
+            hidden_size=4,
+            intermediate_size=8,
+            num_experts=2,
+            num_experts_per_tok=1,
+            use_shared_expert=False,
+        )
+        with torch.no_grad():
+            self.moe.gate.weight.fill_(float("nan"))
+
+    def forward(self, x):
+        logits, aux_loss = self.moe(x)
+        return {
+            "loss": logits.sum() + aux_loss,
+            "logits": logits,
+            "aux_loss": aux_loss,
+        }
+
+
+def test_nonfinite_moe_state_is_caught_at_synchronized_output_boundary():
+    model = NonFiniteMoeModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    dataloader = DataLoader(
+        [
+            {
+                "x": torch.ones(1, 1, 4),
+                "_sample_ids": ["moe-bad"],
+            }
+        ],
+        batch_size=None,
+    )
+
+    with pytest.raises(NonFiniteTrainingError, match="moe-bad"):
+        train_one_epoch(
+            model, dataloader, optimizer, None, torch.device("cpu")
+        )
