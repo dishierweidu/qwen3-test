@@ -2,6 +2,7 @@
 
 import os
 import time
+import math
 import signal
 import json
 from contextlib import nullcontext
@@ -1473,6 +1474,122 @@ def _build_stage2_dataloaders(
     return train_loader, val_loader
 
 
+@dataclass(frozen=True)
+class Stage2EpochResult:
+    train_loss: float
+    global_step: int
+    best_val_loss: float
+    should_stop: bool
+
+
+def _stage2_schedule_shape(runtime, num_batches):
+    updates_per_epoch = max(
+        1,
+        math.ceil(
+            int(num_batches) / runtime.gradient_accumulation_steps
+        ),
+    )
+    if runtime.max_steps > 0:
+        total_updates = runtime.max_steps
+        effective_epochs = max(
+            runtime.num_epochs,
+            math.ceil(runtime.max_steps / updates_per_epoch),
+        )
+    else:
+        total_updates = updates_per_epoch * runtime.num_epochs
+        effective_epochs = runtime.num_epochs
+    return updates_per_epoch, total_updates, effective_epochs
+
+
+def _run_stage2_epoch(
+    *,
+    runtime,
+    epoch,
+    starting_global_step,
+    best_val_loss,
+    model,
+    train_loader,
+    optimizer,
+    scheduler,
+    device,
+    autocast_dtype,
+    grad_scaler,
+    evaluate_fn,
+    checkpoint_fn,
+    log_step_fn=None,
+):
+    state = {
+        "global_step": int(starting_global_step),
+        "best_val_loss": float(best_val_loss),
+    }
+
+    def should_stop():
+        return (
+            runtime.max_steps > 0
+            and state["global_step"] >= runtime.max_steps
+        )
+
+    def on_log(**event):
+        if log_step_fn is None:
+            return
+        event["step"] = starting_global_step + event["step"]
+        log_step_fn(**event)
+
+    def after_step(**event):
+        global_step = starting_global_step + event["step"]
+        state["global_step"] = global_step
+
+        if (
+            runtime.eval_steps > 0
+            and global_step % runtime.eval_steps == 0
+        ):
+            try:
+                val_loss = evaluate_fn(global_step)
+            finally:
+                model.train()
+            if val_loss < state["best_val_loss"]:
+                state["best_val_loss"] = val_loss
+                checkpoint_fn(
+                    f"best_step_{global_step}",
+                    epoch,
+                    global_step,
+                    state["best_val_loss"],
+                )
+
+        if (
+            runtime.save_steps > 0
+            and global_step % runtime.save_steps == 0
+        ):
+            checkpoint_fn(
+                f"step_{global_step}",
+                epoch,
+                global_step,
+                state["best_val_loss"],
+            )
+
+    train_loss = train_one_epoch(
+        model=model,
+        dataloader=train_loader,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=device,
+        gradient_accumulation_steps=(
+            runtime.gradient_accumulation_steps
+        ),
+        log_step_fn=on_log if log_step_fn is not None else None,
+        autocast_dtype=autocast_dtype,
+        grad_scaler=grad_scaler,
+        after_step_fn=after_step,
+        should_stop_fn=should_stop,
+    )
+    return Stage2EpochResult(
+        train_loss=train_loss,
+        global_step=state["global_step"],
+        best_val_loss=state["best_val_loss"],
+        should_stop=should_stop(),
+    )
+
+
 def train_thinker_stage2(
     cfg: Union[
         Stage2RuntimeConfig,
@@ -1498,11 +1615,9 @@ def train_thinker_stage2(
     audio_root = runtime.audio_root
     output_dir = runtime.output_dir + time.strftime("-%Y%m%d-%H%M%S")
     resume_path = runtime.resume_from_checkpoint
-    num_epochs = runtime.num_epochs
     learning_rate = runtime.learning_rate
     weight_decay = runtime.weight_decay
     warmup_ratio = runtime.warmup_ratio
-    grad_accum = runtime.gradient_accumulation_steps
     logging_steps = runtime.logging_steps
     fp16 = runtime.fp16
     bf16 = runtime.bf16
@@ -1593,10 +1708,10 @@ def train_thinker_stage2(
             model.parameters(), lr=learning_rate, weight_decay=weight_decay
         )
 
-    total_updates_per_epoch = max(
-        1, len(train_loader) // grad_accum
+    _, total_updates, effective_epochs = _stage2_schedule_shape(
+        runtime,
+        len(train_loader),
     )
-    total_updates = total_updates_per_epoch * num_epochs
     warmup_steps = int(total_updates * warmup_ratio)
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -1635,7 +1750,6 @@ def train_thinker_stage2(
 
     train_start_time = time.time()
     epoch_start_time = time.time()
-    step_offset = global_step
 
     def _fmt_secs(seconds: float) -> str:
         seconds = max(0.0, float(seconds))
@@ -1643,12 +1757,17 @@ def train_thinker_stage2(
         hrs, mins = divmod(mins, 60)
         return f"{int(hrs):02d}:{int(mins):02d}:{int(secs):02d}"
 
-    def log_step_fn(step: int, loss: float, batch_idx: int, ce_loss=None, aux_loss=None, lr=None):
-        nonlocal global_step
+    def log_step_fn(
+        step: int,
+        loss: float,
+        batch_idx: int,
+        ce_loss=None,
+        aux_loss=None,
+        lr=None,
+    ):
         nonlocal epoch_start_time
-        global_step = step_offset + step
-        if global_step % logging_steps == 0:
-            msg = f"[step {global_step}] loss={loss:.4f}"
+        if step % logging_steps == 0:
+            msg = f"[step {step}] loss={loss:.4f}"
             if ce_loss is not None:
                 msg += f" ce={ce_loss:.4f}"
             if aux_loss is not None:
@@ -1657,8 +1776,8 @@ def train_thinker_stage2(
                 msg += f" lr={lr:.6f}"
 
             elapsed_total = time.time() - train_start_time
-            remaining = max(total_updates - global_step, 0)
-            avg_step = elapsed_total / max(global_step, 1)
+            remaining = max(total_updates - step, 0)
+            avg_step = elapsed_total / max(step, 1)
             eta_total = remaining * avg_step
 
             elapsed_epoch = time.time() - epoch_start_time
@@ -1672,31 +1791,71 @@ def train_thinker_stage2(
             print(msg)
 
         if writer is not None:
-            writer.add_scalar("train/loss", loss, global_step)
+            writer.add_scalar("train/loss", loss, step)
             if ce_loss is not None:
-                writer.add_scalar("train/ce_loss", ce_loss, global_step)
+                writer.add_scalar("train/ce_loss", ce_loss, step)
             if aux_loss is not None:
-                writer.add_scalar("train/aux_loss", aux_loss, global_step)
+                writer.add_scalar("train/aux_loss", aux_loss, step)
             if lr is not None:
-                writer.add_scalar("train/lr", lr, global_step)
+                writer.add_scalar("train/lr", lr, step)
             writer.flush()
 
-    for epoch in range(start_epoch, num_epochs):
-        print(f"Epoch {epoch} / {num_epochs - 1}")
-        epoch_start_time = time.time()
-        step_offset = global_step
-
-        train_loss = train_one_epoch(
+    def evaluate_at_step(step: int) -> float:
+        val_loss = evaluate(
             model=model,
-            dataloader=train_loader,
+            dataloader=val_loader,
+            device=device,
+            autocast_dtype=autocast_dtype,
+        )
+        print(f"[step {step}] val_loss={val_loss:.4f}")
+        if writer is not None:
+            writer.add_scalar("step/val_loss", val_loss, step)
+            writer.flush()
+        return val_loss
+
+    def save_step_checkpoint(
+        tag: str,
+        epoch: int,
+        step: int,
+        best: float,
+    ) -> None:
+        save_path = os.path.join(output_dir, tag)
+        print(f"Saving Stage2 checkpoint to {save_path}")
+        save_checkpoint(
+            checkpoint_dir=save_path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=grad_scaler,
+            epoch=epoch + 1,
+            global_step=step,
+            best_val_loss=best,
+        )
+        tokenizer.save_pretrained(save_path)
+
+    for epoch in range(start_epoch, effective_epochs):
+        print(f"Epoch {epoch} / {effective_epochs - 1}")
+        epoch_start_time = time.time()
+
+        epoch_result = _run_stage2_epoch(
+            runtime=runtime,
+            epoch=epoch,
+            starting_global_step=global_step,
+            best_val_loss=best_val_loss,
+            model=model,
+            train_loader=train_loader,
             optimizer=optimizer,
             scheduler=scheduler,
             device=device,
-            gradient_accumulation_steps=grad_accum,
-            log_step_fn=log_step_fn,
             autocast_dtype=autocast_dtype,
             grad_scaler=grad_scaler,
+            evaluate_fn=evaluate_at_step,
+            checkpoint_fn=save_step_checkpoint,
+            log_step_fn=log_step_fn,
         )
+        train_loss = epoch_result.train_loss
+        global_step = epoch_result.global_step
+        best_val_loss = epoch_result.best_val_loss
         print(f"Epoch {epoch} train_loss={train_loss:.4f}")
         if writer is not None:
             writer.add_scalar("epoch/train_loss", train_loss, global_step)
@@ -1750,6 +1909,9 @@ def train_thinker_stage2(
             best_val_loss=best_val_loss,
         )
         tokenizer.save_pretrained(latest_path)
+
+        if epoch_result.should_stop:
+            break
 
     if writer is not None:
         writer.close()
