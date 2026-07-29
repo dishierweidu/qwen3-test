@@ -51,6 +51,9 @@ import torchvision
 import torchaudio
 import transformers
 PY
+
+.venv-prototype/bin/python -m pytest -q
+.venv-prototype/bin/python -m compileall -q src scripts tests
 ```
 
 ### Official Qwen3-Omni reference profile (CUDA 12.8)
@@ -74,6 +77,8 @@ Use `https://download.pytorch.org/whl/cpu` instead on CPU-only test hosts.
 Verify the reference interpreter independently:
 
 ```bash
+ffmpeg -version
+
 .venv-qwen-reference/bin/python - <<'PY'
 import importlib.metadata as metadata
 for package in (
@@ -89,20 +94,39 @@ import torchvision
 import torchaudio
 import transformers
 from qwen_omni_utils import process_mm_info
+from transformers import (
+    Qwen3OmniMoeForConditionalGeneration,
+    Qwen3OmniMoeProcessor,
+)
 assert callable(process_mm_info)
+assert Qwen3OmniMoeForConditionalGeneration is not None
+assert Qwen3OmniMoeProcessor is not None
 PY
+
+.venv-qwen-reference/bin/python -m pytest -q
+.venv-qwen-reference/bin/python -m compileall -q src scripts tests
 ```
+
+The reference profile is for architecture and API comparison. Installing its
+dependencies does not make this custom implementation checkpoint-compatible
+with official Qwen3-Omni models; the architectures and state dictionaries
+remain different.
+
+### ABI troubleshooting
+
+An error such as `undefined symbol` while loading `libtorchaudio.so` means the
+installed TorchAudio wheel does not match the installed Torch release (and
+often its CUDA build). Recreate the affected virtual environment and install
+the exact Torch, TorchVision, and TorchAudio trio from one PyTorch wheel index.
+Do not repair one profile by installing packages into the other profile or the
+ambient interpreter.
 
 ## Tests
 
-```bash
-pytest -q
-python -m compileall src scripts tests
-```
-
 The tests cover Stage-2 target masking, strict media decoding, multimodal
 attention masks, MoE routing scale, numerical fail-fast behavior, and parameter
-statistics.
+statistics. Run the profile-specific commands above so test collection uses the
+intended dependency set.
 
 ## Stage-2 media behavior
 
