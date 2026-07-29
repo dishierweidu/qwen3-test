@@ -73,16 +73,28 @@ def _is_global_bad_loss(loss: torch.Tensor) -> bool:
     )
 
 
+def _finite_flag(tensor: torch.Tensor) -> torch.Tensor:
+    values = tensor.coalesce().values() if tensor.is_sparse else tensor
+    return torch.isfinite(values).all()
+
+
 def _find_non_finite_output(outputs: Mapping[str, Any]) -> Optional[str]:
     """Return the first checked output field containing NaN/Inf values."""
+    checked = []
     for key in ("loss", "ce_loss", "aux_loss", "logits"):
         value = outputs.get(key)
-        if isinstance(value, torch.Tensor) and not bool(
-            torch.isfinite(value).all().item()
-        ):
-            count = int((~torch.isfinite(value)).sum().item())
+        if isinstance(value, torch.Tensor):
+            checked.append((key, value, _finite_flag(value)))
+
+    if not checked or bool(torch.stack([item[2] for item in checked]).all().item()):
+        return None
+
+    for key, value, finite in checked:
+        if not bool(finite.item()):
+            values = value.coalesce().values() if value.is_sparse else value
+            count = int((~torch.isfinite(values)).sum().item())
             return f"output {key!r} contains {count} non-finite value(s)"
-    return None
+    return "model output contains non-finite values"
 
 
 def _find_non_finite_module_diagnostic(
@@ -115,14 +127,22 @@ def _find_non_finite_module_diagnostic(
 
 
 def _find_non_finite_gradient(model: torch.nn.Module) -> Optional[str]:
+    checked = []
     for name, parameter in model.named_parameters():
         gradient = parameter.grad
         if gradient is None:
             continue
-        if not bool(torch.isfinite(gradient).all().item()):
-            count = int((~torch.isfinite(gradient)).sum().item())
+        checked.append((name, gradient, _finite_flag(gradient)))
+
+    if not checked or bool(torch.stack([item[2] for item in checked]).all().item()):
+        return None
+
+    for name, gradient, finite in checked:
+        if not bool(finite.item()):
+            values = gradient.coalesce().values() if gradient.is_sparse else gradient
+            count = int((~torch.isfinite(values)).sum().item())
             return f"gradient {name!r} contains {count} non-finite value(s)"
-    return None
+    return "model gradients contain non-finite values"
 
 
 def _format_metadata(metadata: Mapping[str, Any]) -> str:
