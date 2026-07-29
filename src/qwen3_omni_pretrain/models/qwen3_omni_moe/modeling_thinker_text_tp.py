@@ -37,6 +37,7 @@ from .modeling_thinker_text import (
     CausalConv1d,
     GatedDeltaNetAttention,
 )
+from .modules.moe import select_topk_routes
 
 # Import parallel components
 from qwen3_omni_pretrain.parallel import (
@@ -337,7 +338,11 @@ class TensorParallelMoeMLP(nn.Module):
         
         # Top-k selection
         k = self.num_experts_per_tok
-        topk_vals, topk_idx = gate_probs.topk(k=k, dim=-1)
+        topk_vals, topk_idx = select_topk_routes(
+            gate_probs,
+            k=self.num_experts_per_tok,
+            renormalize=self.renormalize_topk,
+        )
         
         # Expand indices
         topk_vals_flat = topk_vals.reshape(-1)

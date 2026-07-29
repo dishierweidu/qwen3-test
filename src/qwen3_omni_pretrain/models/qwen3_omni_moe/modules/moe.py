@@ -6,6 +6,18 @@ import torch
 import torch.nn as nn
 
 
+def select_topk_routes(
+    router_probs: torch.Tensor,
+    *,
+    k: int,
+    renormalize: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    values, indices = router_probs.float().topk(k=int(k), dim=-1)
+    if renormalize:
+        values = values / values.sum(dim=-1, keepdim=True)
+    return values, indices
+
+
 class ExpertMLP(nn.Module):
     """Two-layer SiLU expert used by the routed MoE block."""
 
@@ -94,15 +106,11 @@ class Qwen3OmniMoeMLP(nn.Module):
                 "gate_probs must have shape [num_tokens, num_experts]"
             )
         num_tokens = gate_probs.size(0)
-        topk_values, topk_indices = gate_probs.topk(
-            k=self.num_experts_per_tok, dim=-1
+        topk_values, topk_indices = select_topk_routes(
+            gate_probs,
+            k=self.num_experts_per_tok,
+            renormalize=self.renormalize_topk,
         )
-        if self.renormalize_topk:
-            denominator = topk_values.sum(dim=-1, keepdim=True)
-            # Keep this branch free of rank-local numerical exceptions. Any
-            # NaN/Inf propagates into model outputs and is handled by the
-            # trainer's synchronized non-finite check.
-            topk_values = topk_values / denominator
 
         token_indices = (
             torch.arange(num_tokens, device=gate_probs.device)
@@ -124,7 +132,7 @@ class Qwen3OmniMoeMLP(nn.Module):
             )
         x_flat = x.reshape(batch_size * sequence_length, hidden_size)
         gate_logits = self.gate(x_flat)
-        gate_probs = torch.softmax(gate_logits, dim=-1)
+        gate_probs = torch.softmax(gate_logits.float(), dim=-1)
         token_indices, expert_indices, scores = self._dispatch_tokens(gate_probs)
 
         importance = gate_probs.mean(dim=0)
@@ -159,7 +167,9 @@ class Qwen3OmniMoeMLP(nn.Module):
 
             expert_output = expert(expert_input)
             if has_tokens:
-                weighted_output = expert_output * selected_scores.unsqueeze(-1)
+                weighted_output = expert_output * selected_scores.to(
+                    expert_output.dtype
+                ).unsqueeze(-1)
                 y_flat.index_add_(
                     0, selected_token_indices, weighted_output
                 )
