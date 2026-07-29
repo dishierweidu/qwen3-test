@@ -125,3 +125,82 @@ def test_nonfinite_moe_state_is_caught_at_synchronized_output_boundary():
         train_one_epoch(
             model, dataloader, optimizer, None, torch.device("cpu")
         )
+
+
+class SanitizingNonFiniteMoeModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        from qwen3_omni_pretrain.models.qwen3_omni_moe.modules.moe import (
+            Qwen3OmniMoeMLP,
+        )
+
+        self.moe = Qwen3OmniMoeMLP(
+            hidden_size=4,
+            intermediate_size=8,
+            num_experts=2,
+            num_experts_per_tok=1,
+            use_shared_expert=False,
+        )
+        with torch.no_grad():
+            self.moe.gate.weight.fill_(float("nan"))
+
+    def forward(self, x):
+        logits, aux_loss = self.moe(x)
+        sanitized_logits = torch.nan_to_num(logits)
+        sanitized_aux_loss = torch.nan_to_num(aux_loss)
+        return {
+            "loss": sanitized_logits.sum() + sanitized_aux_loss,
+            "logits": sanitized_logits,
+            "aux_loss": sanitized_aux_loss,
+        }
+
+
+def test_module_diagnostic_catches_nonfinite_moe_state_after_output_sanitization():
+    model = SanitizingNonFiniteMoeModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    dataloader = DataLoader(
+        [
+            {
+                "x": torch.ones(1, 1, 4),
+                "_sample_ids": ["moe-sanitized"],
+            }
+        ],
+        batch_size=None,
+    )
+
+    with pytest.raises(NonFiniteTrainingError, match="MoE router probabilities"):
+        train_one_epoch(
+            model, dataloader, optimizer, None, torch.device("cpu")
+        )
+
+
+class DiagnosticOnlyModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self._nonfinite_diagnostic = torch.tensor(True)
+        self._nonfinite_diagnostic_reason = "synthetic internal state is non-finite"
+
+
+class FiniteOutputWithBadInternalDiagnostic(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.tensor(1.0))
+        self.diagnostic = DiagnosticOnlyModule()
+
+    def forward(self, x):
+        logits = x * self.weight
+        return {"loss": logits.sum(), "logits": logits}
+
+
+def test_internal_module_diagnostic_is_checked_after_forward():
+    model = FiniteOutputWithBadInternalDiagnostic()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    dataloader = DataLoader(
+        [{"x": torch.tensor([1.0]), "_sample_ids": ["internal-bad"]}],
+        batch_size=None,
+    )
+
+    with pytest.raises(NonFiniteTrainingError, match="synthetic internal state"):
+        train_one_epoch(
+            model, dataloader, optimizer, None, torch.device("cpu")
+        )
