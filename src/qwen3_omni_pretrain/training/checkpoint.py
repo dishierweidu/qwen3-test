@@ -7,7 +7,11 @@ from typing import Optional, Tuple, TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
-from transformers.modeling_utils import load_sharded_checkpoint
+
+try:
+	from transformers.trainer_utils import load_sharded_checkpoint
+except ImportError:
+	from transformers.modeling_utils import load_sharded_checkpoint
 
 if TYPE_CHECKING:
     from accelerate import Accelerator
@@ -468,4 +472,3 @@ def save_model_only_accelerator(
 	accelerator.wait_for_everyone()
 	print(f"[rank{rank}] >>> save_only_model: done", flush=True)
 	return save_dir
-
