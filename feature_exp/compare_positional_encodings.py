@@ -24,6 +24,155 @@ def causal_mask(T: int, device):
     m = torch.full((T, T), float("-inf"), device=device)
     return torch.triu(m, diagonal=1)
 
+class IndirectIndexGen:
+    """
+    2D-grid Indirect Indexing:
+      - Key segment and Value segment share same time_id (0..M-1) -> position collision
+      - mod_id distinguishes segments (0=KEY, 1=VAL, 2=special)
+
+    Sequence:
+      [BOS][OFF_k][KEY_q][SEP]
+        KEY_SEG (len=M)
+      [SEP]
+        VAL_SEG (len=M)
+      [Q]
+
+    Label:
+      VAL_SEG[p_q + k]
+    """
+    def __init__(self, vocab_noise=256, n_values=64, n_keys=32, k_max=16, M=64):
+        self.vocab_noise = vocab_noise
+        self.n_values = n_values
+        self.n_keys = n_keys
+        self.k_max = k_max
+        self.M = M
+
+        base = vocab_noise
+        self.BOS = base + 0
+        self.SEP = base + 1
+        self.Q   = base + 2
+
+        self.OFF0 = base + 16                 # OFF tokens: OFF0..OFF(2*k_max)
+        self.KEY0 = base + 128                # KEY tokens: KEY0..KEY(n_keys-1)
+        self.VAL0 = base + 256                # VAL tokens: VAL0..VAL(n_values-1)
+
+        self.vocab_size = base + 512 + 512
+
+    def _sample_one(self):
+        M = self.M
+        # sample offset k in [-k_max, k_max]
+        k = random.randint(-self.k_max, self.k_max)
+
+        # place keys in KEY_SEG at unique positions
+        key_positions = random.sample(range(M), self.n_keys)  # unique
+        # choose query key q
+        q = random.randint(0, self.n_keys - 1)
+        # key token id
+        key_token_q = self.KEY0 + q
+        # its position p_q in [0..M-1]
+        p_q = key_positions[q]
+
+        # ensure p_q + k is in range; resample k a few times if needed
+        for _ in range(50):
+            if 0 <= p_q + k < M:
+                break
+            k = random.randint(-self.k_max, self.k_max)
+        else:
+            k = max(-p_q, min(k, M - 1 - p_q))
+
+        # build key segment
+        key_seg = [random.randint(0, self.vocab_noise - 1) for _ in range(M)]
+        for i, p in enumerate(key_positions):
+            key_seg[p] = self.KEY0 + i
+
+        # build value segment
+        val_seg = [self.VAL0 + random.randint(0, self.n_values - 1) for _ in range(M)]
+        label = val_seg[p_q + k]
+
+        # build full token seq
+        off_token = self.OFF0 + (k + self.k_max)  # shift to [0..2*k_max]
+        tokens = [self.BOS, off_token, key_token_q, self.SEP] + key_seg + [self.SEP] + val_seg + [self.Q]
+
+        # IMPORTANT: 2D ids
+        # prefix specials: time_id negative; mod_id=2
+        time_id = [-3, -2, -1, -1]
+        mod_id  = [ 2,  2,  2,  2]
+
+        # key segment: time_id 0..M-1, mod_id=0
+        time_id += list(range(M))
+        mod_id  += [0] * M
+
+        # sep: special
+        time_id += [-1]
+        mod_id  += [2]
+
+        # value segment: time_id 0..M-1 AGAIN (collision!), mod_id=1
+        time_id += list(range(M))
+        mod_id  += [1] * M
+
+        # Q: special
+        time_id += [M]
+        mod_id  += [2]
+
+        return tokens, time_id, mod_id, label
+
+    def sample_batch(self, B, device):
+        xs, ts, ms, ys = [], [], [], []
+        for _ in range(B):
+            x, t, m, y = self._sample_one()
+            xs.append(x); ts.append(t); ms.append(m); ys.append(y)
+        x = torch.tensor(xs, device=device, dtype=torch.long)
+        t = torch.tensor(ts, device=device, dtype=torch.long)
+        m = torch.tensor(ms, device=device, dtype=torch.long)
+        y = torch.tensor(ys, device=device, dtype=torch.long)
+        return x, t, m, y
+    
+class IndirectStringGen:
+    def __init__(self, vocab_noise=0, alphabet=64, L=40, k_max=16):
+        self.alphabet = alphabet
+        self.L = L
+        self.k_max = k_max
+
+        self.BOS = 0
+        self.SEP = 1
+        self.Q   = 2
+        self.CHAR0  = 3
+        self.SHIFT0 = self.CHAR0 + alphabet  # 紧接字符
+        self.vocab_size = self.SHIFT0 + (2*k_max + 1)
+
+    def _sample_one(self):
+        perm = random.sample(range(self.alphabet), self.L)
+        src = [self.CHAR0 + c for c in perm]
+        p = random.randint(0, self.L - 1)
+        src_char = src[p]
+
+        # sample d in [-k_max, k_max], keep in range
+        for _ in range(100):
+            d = random.randint(-self.k_max, self.k_max)
+            if d == 0:
+                continue  # forbid copy shortcut
+            if 0 <= p + d < self.L:
+                break
+        target = src[p + d]
+        shift_tok = self.SHIFT0 + (d + self.k_max)
+
+        tokens = [self.BOS] + src + [self.SEP, src_char, shift_tok, self.Q]
+        time_id = list(range(len(tokens)))
+        mod_id  = [0] * len(tokens)
+        return tokens, time_id, mod_id, target
+
+    def sample_batch(self, B, device):
+        xs, ts, ms, ys = [], [], [], []
+        for _ in range(B):
+            x, t, m, y = self._sample_one()
+            xs.append(x); ts.append(t); ms.append(m); ys.append(y)
+        return (
+            torch.tensor(xs, device=device, dtype=torch.long),
+            torch.tensor(ts, device=device, dtype=torch.long),
+            torch.tensor(ms, device=device, dtype=torch.long),
+            torch.tensor(ys, device=device, dtype=torch.long),
+        )
+
 
 # -------------------------
 # Toy multimodal generator
@@ -201,6 +350,24 @@ def apply_rope(x, pos, inv_freq):
     return y
 
 
+def apply_rope_partial(x, pos, base=10000.0, rotary_pct=0.5):
+    """
+    Apply RoPE on a fraction of dimensions to keep some plain content dims for easy matching.
+    """
+    B,H,T,D = x.shape
+    D_rot = int(D * rotary_pct)
+    D_rot = D_rot - (D_rot % 2)  # ensure even
+    if D_rot <= 0:
+        return x
+    if D_rot >= D:
+        inv = build_inv_freq_rope(D // 2, base=base, device=x.device)
+        return apply_rope(x, pos, inv)
+
+    inv = build_inv_freq_rope(D_rot // 2, base=base, device=x.device)
+    x_rot = apply_rope(x[..., :D_rot], pos, inv)
+    return torch.cat([x_rot, x[..., D_rot:]], dim=-1)
+
+
 class PoPEPhaseBias(nn.Module):
     """
     Learnable but bounded delta in [-2pi, 0], as described in the paper. :contentReference[oaicite:9]{index=9}
@@ -329,9 +496,12 @@ class MHA(nn.Module):
         v = qkv[:, :, :, 2, :]  # [B,H,T,D]
 
         if self.pe_mode == "rope_1d":
-            # use time_id as position
-            q = apply_rope(q, time_id, self.inv_freq_time)
-            k = apply_rope(k, time_id, self.inv_freq_time)
+            # partial rotary: leave some dims unrotated for content matching, rotate the rest for relative shift
+            Hc = self.n_heads // 2  # 前一半 head：纯内容（不加 RoPE）
+            # 后一半 head：纯位置（加 RoPE）
+            q = torch.cat([q[:, :Hc], apply_rope(q[:, Hc:], time_id, self.inv_freq_time)], dim=1)
+            k = torch.cat([k[:, :Hc], apply_rope(k[:, Hc:], time_id, self.inv_freq_time)], dim=1)
+
 
             scores = torch.einsum("bhtd,bhsd->bhts", q, k) / math.sqrt(self.d_head)
 
@@ -458,6 +628,8 @@ class TinyDecoder(nn.Module):
         self.blocks = nn.ModuleList([Block(d_model, n_heads, pe_mode, device) for _ in range(n_layers)])
         self.norm = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        # tie output projection to input embeddings to help pointer-style tasks
+        self.lm_head.weight = self.emb.weight
 
     def forward(self, tok, time_id, mod_id):
         B,T = tok.shape
@@ -473,14 +645,24 @@ class TinyDecoder(nn.Module):
 # -------------------------
 # Train / Eval
 # -------------------------
+def mask_logits_indirect_str(logits, gen, task):
+    if task == "indirect_str":
+        mask = torch.full_like(logits, float("-inf"))
+        mask[:, gen.CHAR0 : gen.CHAR0 + gen.alphabet] = 0.0
+        logits = logits + mask
+    return logits
+
+
 @torch.no_grad()
-def eval_acc(model, gen, steps, batch_size, device):
+def eval_acc(model, gen, steps, batch_size, device, task):
     model.eval()
     correct = 0
     total = 0
     for _ in range(steps):
         x,t,m,y = gen.sample_batch(batch_size, device)
         logits = model(x,t,m)[:,-1,:]  # last token = Q
+        logits = mask_logits_indirect_str(logits, gen, task)
+
         pred = logits.argmax(dim=-1)
         correct += (pred == y).sum().item()
         total += y.numel()
@@ -490,9 +672,15 @@ def eval_acc(model, gen, steps, batch_size, device):
 def train(args):
     device = "cuda" if (torch.cuda.is_available() and not args.cpu) else "cpu"
     set_seed(args.seed)
-
     cfg = ToyCfg(T=args.T, layout=args.layout)
-    gen = MultiModalToyGen(cfg)
+
+    if args.task == "crossmodal":
+        gen = MultiModalToyGen(cfg)
+    elif args.task == "indirect_str":
+        gen = IndirectStringGen(vocab_noise=0, alphabet=args.alphabet, L=args.L, k_max=args.Kmax)
+    else:
+        gen = IndirectIndexGen(vocab_noise=256, n_values=args.M, n_keys=args.Nkeys, k_max=args.Kmax, M=args.ArrLen)
+
 
     model = TinyDecoder(
         vocab_size=gen.vocab_size,
@@ -503,12 +691,13 @@ def train(args):
         device=device
     ).to(device)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd, betas=(0.9, 0.95))
 
     for step in range(1, args.train_steps + 1):
         model.train()
         x,t,m,y = gen.sample_batch(args.batch, device)
         logits = model(x,t,m)[:,-1,:]
+        logits = mask_logits_indirect_str(logits, gen, args.task)
         loss = F.cross_entropy(logits, y)
 
         opt.zero_grad(set_to_none=True)
@@ -521,16 +710,30 @@ def train(args):
             print(f"step {step:5d} | loss {loss.item():.4f} | train_acc {acc*100:.2f}%")
 
         if step % args.eval_every == 0:
-            test_acc = eval_acc(model, gen, steps=50, batch_size=args.batch, device=device)
-            print(f"[eval@T={cfg.T}] acc {test_acc*100:.2f}%")
+            test_acc = eval_acc(model, gen, steps=50, batch_size=args.batch, device=device, task=args.task)
+            tag = f"T={cfg.T}" if args.task == "crossmodal" else (f"L={args.L}" if args.task == "indirect_str" else f"M={args.ArrLen}")
+            print(f"[eval@{tag}] acc {test_acc*100:.2f}%")
 
     # length extrapolation tests
     if args.extrapolate:
-        for T2 in [args.T*2, args.T*4]:
-            cfg2 = ToyCfg(T=T2, layout=args.layout)
-            gen2 = MultiModalToyGen(cfg2)
-            acc2 = eval_acc(model, gen2, steps=50, batch_size=args.batch, device=device)
-            print(f"[extrapolate@T={T2}] acc {acc2*100:.2f}%")
+        if args.task == "crossmodal":
+            for T2 in [args.T*2, args.T*4]:
+                cfg2 = ToyCfg(T=T2, layout=args.layout)
+                gen2 = MultiModalToyGen(cfg2)
+                acc2 = eval_acc(model, gen2, steps=50, batch_size=args.batch, device=device, task=args.task)
+                print(f"[extrapolate@T={T2}] acc {acc2*100:.2f}%")
+        elif args.task == "indirect_str":
+            for L2 in [args.L * 2, args.L * 4]:
+                if L2 > args.alphabet:
+                    raise ValueError("Need alphabet >= max extrapolate L when requiring unique chars.")
+                gen2 = IndirectStringGen(vocab_noise=0, alphabet=args.alphabet, L=L2, k_max=args.Kmax)
+                acc2 = eval_acc(model, gen2, steps=50, batch_size=args.batch, device=device, task=args.task)
+                print(f"[extrapolate@L={L2}] acc {acc2*100:.2f}%")
+        else:
+            for M2 in [args.M*2, args.M*4]:
+                gen2 = IndirectIndexGen(vocab_noise=256, n_values=args.M, n_keys=args.Nkeys, k_max=args.Kmax)
+                acc2 = eval_acc(model, gen2, steps=50, batch_size=args.batch, device=device, task=args.task)
+                print(f"[extrapolate@M={M2}] acc {acc2*100:.2f}%")
 
     return 0
 
@@ -546,12 +749,22 @@ def main():
     p.add_argument("--n_layers", type=int, default=4)
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--wd", type=float, default=0.0)
     p.add_argument("--train_steps", type=int, default=2000)
     p.add_argument("--log_every", type=int, default=100)
     p.add_argument("--eval_every", type=int, default=400)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--cpu", action="store_true")
     p.add_argument("--extrapolate", action="store_true")
+    p.add_argument("--task", type=str, default="crossmodal", choices=["crossmodal","indirect","indirect_str"])
+    p.add_argument("--M", type=int, default=64)      # indirect: n_values
+    p.add_argument("--Nkeys", type=int, default=32)  # indirect: n_keys
+    p.add_argument("--Kmax", type=int, default=16)   # indirect: max offset
+    p.add_argument("--ArrLen", type=int, default=64)
+    p.add_argument("--L", type=int, default=64)
+    p.add_argument("--alphabet", type=int, default=52)
+
+
     args = p.parse_args()
     raise SystemExit(train(args))
 
