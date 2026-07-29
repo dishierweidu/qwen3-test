@@ -2,7 +2,6 @@
 
 import os
 import time
-import datetime
 import signal
 import json
 from contextlib import nullcontext
@@ -18,10 +17,6 @@ from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
 try:
     import deepspeed
-    deepspeed.init_distributed(
-        dist_backend="nccl", 
-        timeout=datetime.timedelta(hours=2)  # <--- 关键！强制传入 2小时
-    )
 except ImportError:
     deepspeed = None
 
