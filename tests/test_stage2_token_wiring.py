@@ -115,8 +115,8 @@ def test_inference_loads_config_then_reconciles_before_weights(monkeypatch):
 
     class SpyConfig:
         @classmethod
-        def from_pretrained(cls, checkpoint):
-            events.append("config-load")
+        def from_legacy_pretrained_config(cls, checkpoint):
+            events.append("legacy-adapt")
             return config
 
     def reconcile(config_arg, tokenizer_arg):
@@ -147,8 +147,76 @@ def test_inference_loads_config_then_reconciles_before_weights(monkeypatch):
         load_kwargs={"torch_dtype": torch.float32},
     )
     assert isinstance(model, SpyModel)
-    assert events == ["config-load", "reconcile", "weight-load"]
+    assert events == ["legacy-adapt", "reconcile", "weight-load"]
     assert captured["torch_dtype"] is torch.float32
+
+
+def test_inference_stage1_adapts_config_before_weights(monkeypatch):
+    events = []
+    config = object()
+    tokenizer = SimpleNamespace(pad_token_id=0, eos_token_id=0)
+
+    monkeypatch.setattr(
+        cli,
+        "_ensure_tokenizer",
+        lambda tokenizer_name_or_path, checkpoint: tokenizer,
+    )
+
+    class SpyConfig:
+        @classmethod
+        def from_legacy_pretrained_config(cls, checkpoint):
+            events.append("legacy-adapt")
+            return config
+
+    class SpyModel:
+        @classmethod
+        def from_pretrained(cls, checkpoint, **kwargs):
+            events.append("weight-load")
+            assert kwargs["config"] is config
+            raise WiringReached()
+
+    monkeypatch.setattr(cli, "Qwen3OmniMoeConfig", SpyConfig)
+    monkeypatch.setattr(cli, "Qwen3OmniMoeThinkerTextModel", SpyModel)
+    args = Namespace(
+        checkpoint="checkpoint",
+        tokenizer_name_or_path=None,
+        dtype="auto",
+    )
+
+    with pytest.raises(WiringReached):
+        cli.run_stage1(args)
+
+    assert events == ["legacy-adapt", "weight-load"]
+
+
+def test_training_stage1_initialization_adapts_config_before_weights(
+    monkeypatch,
+):
+    events = []
+    config = object()
+
+    class SpyConfig:
+        @classmethod
+        def from_legacy_pretrained_config(cls, checkpoint):
+            events.append("legacy-adapt")
+            return config
+
+    class SpyModel:
+        @classmethod
+        def from_pretrained(cls, checkpoint, **kwargs):
+            events.append("weight-load")
+            assert kwargs["config"] is config
+            return cls()
+
+    monkeypatch.setattr(trainer_thinker, "Qwen3OmniMoeConfig", SpyConfig)
+    monkeypatch.setattr(
+        trainer_thinker, "Qwen3OmniMoeThinkerTextModel", SpyModel
+    )
+
+    model = trainer_thinker._load_legacy_stage1_model("checkpoint")
+
+    assert isinstance(model, SpyModel)
+    assert events == ["legacy-adapt", "weight-load"]
 
 
 def test_inference_entry_calls_reconciled_loader(monkeypatch):

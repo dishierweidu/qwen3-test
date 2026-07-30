@@ -160,7 +160,7 @@ def test_run_stage2_uses_skip_flag_and_emits_json_error(
     )
     monkeypatch.setattr(
         cli.Qwen3OmniMoeConfig,
-        "from_pretrained",
+        "from_legacy_pretrained_config",
         classmethod(lambda cls, checkpoint: config),
     )
     monkeypatch.setattr(

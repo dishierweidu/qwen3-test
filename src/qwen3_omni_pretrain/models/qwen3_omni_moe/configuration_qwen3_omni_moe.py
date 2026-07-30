@@ -1,8 +1,19 @@
 # src/qwen3_omni_pretrain/models/qwen3_omni_moe/configuration_qwen3_omni_moe.py
 
+from copy import copy
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field
 from transformers import PretrainedConfig
+
+from qwen3_omni_pretrain.architecture import (
+    ArchitectureProfile,
+    CompatibilityLevel,
+    ProfileManifest,
+)
+from qwen3_omni_pretrain.profiles.legacy_prototype.config_adapter import (
+    LEGACY_MODEL_TYPE,
+    load_legacy_config_dict,
+)
 
 
 @dataclass
@@ -15,6 +26,7 @@ class Qwen3OmniMoeThinkerConfig:
     max_position_embeddings: int = 4096
 
     use_moe: bool = False
+    routing_kind: str = "dense"
     num_experts: int = 8
     num_experts_per_tok: int = 2
     
@@ -102,7 +114,8 @@ class Qwen3OmniMoeCode2WavConfig:
 
 
 class Qwen3OmniMoeConfig(PretrainedConfig):
-    model_type = "qwen3_omni_moe"
+    model_type = LEGACY_MODEL_TYPE
+    architecture_profile = "legacy_prototype"
 
     def __init__(
         self,
@@ -135,8 +148,22 @@ class Qwen3OmniMoeConfig(PretrainedConfig):
         thinker_config: Optional[Dict[str, Any]] = None,
         talker_config: Optional[Dict[str, Any]] = None,
         code2wav_config: Optional[Dict[str, Any]] = None,
+        architecture_profile: str = "legacy_prototype",
+        profile_manifest: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
+        if architecture_profile != self.architecture_profile:
+            raise ValueError(
+                "architecture_profile must be 'legacy_prototype'"
+            )
+        if profile_manifest is not None:
+            serialized_profile = profile_manifest.get(
+                "architecture_profile"
+            )
+            if serialized_profile != self.architecture_profile:
+                raise ValueError(
+                    "profile_manifest must claim legacy_prototype"
+                )
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
@@ -160,6 +187,13 @@ class Qwen3OmniMoeConfig(PretrainedConfig):
         self.use_moe = use_moe
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
+        self.profile_manifest = ProfileManifest(
+            architecture_profile=ArchitectureProfile.LEGACY_PROTOTYPE,
+            compatibility_level=CompatibilityLevel.LEGACY_PROTOTYPE,
+            sources={},
+            assumptions=("custom research architecture",),
+            exact_official_checkpoint_compatible=False,
+        )
 
         # 多模态 token id
         self.image_token_id = image_token_id
@@ -233,7 +267,9 @@ class Qwen3OmniMoeConfig(PretrainedConfig):
 
     def to_dict(self):
         # 确保保存到磁盘时，子配置能转成可 JSON 序列化的 dict
-        output = super().to_dict()
+        serialization_copy = copy(self)
+        serialization_copy.profile_manifest = self.profile_manifest.to_dict()
+        output = PretrainedConfig.to_dict(serialization_copy)
         # 显式保留 RoPE 配置，避免序列化时丢失（resume 时要用到）
         output["rope_partial_factor"] = getattr(self, "rope_partial_factor", 1.0)
         # 方便阅读/调试，也同步保存顶层 gate 标记
@@ -242,4 +278,14 @@ class Qwen3OmniMoeConfig(PretrainedConfig):
         output["thinker_config"] = self.thinker_config.__dict__
         output["talker_config"] = self.talker_config.__dict__
         output["code2wav_config"] = self.code2wav_config.__dict__
+        output["model_type"] = self.model_type
+        output["architecture_profile"] = self.architecture_profile
+        output["profile_manifest"] = self.profile_manifest.to_dict()
         return output
+
+    @classmethod
+    def from_legacy_pretrained_config(
+        cls,
+        path: str,
+    ) -> "Qwen3OmniMoeConfig":
+        return cls(**load_legacy_config_dict(path))

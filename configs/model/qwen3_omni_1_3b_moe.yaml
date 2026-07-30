@@ -1,6 +1,7 @@
 # configs/model/qwen3_omni_1_3b_moe.yaml
 
-model_type: qwen3_omni_moe
+model_type: qwen3_omni_prototype
+architecture_profile: legacy_prototype
 
 vocab_size: 152064
 

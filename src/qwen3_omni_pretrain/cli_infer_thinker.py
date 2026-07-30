@@ -167,7 +167,9 @@ def _load_reconciled_stage2_model(
     *,
     load_kwargs: Optional[Mapping[str, Any]] = None,
 ) -> Qwen3OmniMoeThinkerVisionAudioModel:
-    model_config = Qwen3OmniMoeConfig.from_pretrained(checkpoint)
+    model_config = Qwen3OmniMoeConfig.from_legacy_pretrained_config(
+        checkpoint
+    )
     reconcile_multimodal_token_ids(model_config, tokenizer)
     return Qwen3OmniMoeThinkerVisionAudioModel.from_pretrained(
         checkpoint,
@@ -351,7 +353,14 @@ def run_stage1(args: argparse.Namespace):
     if dtype is not None:
         load_kwargs["torch_dtype"] = dtype
     try:
-        model = Qwen3OmniMoeThinkerTextModel.from_pretrained(args.checkpoint, **load_kwargs)
+        model_config = Qwen3OmniMoeConfig.from_legacy_pretrained_config(
+            args.checkpoint
+        )
+        model = Qwen3OmniMoeThinkerTextModel.from_pretrained(
+            args.checkpoint,
+            config=model_config,
+            **load_kwargs,
+        )
     except ValueError as exc:
         msg = str(exc)
         if "torch.load" in msg or "CVE-2025-32434" in msg:

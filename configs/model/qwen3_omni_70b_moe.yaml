@@ -1,6 +1,7 @@
 # configs/model/qwen3_omni_70b_moe.yaml
 
-model_type: qwen3_omni_moe
+model_type: qwen3_omni_prototype
+architecture_profile: legacy_prototype
 
 # 基本结构
 vocab_size: 152064        # 可以根据实际 tokenizer 调整

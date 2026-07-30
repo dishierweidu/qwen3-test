@@ -1601,6 +1601,18 @@ def _build_reconciled_stage2_model(
     return Qwen3OmniMoeThinkerVisionAudioModel(model_config)
 
 
+def _load_legacy_stage1_model(
+    checkpoint: str,
+) -> Qwen3OmniMoeThinkerTextModel:
+    model_config = Qwen3OmniMoeConfig.from_legacy_pretrained_config(
+        checkpoint
+    )
+    return Qwen3OmniMoeThinkerTextModel.from_pretrained(
+        checkpoint,
+        config=model_config,
+    )
+
+
 def train_thinker_stage2(
     cfg: Union[
         Stage2RuntimeConfig,
@@ -1673,9 +1685,7 @@ def train_thinker_stage2(
     # ✅ 从 Stage1 ckpt 初始化 Thinker 权重（仅在不从已有 stage2 ckpt 恢复时）
     if stage1_init_ckpt and not resume_path:
         print(f"Loading Stage1 checkpoint from {stage1_init_ckpt}")
-        base_thinker = Qwen3OmniMoeThinkerTextModel.from_pretrained(
-            stage1_init_ckpt
-        )
+        base_thinker = _load_legacy_stage1_model(stage1_init_ckpt)
         missing, unexpected = model.thinker.load_state_dict(
             base_thinker.state_dict(), strict=False
         )
