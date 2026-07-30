@@ -328,6 +328,69 @@ def test_media_sequence_accepts_boolean_and_integer_masks(dtype):
     ).validate()
 
 
+@pytest.mark.parametrize(
+    "attention_mask",
+    [
+        torch.tensor([[1, 2, 0]]),
+        torch.tensor([[1, -1, 0]]),
+    ],
+)
+def test_media_sequence_rejects_non_binary_integer_masks(attention_mask):
+    sequence = make_audio_sequence(attention_mask=attention_mask)
+
+    with pytest.raises(ValueError, match="0 or 1"):
+        sequence.validate()
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.bool, torch.int64, torch.complex64]
+)
+def test_media_sequence_requires_floating_non_complex_embeddings(dtype):
+    sequence = MediaSequence(
+        embeddings=torch.zeros(1, 3, 8, dtype=dtype),
+        attention_mask=torch.ones(1, 3, dtype=torch.bool),
+        modality=MediaModality.AUDIO,
+        sources=(MediaSource(0, 0, "audio-0"),),
+    )
+
+    with pytest.raises(TypeError, match="embeddings"):
+        sequence.validate()
+
+
+@pytest.mark.parametrize(
+    "mismatched_tensor",
+    ["embeddings", "attention_mask", "timestamps"],
+)
+def test_media_sequence_requires_all_tensors_on_one_device(
+    mismatched_tensor,
+):
+    values = {
+        "embeddings": torch.zeros(1, 3, 8),
+        "attention_mask": torch.ones(1, 3, dtype=torch.bool),
+        "timestamps": torch.tensor([[0.0, 0.08, 0.16]]),
+    }
+    if mismatched_tensor == "embeddings":
+        values[mismatched_tensor] = torch.empty(
+            1, 3, 8, device="meta"
+        )
+    elif mismatched_tensor == "attention_mask":
+        values[mismatched_tensor] = torch.empty(
+            1, 3, dtype=torch.bool, device="meta"
+        )
+    else:
+        values[mismatched_tensor] = torch.empty(
+            1, 3, device="meta"
+        )
+    sequence = MediaSequence(
+        **values,
+        modality=MediaModality.AUDIO,
+        sources=(MediaSource(0, 0, "audio-0"),),
+    )
+
+    with pytest.raises(ValueError, match="device"):
+        sequence.validate()
+
+
 def test_media_sequence_requires_one_source_per_batch_row():
     sequence = MediaSequence(
         embeddings=torch.zeros(2, 3, 8),
@@ -398,20 +461,88 @@ def test_media_sequence_requires_seconds_per_grid_to_match_batch_size():
         sequence.validate()
 
 
-@pytest.mark.parametrize(
-    "value",
-    [True, 0.0, -0.08, float("nan"), float("inf"), "0.08"],
-)
-def test_media_sequence_rejects_invalid_present_seconds_per_grid(value):
-    sequence = make_audio_sequence(seconds_per_grid=(value,))
+@pytest.mark.parametrize("value", [True, "0.08", 0.08 + 0j])
+def test_video_sequence_seconds_per_grid_type_errors_are_type_errors(value):
+    sequence = MediaSequence(
+        embeddings=torch.zeros(1, 2, 8),
+        attention_mask=torch.ones(1, 2, dtype=torch.bool),
+        modality=MediaModality.VIDEO,
+        sources=(MediaSource(0, 0, "video-0"),),
+        grid=(MediaGrid(1, 1, 2),),
+        seconds_per_grid=(value,),
+    )
 
-    with pytest.raises((TypeError, ValueError), match="seconds_per_grid"):
+    with pytest.raises(TypeError, match="seconds_per_grid"):
         sequence.validate()
 
 
-@pytest.mark.parametrize("value", [None, 1, 0.08])
-def test_media_sequence_accepts_absent_or_positive_seconds_per_grid(value):
-    make_audio_sequence(seconds_per_grid=(value,)).validate()
+@pytest.mark.parametrize(
+    "value", [0.0, -0.08, float("nan"), float("inf")]
+)
+def test_video_sequence_seconds_per_grid_value_errors_are_value_errors(
+    value,
+):
+    sequence = MediaSequence(
+        embeddings=torch.zeros(1, 2, 8),
+        attention_mask=torch.ones(1, 2, dtype=torch.bool),
+        modality=MediaModality.VIDEO,
+        sources=(MediaSource(0, 0, "video-0"),),
+        grid=(MediaGrid(1, 1, 2),),
+        seconds_per_grid=(value,),
+    )
+
+    with pytest.raises(ValueError, match="seconds_per_grid"):
+        sequence.validate()
+
+
+@pytest.mark.parametrize(
+    "modality", [MediaModality.AUDIO, MediaModality.IMAGE]
+)
+def test_only_video_sequences_accept_present_seconds_per_grid(modality):
+    sequence = MediaSequence(
+        embeddings=torch.zeros(1, 2, 8),
+        attention_mask=torch.ones(1, 2, dtype=torch.bool),
+        modality=modality,
+        sources=(MediaSource(0, 0, f"{modality.value}-0"),),
+        grid=(
+            (MediaGrid(1, 1, 2),)
+            if modality is MediaModality.IMAGE
+            else None
+        ),
+        seconds_per_grid=(0.08,),
+    )
+
+    with pytest.raises(ValueError, match="video"):
+        sequence.validate()
+
+
+def test_video_sequence_accepts_positive_seconds_per_grid():
+    MediaSequence(
+        embeddings=torch.zeros(1, 2, 8),
+        attention_mask=torch.ones(1, 2, dtype=torch.bool),
+        modality=MediaModality.VIDEO,
+        sources=(MediaSource(0, 0, "video-0"),),
+        grid=(MediaGrid(1, 1, 2),),
+        seconds_per_grid=(0.08,),
+    ).validate()
+
+
+@pytest.mark.parametrize(
+    "modality", [MediaModality.AUDIO, MediaModality.IMAGE]
+)
+def test_non_video_sequences_allow_absent_seconds_per_grid(modality):
+    MediaSequence(
+        embeddings=torch.zeros(1, 2, 8),
+        attention_mask=torch.ones(1, 2, dtype=torch.bool),
+        modality=modality,
+        sources=(MediaSource(0, 0, f"{modality.value}-0"),),
+        grid=(
+            (MediaGrid(1, 1, 2),)
+            if modality is MediaModality.IMAGE
+            else None
+        ),
+        seconds_per_grid=(None,),
+    ).validate()
 
 
 def test_media_sequence_requires_timestamp_shape_to_match_tokens():
@@ -527,10 +658,19 @@ def test_non_video_spans_reject_seconds_per_grid():
         ).validate()
 
 
+@pytest.mark.parametrize("value", [True, "0.08", 0.08 + 0j])
+def test_video_span_seconds_per_grid_type_errors_are_type_errors(value):
+    with pytest.raises(TypeError, match="seconds_per_grid"):
+        make_media_span(
+            modality=MediaModality.VIDEO,
+            seconds_per_grid=value,
+        ).validate()
+
+
 @pytest.mark.parametrize(
-    "value", [True, 0.0, -0.08, float("nan"), float("inf")]
+    "value", [0.0, -0.08, float("nan"), float("inf")]
 )
-def test_video_span_rejects_invalid_present_seconds_per_grid(value):
+def test_video_span_seconds_per_grid_value_errors_are_value_errors(value):
     with pytest.raises(ValueError, match="seconds_per_grid"):
         make_media_span(
             modality=MediaModality.VIDEO,
@@ -746,6 +886,83 @@ def test_assembled_sequence_validates_core_shapes_and_optional_labels():
 
 
 @pytest.mark.parametrize(
+    "inputs_embeds",
+    [
+        torch.zeros(1, 2, 4, dtype=torch.bool),
+        torch.zeros(1, 2, 4, dtype=torch.int64),
+        torch.zeros(1, 2, 4, dtype=torch.complex64),
+    ],
+)
+def test_assembled_sequence_requires_floating_non_complex_embeddings(
+    inputs_embeds,
+):
+    with pytest.raises(TypeError, match="inputs_embeds"):
+        make_assembled(inputs_embeds=inputs_embeds).validate()
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.float32])
+def test_assembled_sequence_requires_long_labels(dtype):
+    with pytest.raises(TypeError, match="labels"):
+        make_assembled(labels=torch.zeros(1, 2, dtype=dtype)).validate()
+
+
+def test_assembled_sequence_rejects_negative_expanded_input_ids():
+    with pytest.raises(ValueError, match="non-negative"):
+        make_assembled(
+            expanded_input_ids=torch.tensor([[0, -1]])
+        ).validate()
+
+
+def test_assembled_sequence_rejects_non_binary_integer_masks():
+    with pytest.raises(ValueError, match="0 or 1"):
+        make_assembled(
+            attention_mask=torch.tensor([[1, 2]])
+        ).validate()
+
+
+@pytest.mark.parametrize(
+    "mismatched_tensor",
+    [
+        "expanded_input_ids",
+        "inputs_embeds",
+        "attention_mask",
+        "labels",
+        "span_timestamps",
+    ],
+)
+def test_assembled_sequence_requires_all_tensors_on_one_device(
+    mismatched_tensor,
+):
+    values = {
+        "expanded_input_ids": torch.zeros(1, 2, dtype=torch.long),
+        "inputs_embeds": torch.zeros(1, 2, 4),
+        "attention_mask": torch.ones(1, 2, dtype=torch.bool),
+        "labels": torch.zeros(1, 2, dtype=torch.long),
+    }
+    timestamps = torch.tensor([0.0, 0.08])
+    if mismatched_tensor == "span_timestamps":
+        timestamps = torch.empty(2, device="meta")
+    else:
+        tensor = values[mismatched_tensor]
+        values[mismatched_tensor] = torch.empty(
+            tensor.shape, dtype=tensor.dtype, device="meta"
+        )
+    span = make_media_span(
+        modality=MediaModality.AUDIO,
+        grid=None,
+        timestamps=timestamps,
+        source_token_indices=(0, 1),
+    )
+    assembled = make_assembled(
+        **values,
+        spans=(span,),
+    )
+
+    with pytest.raises(ValueError, match="device"):
+        assembled.validate()
+
+
+@pytest.mark.parametrize(
     ("field", "value", "message"),
     [
         (
@@ -837,6 +1054,29 @@ def test_assembled_sequence_allows_same_offsets_in_different_samples():
     ).validate()
 
 
+def test_assembled_sequence_requires_spans_in_canonical_offset_order():
+    spans = (
+        make_span(start=1, end=2),
+        make_span(start=0, end=1),
+    )
+
+    with pytest.raises(ValueError, match="canonical"):
+        make_assembled(spans=spans).validate()
+
+
+def test_assembled_sequence_requires_spans_in_canonical_sample_order():
+    spans = (
+        make_span(sample_index=1, start=0, end=2),
+        make_span(sample_index=0, start=0, end=2),
+    )
+
+    with pytest.raises(ValueError, match="canonical"):
+        make_assembled(
+            attention_mask=torch.ones(2, 2, dtype=torch.bool),
+            spans=spans,
+        ).validate()
+
+
 @pytest.mark.parametrize(
     "span",
     [
@@ -885,6 +1125,43 @@ def test_position_batch_accepts_integer_positions():
         rope_deltas=torch.tensor([[0]]),
         axis_names=("sequence",),
     ).validate(torch.ones(1, 3, dtype=torch.bool))
+
+
+def test_position_batch_rejects_non_binary_integer_attention_mask():
+    batch = PositionBatch(
+        position_ids=torch.tensor([[[0, 1]]]),
+        rope_deltas=torch.tensor([[0]]),
+        axis_names=("sequence",),
+    )
+
+    with pytest.raises(ValueError, match="0 or 1"):
+        batch.validate(torch.tensor([[1, 2]]))
+
+
+@pytest.mark.parametrize(
+    "mismatched_tensor",
+    ["position_ids", "rope_deltas", "attention_mask"],
+)
+def test_position_batch_requires_all_tensors_on_one_device(
+    mismatched_tensor,
+):
+    values = {
+        "position_ids": torch.zeros(1, 1, 2),
+        "rope_deltas": torch.zeros(1, 1),
+        "attention_mask": torch.ones(1, 2, dtype=torch.bool),
+    }
+    tensor = values[mismatched_tensor]
+    values[mismatched_tensor] = torch.empty(
+        tensor.shape, dtype=tensor.dtype, device="meta"
+    )
+    batch = PositionBatch(
+        position_ids=values["position_ids"],
+        rope_deltas=values["rope_deltas"],
+        axis_names=("sequence",),
+    )
+
+    with pytest.raises(ValueError, match="device"):
+        batch.validate(values["attention_mask"])
 
 
 @pytest.mark.parametrize(

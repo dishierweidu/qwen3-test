@@ -35,19 +35,32 @@ def _is_numeric_non_complex(tensor: torch.Tensor) -> bool:
     return tensor.is_floating_point() or tensor.dtype in _INTEGER_DTYPES
 
 
-def _validate_mask_dtype(mask: torch.Tensor, name: str) -> None:
+def _validate_mask(mask: torch.Tensor, name: str) -> None:
     if not _is_mask_dtype(mask.dtype):
         raise TypeError(f"{name} must have a boolean or integer dtype")
+    if not bool(((mask == 0) | (mask == 1)).all().item()):
+        raise ValueError(f"{name} values must be 0 or 1")
 
 
 def _validate_positive_number(value: object, name: str) -> None:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, Real)
-        or not math.isfinite(float(value))
-        or value <= 0
-    ):
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError(f"{name} must be a real number")
+    if not math.isfinite(float(value)) or value <= 0:
         raise ValueError(f"{name} must be a finite positive number")
+
+
+def _validate_same_device(
+    *named_tensors: tuple[str, torch.Tensor],
+) -> None:
+    if not named_tensors:
+        return
+    expected_device = named_tensors[0][1].device
+    if any(
+        tensor.device != expected_device
+        for _, tensor in named_tensors[1:]
+    ):
+        names = ", ".join(name for name, _ in named_tensors)
+        raise ValueError(f"{names} must be on the same device")
 
 
 @dataclass(frozen=True)
@@ -103,11 +116,34 @@ class MediaSequence:
         attention_mask = _require_tensor(
             self.attention_mask, "attention_mask"
         )
+        timestamps = (
+            None
+            if self.timestamps is None
+            else _require_tensor(self.timestamps, "timestamps")
+        )
         if embeddings.ndim != 3:
             raise ValueError("embeddings must have shape [B, M, H]")
+        if not embeddings.is_floating_point():
+            raise TypeError(
+                "embeddings must have a floating non-complex dtype"
+            )
         if attention_mask.shape != embeddings.shape[:2]:
             raise ValueError("attention_mask must have shape [B, M]")
-        _validate_mask_dtype(attention_mask, "attention_mask")
+        if timestamps is not None:
+            if timestamps.shape != embeddings.shape[:2]:
+                raise ValueError("timestamps must have shape [B, M]")
+            if not _is_numeric_non_complex(timestamps):
+                raise TypeError(
+                    "timestamps must have a numeric non-complex dtype"
+                )
+        tensor_fields = [
+            ("embeddings", embeddings),
+            ("attention_mask", attention_mask),
+        ]
+        if timestamps is not None:
+            tensor_fields.append(("timestamps", timestamps))
+        _validate_same_device(*tensor_fields)
+        _validate_mask(attention_mask, "attention_mask")
         if not isinstance(self.modality, MediaModality):
             raise TypeError("modality must be MediaModality")
         if not isinstance(self.sources, tuple):
@@ -181,21 +217,22 @@ class MediaSequence:
                 raise ValueError(
                     "seconds_per_grid tuple length must equal batch size"
                 )
+            if (
+                self.modality is not MediaModality.VIDEO
+                and any(
+                    value is not None
+                    for value in self.seconds_per_grid
+                )
+            ):
+                raise ValueError(
+                    "seconds_per_grid values are only valid for video"
+                )
             for value in self.seconds_per_grid:
                 if value is not None:
                     _validate_positive_number(value, "seconds_per_grid")
 
-        if self.timestamps is not None:
-            timestamps = _require_tensor(self.timestamps, "timestamps")
-            if timestamps.shape != embeddings.shape[:2]:
-                raise ValueError("timestamps must have shape [B, M]")
-            if not _is_numeric_non_complex(timestamps):
-                raise TypeError(
-                    "timestamps must have a numeric non-complex dtype"
-                )
-            valid_mask = attention_mask.to(
-                device=timestamps.device, dtype=torch.bool
-            )
+        if timestamps is not None:
+            valid_mask = attention_mask.to(dtype=torch.bool)
             valid_timestamps = timestamps.masked_select(valid_mask)
             if not bool(torch.isfinite(valid_timestamps).all().item()):
                 raise ValueError("valid timestamps must be finite")
@@ -392,6 +429,11 @@ class AssembledSequence:
         attention_mask = _require_tensor(
             self.attention_mask, "attention_mask"
         )
+        labels = (
+            None
+            if self.labels is None
+            else _require_tensor(self.labels, "labels")
+        )
         if expanded_input_ids.ndim != 2:
             raise ValueError(
                 "expanded_input_ids must have shape [B, S]"
@@ -404,15 +446,55 @@ class AssembledSequence:
             sequence_length,
         ):
             raise ValueError("inputs_embeds must have shape [B, S, H]")
+        if not inputs_embeds.is_floating_point():
+            raise TypeError(
+                "inputs_embeds must have a floating non-complex dtype"
+            )
         if attention_mask.shape != (batch_size, sequence_length):
             raise ValueError("attention_mask must have shape [B, S]")
-        _validate_mask_dtype(attention_mask, "attention_mask")
-        if self.labels is not None:
-            labels = _require_tensor(self.labels, "labels")
+        if labels is not None:
             if labels.shape != (batch_size, sequence_length):
                 raise ValueError("labels must have shape [B, S]")
+            if labels.dtype is not torch.long:
+                raise TypeError("labels must have dtype torch.long")
         if not isinstance(self.spans, tuple):
             raise TypeError("spans must be a tuple")
+        if any(
+            not isinstance(span, SequenceSpan) for span in self.spans
+        ):
+            raise TypeError("spans must contain SequenceSpan values")
+
+        tensor_fields = [
+            ("expanded_input_ids", expanded_input_ids),
+            ("inputs_embeds", inputs_embeds),
+            ("attention_mask", attention_mask),
+        ]
+        if labels is not None:
+            tensor_fields.append(("labels", labels))
+        for span in self.spans:
+            if span.timestamps is not None:
+                tensor_fields.append(
+                    (
+                        "span timestamps",
+                        _require_tensor(
+                            span.timestamps, "span timestamps"
+                        ),
+                    )
+                )
+        _validate_same_device(*tensor_fields)
+        if bool((expanded_input_ids < 0).any().item()):
+            raise ValueError(
+                "expanded_input_ids must be non-negative"
+            )
+        _validate_mask(attention_mask, "attention_mask")
+
+        span_keys = tuple(
+            (span.sample_index, span.start) for span in self.spans
+        )
+        if span_keys != tuple(sorted(span_keys)):
+            raise ValueError(
+                "spans must be in canonical (sample_index, start) order"
+            )
 
         valid_mask = attention_mask.to(dtype=torch.bool)
         coverage = torch.zeros_like(valid_mask)
@@ -421,8 +503,6 @@ class AssembledSequence:
         id_sources: dict[tuple[int, str], MediaSource] = {}
 
         for span in self.spans:
-            if not isinstance(span, SequenceSpan):
-                raise TypeError("spans must contain SequenceSpan values")
             span.validate()
             if span.sample_index >= batch_size:
                 raise ValueError(
@@ -540,7 +620,6 @@ class PositionBatch:
         axis_count, batch_size, sequence_length = position_ids.shape
         if attention_mask.shape != (batch_size, sequence_length):
             raise ValueError("attention_mask must have shape [B, S]")
-        _validate_mask_dtype(attention_mask, "attention_mask")
         if rope_deltas.shape != (batch_size, 1):
             raise ValueError("rope_deltas must have shape [B, 1]")
         if (
@@ -566,6 +645,12 @@ class PositionBatch:
             raise ValueError(
                 "axis_names must be unique and match the axis count"
             )
+        _validate_same_device(
+            ("position_ids", position_ids),
+            ("rope_deltas", rope_deltas),
+            ("attention_mask", attention_mask),
+        )
+        _validate_mask(attention_mask, "attention_mask")
         if (
             not bool(torch.isfinite(position_ids).all().item())
             or not bool(torch.isfinite(rope_deltas).all().item())
@@ -575,9 +660,7 @@ class PositionBatch:
             )
 
         valid_mask = (
-            attention_mask.to(
-                device=position_ids.device, dtype=torch.bool
-            )
+            attention_mask.to(dtype=torch.bool)
             .unsqueeze(0)
             .expand_as(position_ids)
         )
