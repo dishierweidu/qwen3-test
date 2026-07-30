@@ -1705,19 +1705,28 @@ git commit -m "feat: build time-aligned multimodal positions"
 **Files:**
 - Create: `src/qwen3_omni_pretrain/multimodal/prefill.py`
 - Create: `tests/multimodal/test_multimodal_prefill.py`
+- Modify: `src/qwen3_omni_pretrain/multimodal/__init__.py`
 - Modify: `README.md`
 
 **Interfaces:**
-- Consumes: token schema, text `pad_token_id`, decoded items, media encoders,
-  explicit expansion/grouping policy, `SequenceAssembler`, and
-  `PositionBuilder`.
-- Produces: `MultimodalPrefillPipeline.encode_and_assemble(...) -> MultimodalPrefillOutput`.
+- Consumes: strict retained text tensors, the final `DecodedMedia` tuple from
+  the collator, one caller-owned text-embedding callable, registered media
+  encoders, an explicit expansion policy, `SequenceAssembler`, and one
+  explicit `PositionBuilder`.
+- Produces: frozen `MultimodalPrefillOutput(assembled, positions,
+  media_sequences)` through both conventional `forward(...)` and the named
+  `encode_and_assemble(...)` API.
+- Owns only the three media encoders. It never owns a text embedding, language
+  model, decoder, quarantine policy, cache, or profile factory.
 
 - [ ] **Step 1: Write a failing end-to-end prefill test**
 
 ```python
 def test_prefill_keeps_image_and_audio_sequences_in_prompt_order():
-    pipeline = tiny_prefill_pipeline()
+    pipeline = tiny_prefill_pipeline(
+        position_builder=tiny_three_axis_builder(),
+    )
+    text_embedding = RecordingEmbedding(32, 8)
     output = pipeline.encode_and_assemble(
         input_ids=torch.tensor([[5, 10, 6, 12, 7]]),
         attention_mask=torch.ones(1, 5, dtype=torch.long),
@@ -1726,7 +1735,7 @@ def test_prefill_keeps_image_and_audio_sequences_in_prompt_order():
             tiny_image_item(source_id="image-0"),
             tiny_audio_item(source_id="audio-0"),
         ),
-        text_embedding=nn.Embedding(32, 8),
+        text_embedding=text_embedding,
     )
     assert output.assembled.inputs_embeds.shape[1] > 5
     assert [span.modality for span in output.assembled.spans if span.modality] == [
@@ -1734,6 +1743,7 @@ def test_prefill_keeps_image_and_audio_sequences_in_prompt_order():
         MediaModality.AUDIO,
     ]
     assert output.positions.position_ids.shape[:2] == (3, 1)
+    assert text_embedding.rank2_calls == 1
 ```
 
 - [ ] **Step 2: Run and observe missing pipeline failure**
@@ -1773,95 +1783,263 @@ class MultimodalPrefillPipeline(nn.Module):
         max_assembled_length: int,
     ) -> None:
         super().__init__()
-        if any(
-            isinstance(component, nn.Module)
-            for component in (assembler, expansion_policy, position_builder)
-        ):
-            raise TypeError(
-                "assembler, expansion policy and position builder "
-                "must be parameter-free non-modules"
-            )
+        # Perform the exact checks specified below before registration.
         self.image_encoder = image_encoder
         self.video_encoder = video_encoder
         self.audio_encoder = audio_encoder
-        if pad_token_id < 0 or max_assembled_length <= 0:
-            raise ValueError("pad token and assembled length are invalid")
         self.tokens = tokens
         self.assembler = assembler
         self.expansion_policy = expansion_policy
         self.position_builder = position_builder
         self.pad_token_id = pad_token_id
-        self.joint_separator_token_ids = frozenset(
-            joint_separator_token_ids
-        )
+        self.joint_separator_token_ids = joint_separator_token_ids
         self.max_assembled_length = max_assembled_length
+
+    def forward(
+        self,
+        *,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.Tensor,
+        labels: torch.LongTensor | None,
+        decoded_media: Sequence[DecodedMedia],
+        text_embedding: EmbeddingLookup,
+    ) -> MultimodalPrefillOutput:
+        ...
+
+    def encode_and_assemble(
+        self,
+        *,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.Tensor,
+        labels: torch.LongTensor | None,
+        decoded_media: Sequence[DecodedMedia],
+        text_embedding: EmbeddingLookup,
+    ) -> MultimodalPrefillOutput:
+        return self(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            decoded_media=decoded_media,
+            text_embedding=text_embedding,
+        )
 ```
 
-The constructor also rejects negative separator IDs and any separator equal to
-the pad or media-sentinel IDs, mirroring the assembler's validation.
+`forward()` is the canonical implementation. The named method delegates via
+`self(...)`, so normal `nn.Module` hooks still run; the reverse delegation is
+forbidden. The constructor performs all of these exact trusted-boundary checks:
 
-`encode_and_assemble()` groups decoded items by modality, calls each **non-empty**
-modality encoder exactly once (passing the registered image patch encoder into
-the video encoder), calls
-`assemble(expansion_policy=self.expansion_policy,
-embedding_lookup=text_embedding, pad_token_id=self.pad_token_id,
-joint_separator_token_ids=self.joint_separator_token_ids,
-max_assembled_length=self.max_assembled_length)`,
-builds
-positions, validates the three outputs, and returns.
-It does not call a language model and does not own request cache.
-Every caller supplies the policy and position builder explicitly. Qwen3
-reference callers for disjoint media use `IdentityMediaExpansion` plus
-`Qwen3DisjointPositionBuilder`; full `use_audio_in_video=True` parity is owned
-by the later Qwen3 reference-runtime adapter/oracle plan. MiMo experiments use
-their declared policy;
-the later Qwen3.5 plan may construct `TimestampInterleaveExpansion` plus a
-160 ms experimental builder. This task does not add profile factories or
-timestamp token IDs. The pipeline must not instantiate an implicit policy
-based on profile-name conditionals.
-Because the pipeline is an `nn.Module`, all three encoder modules are registered
-for `.to()`, checkpointing and optimization. `text_embedding` remains an
-argument owned by the language model and is not assigned to the pipeline.
+- `type(tokens) is ResolvedMultimodalTokens`; every present token ID has exact
+  `int` type, is non-negative, and all present IDs are pairwise distinct;
+- `pad_token_id` has exact `int` type, is non-negative, and differs from the
+  image/video/audio sentinel IDs;
+- `max_assembled_length` has exact `int` type and is positive;
+- `joint_separator_token_ids` is already a `frozenset`; every member has exact
+  non-negative `int` type and differs from pad and all media sentinel IDs.
+  Wrapper IDs may be explicitly whitelisted. The pipeline never normalizes a
+  list, set, iterator, bool, or other mutable/ambiguous input;
+- the encoders are respectively `PatchVisionEncoder`,
+  `TemporalVideoEncoder`, and `AudioWindowEncoder`, and their exact
+  `hidden_size` values agree;
+- `assembler` is a `SequenceAssembler`; the non-`None` policy exposes callable
+  `expand_sample`, and the builder exposes callable `build`;
+- assembler, policy, and builder are parameter-free non-`nn.Module` objects.
+  Use structural callable validation rather than `isinstance()` against a
+  non-runtime-checkable protocol.
 
-- [ ] **Step 4: Add ablation and ordering tests**
+The pipeline is cast-free at its orchestration boundary. It never moves or
+casts `input_ids`, masks, labels, base text embeddings, or encoder-produced
+sequences. Only the encoders may move/cast decoded float tensors. The caller
+must put the external text embedding and all registered encoders on one device
+and floating dtype. A BF16 pipeline paired with an FP32 text embedding fails;
+there is no implicit CPU/GPU or FP32/BF16 fallback. Video receives the exact
+registered `self.image_encoder` object, but never registers it as a child.
+
+`forward()` follows this non-negotiable execution order:
+
+1. Validate the Task 5 text preflight before any embedding, encoder, policy,
+   assembler, or builder call: tensors have exact ranks and coupled `[B,T]`
+   shapes with non-empty dimensions; IDs/labels are long; IDs are
+   non-negative; labels contain only `-100` or non-negative values; the mask is
+   binary with a non-empty right-padded prefix per row; all coupled tensors
+   share a device; masked IDs equal the exact pad ID and masked labels equal
+   `-100`. `labels=None` remains valid.
+2. Require `decoded_media` to be a non-string `Sequence`, snapshot it to a
+   tuple without mutation, and require every entry to be `DecodedMedia`.
+   Before encoder work, globally validate final request keys against batch
+   size: every `sample_index` is in range; `(sample_index,item_index)` and
+   `(sample_index,source_id)` are unique across all modalities; and each
+   sample's item indices are exactly `0..N-1`. Never repair/reindex requests.
+3. Sort the snapshot by `(sample_index,item_index)`, then partition in the
+   fixed order IMAGE, VIDEO, AUDIO. This is the canonical public
+   `media_sequences` order; it is intentionally independent of the prompt
+   order later represented by assembled spans.
+4. Require `text_embedding` to be callable and invoke
+   `text_embedding(input_ids)` exactly once with the original rank-2 tensor.
+   Require a floating non-complex tensor of exact shape `[B,T,H]`, on
+   `input_ids.device`, with `H` equal to the encoders' common hidden size.
+   Never assign/cache the callable on `self`. On every call, collect all
+   floating parameters from all three registered encoders, require a non-empty
+   collection with one exact common `(device,dtype)` pair, and require the base
+   text embedding to match it. This applies when `decoded_media=()` or a
+   modality is omitted and is repeated per call because a caller may move one
+   child module independently after construction.
+5. Invoke exactly one top-level encoder `forward` for each non-empty canonical
+   partition and no encoder for an empty partition. For video call
+   `video_encoder(items, patch_encoder=self.image_encoder)`; its internal patch
+   helper use is not a second image-encoder `forward`.
+6. Require each result to be `MediaSequence`, call `validate()`, require its
+   modality to equal the partition modality, and require its sources to equal
+   the partition requests converted to `MediaSource` in canonical order.
+   Require embeddings to match the base text hidden size, dtype, and device.
+7. Call the assembler exactly once with every explicit argument:
+
+   ```python
+   assembled = self.assembler.assemble(
+       input_ids=input_ids,
+       text_embeddings=text_embeddings,
+       attention_mask=attention_mask,
+       labels=labels,
+       media_sequences=media_sequences,
+       tokens=self.tokens,
+       expansion_policy=self.expansion_policy,
+       embedding_lookup=text_embedding,
+       pad_token_id=self.pad_token_id,
+       joint_separator_token_ids=self.joint_separator_token_ids,
+       max_assembled_length=self.max_assembled_length,
+   )
+   ```
+
+   The same non-owning callable is used for Task 5 timestamp markers. Total
+   lookup count is one base rank-2 call plus one rank-1 call for each assembled
+   row whose policy expansion contains at least one
+   `SequenceSpanKind.TIMESTAMP` token. Timestamped MEDIA spans alone never
+   trigger a lookup. A hard-length failure occurs after the base call/required
+   encoding, but before all rank-1 timestamp lookups.
+8. Require an `AssembledSequence` and call `assembled.validate()`.
+9. Call `position_builder.build(assembled)` exactly once. It is never called
+   if assembly or assembled validation fails.
+10. Require a `PositionBatch` and call
+    `positions.validate(assembled.attention_mask)`.
+11. Return the frozen output without adding diagnostic fields or mutating an
+    input. Malformed custom returns fail explicitly, never via a later
+    incidental attribute error.
+
+`decoded_media=()` is valid for non-empty text. It makes no encoder call and
+returns `media_sequences=()`, while the base embedding, assembler, and builder
+still run. For a subset, only present encoders run and no empty/fake sequence
+is synthesized. Mixed text-only/media rows and `labels=None` are valid; an
+empty text batch/sequence is not.
+
+The collator remains the only quarantine owner. This pipeline accepts retained
+text tensors and final dense `DecodedMedia` requests, but never decodes,
+quarantines, removes rows, catches `MediaLoadError`, synthesizes missing media,
+or copies `_sample_ids`/`_media_errors` into its output. "Direct" collator use
+means explicitly passing its four model fields plus `text_embedding`, not
+`encode_and_assemble(**collated)`, and the pipeline does not accept/ignore
+arbitrary keyword fields.
+
+Every caller supplies a matched policy/builder pair. The generic constructor
+performs structural validation only and never claims semantic compatibility:
+
+- Qwen3 disjoint: `IdentityMediaExpansion` with
+  `Qwen3DisjointPositionBuilder(Qwen3DisjointPositionConfig(
+  position_id_per_seconds=13.0, rotary_sections=(24,20,20)))`;
+- Qwen3.5-inspired experiment: `TimestampInterleaveExpansion` and
+  `TMRoPEPositionBuilder(TMRoPEConfig(temporal_seconds_per_id=0.16,
+  rotary_sections=(24,20,20)))` with the same literal 160 ms quantum;
+- MiMo: only its later explicitly declared experimental pair.
+
+No profile-name conditionals, attribute introspection, implicit factory, or
+checkpoint-compatibility claim is permitted here. Full Qwen3 joint-AV runtime
+parity remains owned by the later reference-runtime adapter/oracle plan.
+
+- [ ] **Step 4: Add strict constructor, ownership, and call-order tests**
 
 Test:
 
-- shuffling the transport container while preserving each
-  `(sample_index,item_index)` key leaves assembled output unchanged;
-- a deliberate ablation that swaps payload-to-source association changes
-  embeddings while spans continue to identify the declared sources;
-- omitted media leaves no media span;
-- duplicate sample-local source IDs fail;
-- assembled hard limit reports text/media token counts;
-- gradients flow to selected encoder/projector and text embedding;
-- `state_dict()` contains image, video-specific and audio parameters exactly
-  once, and `.to(dtype=...)` moves all registered encoder parameters;
-- media labels remain ignored;
-- Qwen3 disjoint-media `13 IDs/second` and experimental 160 ms configs produce
-  their separately specified temporal IDs without a false joint-AV
-  compatibility claim;
-- `TimestampInterleaveExpansion` produces true cross-modal
-  audio0→video0→audio1→video1 token order, not merely equal temporal position
-  IDs on modality-contiguous blocks;
-- a bad first row quarantined by `ProfileStage2Collator` can be passed directly
-  into prefill: dense reindexing and transport-independent assembly remain
-  correct end to end.
+- wrong encoder concrete types, unequal hidden sizes, malformed assembler,
+  missing/malformed policy/builder, and any orchestration component that is an
+  `nn.Module` fail at construction;
+- bool/string/negative pad/limit values, malformed/colliding resolved tokens,
+  mutable separators, bool/negative separator members, and pad/sentinel
+  collisions fail; explicitly whitelisted wrapper IDs remain valid;
+- only image, video-specific, and audio encoder parameters appear in
+  `state_dict()`/`named_parameters()`, each exactly once. No patch subtree is
+  nested below video and no external embedding appears before or after calls;
+- `.to(dtype=...)` moves every registered floating encoder parameter, and
+  video receives the exact registered image encoder;
+- the base rank-2 lookup occurs exactly once; only rows whose policy expansion
+  emits at least one `TIMESTAMP` token add the exact Task 5 rank-1 call.
+  Timestamped MEDIA under identity expansion adds none. Callable non-modules
+  work. Wrong lookup type, rank, shape, hidden size, dtype, or device fails
+  explicitly;
+- malformed text IDs/masks/labels fail before lookup, encoder, policy,
+  assembler, or builder calls; `labels=None` and non-zero pad IDs work;
+- malformed fake encoder/assembler/builder results fail at their declared
+  boundary. Assembler and builder each run exactly once when valid, and module
+  hooks fire through both `pipeline(...)` and `encode_and_assemble(...)`;
+- at the hard limit the base lookup and media encoding occurred, no rank-1
+  timestamp lookup or builder call occurred, and every
+  `AssembledLengthError` field is preserved.
 
-- [ ] **Step 5: Document the profile boundary**
+- [ ] **Step 5: Add dtype, ordering, omission, gradient, and quarantine tests**
 
-Update README:
+Test:
+
+- FP32 decoded tensors with pipeline plus external embedding moved to BF16
+  produce BF16 assembled embeddings and finite gradients; a BF16 pipeline plus
+  FP32 external embedding fails rather than casting, including with
+  `decoded_media=()`. Moving/casting one omitted encoder away from the other
+  two fails before every encoder, policy, assembler, and builder call, while a
+  matched text-only BF16 path succeeds. Add matched/mismatched CUDA tests when
+  CUDA exists, and preserve FP32 timestamps on output device;
+- a transport shuffle leaves the complete result unchanged: canonical fixed
+  modality and per-modality source order, masks, embeddings, grids,
+  timestamps, assembled tensors/spans, and positions;
+- cross-modality duplicate item keys/source IDs, out-of-range samples, and
+  item-index gaps fail before encoder calls and are never repaired;
+- a payload/request swap changes source-associated embeddings while spans keep
+  the declared source keys;
+- every modality subset, `decoded_media=()`, a mixed text-only/media batch,
+  and `labels=None` call only present encoders, produce no fake sequence/span,
+  and preserve ignored media labels;
+- parameterize the text-only path over `IdentityMediaExpansion` paired with
+  both Qwen3-disjoint and experimental TM-RoPE builders: no encoder call,
+  `media_sequences=()`, exactly one rank-2 base lookup and no rank-1 marker
+  lookup, only TEXT spans, and validated builder-specific three-axis
+  positions/deltas;
+- gradients reach image parameters through image and video-only paths,
+  video-specific parameters through video, audio parameters through audio, and
+  the external text embedding. Omitted modality parameters receive no
+  fabricated gradient;
+- Qwen3 disjoint uses literal expected `13 IDs/second` positions; the 160 ms
+  experiment uses a literal matching policy/builder pair and produces actual
+  audio0→video0→audio1→video1 assembled media order with timestamp markers;
+- a bad first collator row and retained good row prove dense final
+  `sample_index == 0`, preserved `original_sample_index`, external diagnostics,
+  no mutation, and full-result shuffle invariance. Encoder/assembler failures
+  propagate instead of becoming quarantine, and all-quarantined input fails in
+  the collator before the pipeline is called.
+
+- [ ] **Step 6: Export the public API and document the profile boundary**
+
+Export `MultimodalPrefillPipeline` and `MultimodalPrefillOutput` from
+`multimodal.__init__` and add a public import test. Update README:
 
 - legacy still uses one-token prepend and is unchanged;
 - new experimental profiles must use `MultimodalPrefillPipeline`;
+- show explicit field reuse from the collator instead of `**collated`;
+- show that callers co-locate the externally owned text embedding and the
+  pipeline encoders, and that the pipeline performs no implicit casts;
 - the common Qwen3 disjoint builder uses pinned fixed vectors/implementation as
   its non-skippable numerical oracle; full joint-AV Qwen3 reference execution
   remains on the official facade in the later runtime plan, with the cached
   processor as an additional integration oracle;
-- passing these common tests means sequence semantics are implemented, not
-  official checkpoint compatibility.
+- policy/builder compatibility is caller-owned; passing common tests means
+  sequence semantics are implemented, not Qwen3, Qwen3.5, or MiMo checkpoint
+  compatibility.
 
-- [ ] **Step 6: Run focused and full suites**
+- [ ] **Step 7: Run focused and full suites**
 
 Run:
 
@@ -1875,10 +2053,11 @@ PYTHONDONTWRITEBYTECODE=1 .venv-prototype/bin/python \
 
 Expected: all focused and full-suite tests pass.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add src/qwen3_omni_pretrain/multimodal/prefill.py \
+  src/qwen3_omni_pretrain/multimodal/__init__.py \
   tests/multimodal/test_multimodal_prefill.py README.md
 git commit -m "feat: add sequence-preserving multimodal prefill"
 ```
