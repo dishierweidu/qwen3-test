@@ -15,6 +15,18 @@ from qwen3_omni_pretrain.profiles.legacy_prototype.config_adapter import (
     load_legacy_config_dict,
 )
 
+_THINKER_STRUCTURAL_MIRROR_FIELDS = (
+    "hidden_size",
+    "intermediate_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "max_position_embeddings",
+    "use_moe",
+    "num_experts",
+    "num_experts_per_tok",
+)
+
 
 @dataclass
 class Qwen3OmniMoeThinkerConfig:
@@ -264,9 +276,19 @@ class Qwen3OmniMoeConfig(PretrainedConfig):
 
         self.headwise_attn_output_gate = self.thinker_config.headwise_attn_output_gate
         self.elementwise_attn_output_gate = self.thinker_config.elementwise_attn_output_gate
+        self._sync_thinker_structural_mirrors()
+
+    def _sync_thinker_structural_mirrors(self) -> None:
+        for field_name in _THINKER_STRUCTURAL_MIRROR_FIELDS:
+            setattr(
+                self,
+                field_name,
+                getattr(self.thinker_config, field_name),
+            )
 
     def to_dict(self):
         # 确保保存到磁盘时，子配置能转成可 JSON 序列化的 dict
+        self._sync_thinker_structural_mirrors()
         serialization_copy = copy(self)
         serialization_copy.profile_manifest = self.profile_manifest.to_dict()
         output = PretrainedConfig.to_dict(serialization_copy)

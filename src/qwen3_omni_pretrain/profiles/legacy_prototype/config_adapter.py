@@ -50,12 +50,17 @@ def adapt_legacy_config_dict(
     else:
         num_experts = int(thinker.get("num_experts", 8))
         top_k = int(thinker.get("num_experts_per_tok", 2))
+        if num_experts <= 0:
+            raise ValueError("legacy num_experts must be positive")
+        if not 1 <= top_k <= num_experts:
+            raise ValueError(
+                "legacy num_experts_per_tok must be between 1 and "
+                "num_experts"
+            )
         if top_k < num_experts:
             thinker["routing_kind"] = "sparse"
-        elif top_k == num_experts:
-            thinker["routing_kind"] = "dense_ensemble"
         else:
-            raise ValueError("legacy top-k cannot exceed num_experts")
+            thinker["routing_kind"] = "dense_ensemble"
     migrated["thinker_config"] = thinker
     migrated["architecture_profile"] = "legacy_prototype"
     return migrated
