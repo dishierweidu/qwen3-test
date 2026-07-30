@@ -13,6 +13,17 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 
+from qwen3_omni_pretrain.architecture.checkpoint_metadata import (
+    CheckpointMetadata,
+    load_checkpoint_metadata,
+    write_checkpoint_metadata,
+)
+from qwen3_omni_pretrain.architecture.profiles import (
+    ArchitectureProfile,
+    CompatibilityLevel,
+)
+from qwen3_omni_pretrain.architecture.summary import ArchitectureSummary
+
 try:
     from accelerate import Accelerator, DistributedType
     from accelerate.utils import (
@@ -343,6 +354,8 @@ def save_tp_sharded_checkpoint(
     global_step: int,
     best_val_loss: float,
     tokenizer=None,
+    *,
+    metadata: CheckpointMetadata,
 ) -> str:
     """TP 安全的分片检查点保存：每个 rank 写自己 shard，rank0 写 manifest。"""
 
@@ -384,6 +397,7 @@ def save_tp_sharded_checkpoint(
 
         if tokenizer is not None:
             tokenizer.save_pretrained(checkpoint_dir)
+        write_checkpoint_metadata(checkpoint_dir, metadata)
 
     accelerator.wait_for_everyone()
     print(f"[rank{rank}] >>> save: done", flush=True)
@@ -400,6 +414,8 @@ def save_accelerator_checkpoint(
     model: Optional[torch.nn.Module] = None,
     optimizer: Optional[torch.optim.Optimizer] = None,
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+    *,
+    metadata: CheckpointMetadata,
 ) -> str:
     """通用保存：TP>1 走分片，其余保持原行为。"""
 
@@ -418,6 +434,7 @@ def save_accelerator_checkpoint(
             global_step=global_step,
             best_val_loss=best_val_loss,
             tokenizer=tokenizer,
+            metadata=metadata,
         )
 
     # 非 TP：使用 Accelerate 内建保存
@@ -432,6 +449,7 @@ def save_accelerator_checkpoint(
         torch.save(state, os.path.join(checkpoint_dir, "trainer_state.pt"))
         if tokenizer is not None:
             tokenizer.save_pretrained(checkpoint_dir)
+        write_checkpoint_metadata(checkpoint_dir, metadata)
 
     accelerator.wait_for_everyone()
     return checkpoint_dir
@@ -443,11 +461,26 @@ def load_accelerator_checkpoint(
     model: Optional[torch.nn.Module] = None,
     optimizer: Optional[torch.optim.Optimizer] = None,
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+    *,
+    expected_profile: ArchitectureProfile | None = None,
+    expected_compatibility: CompatibilityLevel | None = None,
+    expected_architecture: ArchitectureSummary | None = None,
+    expected_tokenizer_sha256: str | None = None,
+    legacy_config: object | None = None,
 ) -> Tuple[int, int, float]:
     """
     加载检查点：TP>1 且存在 train.pt 时走自定义加载，否则使用 accelerator.load_state。
     """
     accelerator.wait_for_everyone()
+
+    load_checkpoint_metadata(
+        checkpoint_dir,
+        expected_profile=expected_profile,
+        expected_compatibility=expected_compatibility,
+        expected_architecture=expected_architecture,
+        expected_tokenizer_sha256=expected_tokenizer_sha256,
+        legacy_config=legacy_config,
+    )
 
     tp = get_tensor_model_parallel_world_size() if dist.is_initialized() else 1
     train_pt = os.path.join(checkpoint_dir, "train.pt")

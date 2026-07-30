@@ -8,6 +8,17 @@ from typing import Optional, Tuple, TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
+from qwen3_omni_pretrain.architecture.checkpoint_metadata import (
+	CheckpointMetadata,
+	load_checkpoint_metadata,
+	write_checkpoint_metadata,
+)
+from qwen3_omni_pretrain.architecture.profiles import (
+	ArchitectureProfile,
+	CompatibilityLevel,
+)
+from qwen3_omni_pretrain.architecture.summary import ArchitectureSummary
+
 try:
 	from transformers.trainer_utils import load_sharded_checkpoint
 except ImportError:
@@ -79,6 +90,9 @@ def atomic_save_checkpoint(
 	best_val_loss: float,
 	verify: bool = True,
 	keep_backup: bool = True,
+	*,
+	metadata: CheckpointMetadata,
+	tokenizer=None,
 ) -> str:
 	"""
 	原子性保存 checkpoint，防止保存中断导致文件损坏。
@@ -133,6 +147,9 @@ def atomic_save_checkpoint(
 			"scaler": scaler.state_dict() if scaler is not None else None,
 		}
 		torch.save(state, os.path.join(temp_dir, "trainer_state.pt"))
+		if tokenizer is not None:
+			tokenizer.save_pretrained(temp_dir)
+		write_checkpoint_metadata(temp_dir, metadata)
 		
 		# 验证完整性（只检查 trainer_state，模型检查太慢）
 		if verify:
@@ -173,6 +190,9 @@ def save_checkpoint(
 	epoch: int,
 	global_step: int,
 	best_val_loss: float,
+	*,
+	metadata: CheckpointMetadata,
+	tokenizer=None,
 ) -> str:
 	"""Persist model (HF format) plus training state into checkpoint_dir.
 	
@@ -189,6 +209,8 @@ def save_checkpoint(
 		best_val_loss=best_val_loss,
 		verify=True,
 		keep_backup=True,
+		metadata=metadata,
+		tokenizer=tokenizer,
 	)
 
 
@@ -199,6 +221,12 @@ def load_checkpoint(
 	scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
 	scaler: Optional[torch.cuda.amp.GradScaler] = None,
 	map_location: Optional[torch.device] = None,
+	*,
+	expected_profile: ArchitectureProfile | None = None,
+	expected_compatibility: CompatibilityLevel | None = None,
+	expected_architecture: ArchitectureSummary | None = None,
+	expected_tokenizer_sha256: str | None = None,
+	legacy_config: object | None = None,
 ) -> Tuple[int, int, float]:
 	"""
 	Load model + optimizer/scheduler/scaler state from checkpoint_dir.
@@ -216,6 +244,14 @@ def load_checkpoint(
 	last_error = None
 	for try_dir in dirs_to_try:
 		try:
+			load_checkpoint_metadata(
+				try_dir,
+				expected_profile=expected_profile,
+				expected_compatibility=expected_compatibility,
+				expected_architecture=expected_architecture,
+				expected_tokenizer_sha256=expected_tokenizer_sha256,
+				legacy_config=legacy_config,
+			)
 			return _load_checkpoint_impl(try_dir, model, optimizer, scheduler, scaler, map_location)
 		except (RuntimeError, FileNotFoundError) as e:
 			last_error = e
@@ -300,6 +336,8 @@ def save_checkpoint_accelerator(
 	global_step: int,
 	best_val_loss: float,
 	tokenizer=None,
+	*,
+	metadata: CheckpointMetadata,
 ) -> str:
 	"""
 	使用 Accelerator 保存检查点（原子写入）
@@ -353,6 +391,7 @@ def save_checkpoint_accelerator(
 		# 保存 tokenizer
 		if tokenizer is not None:
 			tokenizer.save_pretrained(temp_dir)
+		write_checkpoint_metadata(temp_dir, metadata)
 		
 		# 验证 trainer_state 完整性
 		try:
@@ -375,6 +414,12 @@ def save_checkpoint_accelerator(
 def load_checkpoint_accelerator(
 	accelerator: "Accelerator",
 	checkpoint_dir: str,
+	*,
+	expected_profile: ArchitectureProfile | None = None,
+	expected_compatibility: CompatibilityLevel | None = None,
+	expected_architecture: ArchitectureSummary | None = None,
+	expected_tokenizer_sha256: str | None = None,
+	legacy_config: object | None = None,
 ) -> Tuple[int, int, float]:
 	"""
 	使用 Accelerator 加载检查点
@@ -403,6 +448,14 @@ def load_checkpoint_accelerator(
 	last_error = None
 	for try_dir in dirs_to_try:
 		try:
+			load_checkpoint_metadata(
+				try_dir,
+					expected_profile=expected_profile,
+					expected_compatibility=expected_compatibility,
+					expected_architecture=expected_architecture,
+					expected_tokenizer_sha256=expected_tokenizer_sha256,
+					legacy_config=legacy_config,
+			)
 			# 加载 accelerator 状态
 			accelerator.load_state(try_dir)
 			
@@ -435,6 +488,8 @@ def save_model_only_accelerator(
 	model: torch.nn.Module,
 	save_dir: str,
 	safe_serialization: bool = True,
+	*,
+	metadata: CheckpointMetadata,
 ) -> str:
 	"""
 	仅保存模型权重（用于推理/发布）
@@ -467,6 +522,7 @@ def save_model_only_accelerator(
 			safe_serialization=safe_serialization,
 			max_shard_size="2GB",
 		)
+		write_checkpoint_metadata(save_dir, metadata)
 		print("[rank0] >>> save_only_model: after save_pretrained", flush=True)
 
 	accelerator.wait_for_everyone()
