@@ -27,11 +27,11 @@ def _add_request_arguments(
         required=True,
         help="Local config/checkpoint path or a reference model ID.",
     )
-    parser.add_argument(
-        "--dtype",
-        help="Optional build dtype (legacy inspection only).",
-    )
     if include_inspection_options:
+        parser.add_argument(
+            "--dtype",
+            help="Optional build dtype (legacy inspection only).",
+        )
         parser.add_argument(
             "--tokenizer",
             help="Optional tokenizer source (legacy inspection only).",
@@ -47,8 +47,8 @@ def _add_request_arguments(
             "--allow-network",
             action="store_true",
             help=(
-                "Permit lazy loaders to use the network; offline is the "
-                "default."
+                "Permit the legacy tokenizer lookup to use the network; "
+                "offline is the default."
             ),
         )
     parser.add_argument(
@@ -88,6 +88,36 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _validate_cli_options(
+    args: argparse.Namespace,
+    profile: ArchitectureProfile,
+) -> None:
+    if args.command != "inspect":
+        return
+    if (
+        args.dtype is not None
+        and profile is not ArchitectureProfile.LEGACY_PROTOTYPE
+    ):
+        raise ValueError(
+            "--dtype is only valid for legacy_prototype inspection"
+        )
+    if (
+        args.tokenizer is not None
+        and profile is not ArchitectureProfile.LEGACY_PROTOTYPE
+    ):
+        raise ValueError(
+            "--tokenizer is only valid for legacy_prototype inspection"
+        )
+    if args.allow_network and not (
+        profile is ArchitectureProfile.LEGACY_PROTOTYPE
+        and args.tokenizer is not None
+    ):
+        raise ValueError(
+            "--allow-network requires legacy_prototype inspection "
+            "with --tokenizer"
+        )
+
+
 def _request_from_args(
     args: argparse.Namespace,
     profile: ArchitectureProfile,
@@ -105,7 +135,7 @@ def _request_from_args(
         config_or_checkpoint=args.config_or_checkpoint,
         tokenizer=getattr(args, "tokenizer", None),
         local_files_only=not getattr(args, "allow_network", False),
-        dtype=args.dtype,
+        dtype=getattr(args, "dtype", None),
         device=device,
         requested_capabilities=tuple(
             getattr(args, "requested_capabilities", ())
@@ -136,11 +166,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         profile = parse_profile(args.profile)
+        _validate_cli_options(args, profile)
         factory = get_profile_factory(profile)
         request = _request_from_args(args, profile)
         if args.command == "validate":
-            factory.validate(request)
-            payload = factory.manifest(request).to_dict()
+            payload = factory.validate(request).to_dict()
         else:
             result = factory.build(request)
             payload = {

@@ -104,7 +104,10 @@ class ProfileFactory(Protocol):
     ) -> ProfileManifest:
         ...
 
-    def validate(self, request: ProfileBuildRequest) -> None:
+    def validate(
+        self,
+        request: ProfileBuildRequest,
+    ) -> ProfileManifest:
         ...
 
     def build(

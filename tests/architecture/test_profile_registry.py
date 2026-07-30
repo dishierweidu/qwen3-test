@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 import hashlib
 import importlib
 import json
@@ -16,7 +17,6 @@ from qwen3_omni_pretrain.architecture.profiles import (
 from qwen3_omni_pretrain.profiles.qwen3_omni_reference.pins import (
     QWEN3_OMNI_MODEL_ID,
     QWEN3_OMNI_REVISION,
-    QWEN3_TRANSFORMERS_VERSION,
 )
 from qwen3_omni_pretrain.profiles.registry import (
     ProfileBuildRequest,
@@ -53,6 +53,7 @@ def _write_tiny_legacy_config(path: Path) -> Path:
 
 def _write_reference_snapshot(path: Path) -> dict[str, str]:
     artifact_payloads = {
+        "README.md": b"samplerate=24000",
         "chat_template.json": b'{"chat_template":"pinned"}',
         "config.json": b'{"model_type":"qwen3_omni_moe"}',
         "merges.txt": b"#version: 0.2\\na b\\n",
@@ -66,6 +67,17 @@ def _write_reference_snapshot(path: Path) -> dict[str, str]:
         filename: hashlib.sha256(payload).hexdigest()
         for filename, payload in artifact_payloads.items()
     }
+
+
+def _to_json_value(value):
+    if isinstance(value, Mapping):
+        return {
+            key: _to_json_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return [_to_json_value(item) for item in value]
+    return value
 
 
 def test_registry_does_not_import_reference_backend_for_legacy(
@@ -101,10 +113,11 @@ def test_legacy_factory_validates_and_builds_a_real_local_model(tmp_path):
     )
     factory = get_profile_factory(request.profile)
 
-    factory.validate(request)
+    validated_manifest = factory.validate(request)
     manifest = factory.manifest(request)
     result = factory.build(request)
 
+    assert validated_manifest == manifest
     assert manifest.architecture_profile is (
         ArchitectureProfile.LEGACY_PROTOTYPE
     )
@@ -194,13 +207,22 @@ def test_legacy_factory_builds_old_checkpoint_directory_with_one_warning(
 
 
 def test_reference_factory_builds_offline_oracle_artifact_without_weights(
+    tmp_path,
     monkeypatch,
 ):
     factory = get_profile_factory(
         ArchitectureProfile.QWEN3_OMNI_REFERENCE
     )
     factory_module = importlib.import_module(type(factory).__module__)
+    artifact_sha256 = _write_reference_snapshot(tmp_path)
     loader_calls: list[tuple[str, str, bool]] = []
+    download_calls: list[tuple[str, str, str, bool]] = []
+
+    def download(*, repo_id, filename, revision, local_files_only):
+        download_calls.append(
+            (repo_id, filename, revision, local_files_only)
+        )
+        return str(tmp_path / filename)
 
     def load_config(source, *, local_files_only):
         loader_calls.append(("config", source, local_files_only))
@@ -220,6 +242,14 @@ def test_reference_factory_builds_offline_oracle_artifact_without_weights(
         "load_reference_processor",
         load_processor,
     )
+    monkeypatch.setattr(
+        factory_module,
+        "_QWEN3_LOCAL_ARTIFACT_SHA256",
+        artifact_sha256,
+    )
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", download)
     request = ProfileBuildRequest(
         profile=ArchitectureProfile.QWEN3_OMNI_REFERENCE,
         config_or_checkpoint=QWEN3_OMNI_MODEL_ID,
@@ -231,26 +261,44 @@ def test_reference_factory_builds_offline_oracle_artifact_without_weights(
     result = factory.build(request)
 
     assert loader_calls == []
+    assert download_calls == []
     assert type(result.artifact).__name__ == "Qwen3OracleArtifact"
-    assert result.artifact.config_contract["source"] == {
-        "model_id": QWEN3_OMNI_MODEL_ID,
-        "revision": QWEN3_OMNI_REVISION,
-        "transformers_version": QWEN3_TRANSFORMERS_VERSION,
-        "artifact_sha256": json.loads(
-            Path(
-                "tests/fixtures/qwen3_omni/processor_contract.json"
-            ).read_text(encoding="utf-8")
-        )["source"]["artifact_sha256"],
-    }
-    assert result.artifact.config_contract["fields"][
-        "thinker.num_hidden_layers"
-    ] == 48
+    expected_contract = json.loads(
+        Path(
+            "tests/fixtures/qwen3_omni/config_contract.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert _to_json_value(result.artifact.config_contract) == (
+        expected_contract
+    )
+    assert result.artifact.config_contract["audio_encoder"][
+        "input_sample_rate_hz"
+    ] == 16_000
+    assert result.artifact.config_contract["code2wav"][
+        "output_sample_rate_hz"
+    ] == 24_000
+    assert result.artifact.config_contract["vocabulary"][
+        "regular_vocab_size"
+    ] == 151_643
+    assert "README.md" in result.artifact.config_contract["source"][
+        "artifacts"
+    ]
     assert result.artifact.load_config() == "config"
     assert result.artifact.load_processor() == "processor"
     assert loader_calls == [
-        ("config", QWEN3_OMNI_MODEL_ID, True),
-        ("processor", QWEN3_OMNI_MODEL_ID, True),
+        ("config", str(tmp_path), True),
+        ("processor", str(tmp_path), True),
     ]
+    expected_downloads = [
+        (
+            QWEN3_OMNI_MODEL_ID,
+            filename,
+            QWEN3_OMNI_REVISION,
+            True,
+        )
+        for filename in artifact_sha256
+    ]
+    assert download_calls == expected_downloads * 2
     assert result.manifest.architecture_profile is (
         ArchitectureProfile.QWEN3_OMNI_REFERENCE
     )
@@ -286,6 +334,10 @@ def test_reference_factory_builds_offline_oracle_artifact_without_weights(
     assert not hasattr(result.artifact.load_config, "keywords")
     with pytest.raises(TypeError):
         result.artifact.config_contract["source"]["revision"] = "changed"
+    with pytest.raises(TypeError):
+        result.artifact.config_contract["audio_encoder"][
+            "projector_dimensions"
+        ][0] = 0
 
 
 def test_reference_factory_rejects_unpinned_remote_source():
@@ -397,6 +449,144 @@ def test_reference_lazy_loaders_revalidate_local_snapshot(
     with pytest.raises(ValueError, match="do not match pinned"):
         getattr(result.artifact, loader_name)()
     assert delegated == []
+
+
+@pytest.mark.parametrize(
+    ("filename", "loader_name"),
+    [
+        ("config.json", "load_config"),
+        ("README.md", "load_processor"),
+    ],
+)
+def test_reference_lazy_loaders_revalidate_resolved_cached_metadata(
+    tmp_path,
+    monkeypatch,
+    filename,
+    loader_name,
+):
+    artifact_sha256 = _write_reference_snapshot(tmp_path)
+    factory = get_profile_factory(
+        ArchitectureProfile.QWEN3_OMNI_REFERENCE
+    )
+    factory_module = importlib.import_module(type(factory).__module__)
+    monkeypatch.setattr(
+        factory_module,
+        "_QWEN3_LOCAL_ARTIFACT_SHA256",
+        artifact_sha256,
+    )
+    download_calls = []
+    delegated = []
+
+    def download(*, repo_id, filename, revision, local_files_only):
+        download_calls.append(filename)
+        return str(tmp_path / filename)
+
+    def delegate(source, *, local_files_only):
+        delegated.append((source, local_files_only))
+        return "loaded"
+
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", download)
+    monkeypatch.setattr(factory_module, "load_reference_config", delegate)
+    monkeypatch.setattr(
+        factory_module,
+        "load_reference_processor",
+        delegate,
+    )
+    request = ProfileBuildRequest(
+        profile=ArchitectureProfile.QWEN3_OMNI_REFERENCE,
+        config_or_checkpoint=QWEN3_OMNI_MODEL_ID,
+    )
+    result = factory.build(request)
+    assert download_calls == []
+    (tmp_path / filename).write_bytes(b"modified after build")
+
+    with pytest.raises(ValueError, match="do not match pinned"):
+        getattr(result.artifact, loader_name)()
+    assert filename in download_calls
+    assert delegated == []
+
+
+@pytest.mark.parametrize(
+    ("loader_name", "delegate_name"),
+    [
+        ("load_config", "config"),
+        ("load_processor", "processor"),
+    ],
+)
+@pytest.mark.parametrize("local_files_only", [True, False])
+def test_reference_lazy_loaders_resolve_all_pinned_metadata_at_revision(
+    tmp_path,
+    monkeypatch,
+    loader_name,
+    delegate_name,
+    local_files_only,
+):
+    artifact_sha256 = _write_reference_snapshot(tmp_path)
+    factory = get_profile_factory(
+        ArchitectureProfile.QWEN3_OMNI_REFERENCE
+    )
+    factory_module = importlib.import_module(type(factory).__module__)
+    monkeypatch.setattr(
+        factory_module,
+        "_QWEN3_LOCAL_ARTIFACT_SHA256",
+        artifact_sha256,
+    )
+    download_calls = []
+    delegated = []
+
+    def download(*, repo_id, filename, revision, local_files_only):
+        download_calls.append(
+            (repo_id, filename, revision, local_files_only)
+        )
+        return str(tmp_path / filename)
+
+    def config_delegate(source, *, local_files_only):
+        delegated.append(("config", source, local_files_only))
+        return "config"
+
+    def processor_delegate(source, *, local_files_only):
+        delegated.append(("processor", source, local_files_only))
+        return "processor"
+
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", download)
+    monkeypatch.setattr(
+        factory_module,
+        "load_reference_config",
+        config_delegate,
+    )
+    monkeypatch.setattr(
+        factory_module,
+        "load_reference_processor",
+        processor_delegate,
+    )
+    request = ProfileBuildRequest(
+        profile=ArchitectureProfile.QWEN3_OMNI_REFERENCE,
+        config_or_checkpoint=QWEN3_OMNI_MODEL_ID,
+        local_files_only=local_files_only,
+    )
+    result = factory.build(request)
+
+    assert getattr(result.artifact, loader_name)() == delegate_name
+    assert download_calls == [
+        (
+            QWEN3_OMNI_MODEL_ID,
+            filename,
+            QWEN3_OMNI_REVISION,
+            local_files_only,
+        )
+        for filename in artifact_sha256
+    ]
+    assert delegated == [
+        (delegate_name, str(tmp_path), True)
+    ]
+    assert all(
+        not filename.endswith((".bin", ".safetensors"))
+        for _, filename, _, _ in download_calls
+    )
 
 
 def test_reference_factory_rejects_incomplete_local_snapshot(

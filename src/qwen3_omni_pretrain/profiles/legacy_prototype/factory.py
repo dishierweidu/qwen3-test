@@ -112,8 +112,11 @@ class LegacyPrototypeFactory:
     ) -> ProfileManifest:
         return self._config(request).profile_manifest
 
-    def validate(self, request: ProfileBuildRequest) -> None:
-        self._config(request)
+    def validate(
+        self,
+        request: ProfileBuildRequest,
+    ) -> ProfileManifest:
+        return self._config(request).profile_manifest
 
     def build(
         self,

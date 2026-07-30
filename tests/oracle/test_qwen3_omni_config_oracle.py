@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 import copy
 import importlib
 import json
@@ -28,6 +29,23 @@ from tests.oracle.extract_qwen3_omni_config_contract import extract_contract
 
 
 CONTRACT_PATH = Path("tests/fixtures/qwen3_omni/config_contract.json")
+
+
+class _PinnedTokenizerVocab(Mapping[str, int]):
+    def __len__(self):
+        return 151_643
+
+    def __iter__(self):
+        return (str(index) for index in range(len(self)))
+
+    def __getitem__(self, key):
+        index = int(key)
+        if index < 0 or index >= len(self):
+            raise KeyError(key)
+        return index
+
+    def values(self):
+        return range(len(self))
 
 
 def _pinned_config() -> SimpleNamespace:
@@ -233,6 +251,94 @@ def test_checked_in_contract_is_a_small_pinned_provenance_extract():
     assert contract["code_predictor"]["num_hidden_layers"] == 5
     assert contract["code2wav"]["output_sample_rate_hz"] == 24_000
     assert CONTRACT_PATH.stat().st_size < 8_192
+
+
+def test_production_contract_exactly_matches_checked_fixture():
+    from qwen3_omni_pretrain.profiles.qwen3_omni_reference.contract import (
+        config_contract_to_dict,
+    )
+
+    expected = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+
+    assert config_contract_to_dict() == expected
+
+
+def test_production_metadata_hashes_are_config_and_processor_union():
+    from qwen3_omni_pretrain.profiles.qwen3_omni_reference.contract import (
+        QWEN3_OMNI_METADATA_SHA256,
+    )
+
+    config_contract = json.loads(
+        CONTRACT_PATH.read_text(encoding="utf-8")
+    )
+    processor_contract = json.loads(
+        Path(
+            "tests/fixtures/qwen3_omni/processor_contract.json"
+        ).read_text(encoding="utf-8")
+    )
+    expected = dict(
+        processor_contract["source"]["artifact_sha256"]
+    )
+    expected.update(
+        {
+            filename: provenance["sha256"]
+            for filename, provenance in config_contract["source"][
+                "artifacts"
+            ].items()
+        }
+    )
+
+    assert dict(QWEN3_OMNI_METADATA_SHA256) == expected
+    assert set(expected) == {
+        "README.md",
+        "chat_template.json",
+        "config.json",
+        "merges.txt",
+        "preprocessor_config.json",
+        "tokenizer_config.json",
+        "vocab.json",
+    }
+
+
+def test_extractor_parity_guard_rejects_contract_drift():
+    from qwen3_omni_pretrain.profiles.qwen3_omni_reference.contract import (
+        config_contract_to_dict,
+    )
+    from tests.oracle.extract_qwen3_omni_config_contract import (
+        validate_contract_parity,
+    )
+
+    extracted = config_contract_to_dict()
+    validate_contract_parity(extracted)
+    extracted["vocabulary"]["regular_vocab_size"] = 1
+
+    with pytest.raises(ValueError, match="production pinned contract"):
+        validate_contract_parity(extracted)
+
+
+def test_extractor_reproduces_production_and_checked_contract():
+    from qwen3_omni_pretrain.profiles.qwen3_omni_reference.contract import (
+        config_contract_to_dict,
+    )
+    from tests.oracle.extract_qwen3_omni_config_contract import (
+        validate_contract_parity,
+    )
+
+    extracted = extract_contract(
+        _pinned_config(),
+        preprocessor_config={"sampling_rate": 16_000},
+        tokenizer_vocab=_PinnedTokenizerVocab(),
+        model_readme="samplerate=24_000",
+        audio_implementation_contract={
+            "audio_encoder.conv_layers": 3,
+            "audio_encoder.conv_kernel_size": 3,
+            "audio_encoder.conv_stride": 2,
+        },
+    )
+    expected = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+
+    validate_contract_parity(extracted)
+    assert extracted == expected == config_contract_to_dict()
 
 
 def test_contract_extractor_selects_only_the_pinned_architecture_fields():

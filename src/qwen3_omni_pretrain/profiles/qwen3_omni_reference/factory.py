@@ -16,38 +16,21 @@ from qwen3_omni_pretrain.profiles.qwen3_omni_reference import (
     load_reference_processor,
     qwen3_reference_manifest,
 )
+from qwen3_omni_pretrain.profiles.qwen3_omni_reference.contract import (
+    QWEN3_OMNI_CONFIG_CONTRACT,
+    QWEN3_OMNI_METADATA_SHA256,
+    QWEN3_OMNI_MODEL_TYPE,
+)
 from qwen3_omni_pretrain.profiles.qwen3_omni_reference.pins import (
     QWEN3_OMNI_MODEL_ID,
     QWEN3_OMNI_REVISION,
-    QWEN3_TRANSFORMERS_VERSION,
 )
 from qwen3_omni_pretrain.profiles.registry import (
     ProfileBuildRequest,
     ProfileBuildResult,
 )
 
-_QWEN3_LOCAL_ARTIFACT_SHA256: Mapping[str, str] = MappingProxyType(
-    {
-        "chat_template.json": (
-            "90c1b81f29e41b7642b0cc02c877a10c8bf6751a8d8fa1d16ac9a718cf1c3d86"
-        ),
-        "config.json": (
-            "eab5093d47807aaf894119506b238b2b1cee70d08456e894fee9a012d88f2e0d"
-        ),
-        "merges.txt": (
-            "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3"
-        ),
-        "preprocessor_config.json": (
-            "b10e27fd4542cf89ec7145942b87f3e65408d4e9f9d031a29acdd293c15fb3fc"
-        ),
-        "tokenizer_config.json": (
-            "dc3c31c3bdaedd5016382bb3cbe07323026775ad51f5a4fb564505992ae4a670"
-        ),
-        "vocab.json": (
-            "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
-        ),
-    }
-)
+_QWEN3_LOCAL_ARTIFACT_SHA256 = QWEN3_OMNI_METADATA_SHA256
 
 
 @dataclass(frozen=True)
@@ -71,65 +54,41 @@ class Qwen3OracleArtifact:
 
 
 def _pinned_config_contract() -> Mapping[str, object]:
-    # The oracle owns these Task 6 literals. Reading its immutable in-process
-    # contract avoids either duplicating pins or depending on test fixtures.
-    from qwen3_omni_pretrain.profiles.qwen3_omni_reference import oracle
-
-    fields = MappingProxyType(
-        {
-            name: field.expected
-            for name, field in sorted(
-                oracle._CONFIG_CONTRACT_FIELDS.items()
-            )
-        }
-    )
-    implementation_fields = MappingProxyType(
-        dict(sorted(oracle._AUDIO_IMPLEMENTATION_CONTRACT.items()))
-    )
-    source = MappingProxyType(
-        {
-            "model_id": QWEN3_OMNI_MODEL_ID,
-            "revision": QWEN3_OMNI_REVISION,
-            "transformers_version": QWEN3_TRANSFORMERS_VERSION,
-            "artifact_sha256": _QWEN3_LOCAL_ARTIFACT_SHA256,
-        }
-    )
-    return MappingProxyType(
-        {
-            "source": source,
-            "fields": fields,
-            "implementation_fields": implementation_fields,
-        }
-    )
+    return QWEN3_OMNI_CONFIG_CONTRACT
 
 
-def _validate_reference_source(source: str) -> None:
-    if source == QWEN3_OMNI_MODEL_ID:
-        return
-
-    source_path = Path(source)
-    if not source_path.is_dir():
-        raise ValueError(
-            "Qwen3 reference source must be the pinned model ID "
-            f"{QWEN3_OMNI_MODEL_ID!r} or a pinned local snapshot"
-        )
+def _verify_reference_artifacts(
+    artifact_paths: Mapping[str, Path],
+) -> Path:
     missing = [
         filename
         for filename in _QWEN3_LOCAL_ARTIFACT_SHA256
-        if not (source_path / filename).is_file()
+        if filename not in artifact_paths
+        or not artifact_paths[filename].is_file()
     ]
     if missing:
         raise ValueError(
             "Qwen3 reference local snapshot is missing pinned artifacts: "
             + ", ".join(missing)
         )
+
+    snapshot_roots = {
+        artifact_paths[filename].parent
+        for filename in _QWEN3_LOCAL_ARTIFACT_SHA256
+    }
+    if len(snapshot_roots) != 1:
+        raise ValueError(
+            "Qwen3 reference metadata did not resolve to one pinned "
+            "snapshot"
+        )
+
     mismatched = [
         filename
         for filename, expected_sha256 in (
             _QWEN3_LOCAL_ARTIFACT_SHA256.items()
         )
         if hashlib.sha256(
-            (source_path / filename).read_bytes()
+            artifact_paths[filename].read_bytes()
         ).hexdigest()
         != expected_sha256
     ]
@@ -139,6 +98,56 @@ def _validate_reference_source(source: str) -> None:
             "revision: "
             + ", ".join(mismatched)
         )
+    return snapshot_roots.pop()
+
+
+def _verify_local_reference_snapshot(source_path: Path) -> Path:
+    if not source_path.is_dir():
+        raise ValueError(
+            "Qwen3 reference source must be the pinned model ID "
+            f"{QWEN3_OMNI_MODEL_ID!r} or a pinned local snapshot"
+        )
+    return _verify_reference_artifacts(
+        {
+            filename: source_path / filename
+            for filename in _QWEN3_LOCAL_ARTIFACT_SHA256
+        }
+    )
+
+
+def _validate_reference_source(source: str) -> None:
+    if source == QWEN3_OMNI_MODEL_ID:
+        return
+    _verify_local_reference_snapshot(Path(source))
+
+
+def _resolve_reference_source(
+    source: str,
+    *,
+    local_files_only: bool,
+) -> Path:
+    if source != QWEN3_OMNI_MODEL_ID:
+        return _verify_local_reference_snapshot(Path(source))
+
+    from huggingface_hub import hf_hub_download
+
+    artifact_paths = {}
+    for filename in _QWEN3_LOCAL_ARTIFACT_SHA256:
+        resolved = Path(
+            hf_hub_download(
+                repo_id=QWEN3_OMNI_MODEL_ID,
+                filename=filename,
+                revision=QWEN3_OMNI_REVISION,
+                local_files_only=local_files_only,
+            )
+        )
+        if resolved.name != filename:
+            raise ValueError(
+                "Qwen3 reference metadata resolved an unexpected "
+                f"artifact path for {filename}"
+            )
+        artifact_paths[filename] = resolved
+    return _verify_reference_artifacts(artifact_paths)
 
 
 def _lazy_config_loader(
@@ -149,10 +158,13 @@ def _lazy_config_loader(
     loader = load_reference_config
 
     def load() -> object:
-        _validate_reference_source(source)
-        return loader(
+        verified_source = _resolve_reference_source(
             source,
             local_files_only=local_files_only,
+        )
+        return loader(
+            str(verified_source),
+            local_files_only=True,
         )
 
     return load
@@ -166,10 +178,13 @@ def _lazy_processor_loader(
     loader = load_reference_processor
 
     def load() -> object:
-        _validate_reference_source(source)
-        return loader(
+        verified_source = _resolve_reference_source(
             source,
             local_files_only=local_files_only,
+        )
+        return loader(
+            str(verified_source),
+            local_files_only=True,
         )
 
     return load
@@ -208,16 +223,19 @@ class Qwen3ReferenceFactory:
         manifest.validate()
         return manifest
 
-    def validate(self, request: ProfileBuildRequest) -> None:
-        self.manifest(request)
+    def validate(
+        self,
+        request: ProfileBuildRequest,
+    ) -> ProfileManifest:
+        manifest = self.manifest(request)
         _pinned_config_contract()
+        return manifest
 
     def build(
         self,
         request: ProfileBuildRequest,
     ) -> ProfileBuildResult:
-        self._validate_request(request)
-        manifest = self.manifest(request)
+        manifest = self.validate(request)
         contract = _pinned_config_contract()
         artifact = Qwen3OracleArtifact(
             config_contract=contract,
@@ -250,22 +268,16 @@ class Qwen3ReferenceFactory:
             for capability in request.requested_capabilities
             if not capabilities.get(capability, False)
         )
-        fields = contract["fields"]
-        if not isinstance(fields, Mapping):
-            raise TypeError("pinned config fields must be a mapping")
-        embedding_vocab_size = fields[
-            "vocabulary.embedding_vocab_size"
-        ]
-        model_type = fields["model_type"]
-        if (
-            type(embedding_vocab_size) is not int
-            or not isinstance(model_type, str)
-        ):
+        vocabulary = contract["vocabulary"]
+        if not isinstance(vocabulary, Mapping):
+            raise TypeError("pinned config vocabulary must be a mapping")
+        embedding_vocab_size = vocabulary["embedding_vocab_size"]
+        if type(embedding_vocab_size) is not int:
             raise TypeError("pinned Qwen3 oracle identity is malformed")
         summary = ArchitectureSummary(
             profile=manifest.architecture_profile.value,
             compatibility_level=manifest.compatibility_level.value,
-            model_type=model_type,
+            model_type=QWEN3_OMNI_MODEL_TYPE,
             tokenizer_vocab_size=0,
             embedding_vocab_size=embedding_vocab_size,
             total_parameters=0,

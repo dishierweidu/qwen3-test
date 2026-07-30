@@ -116,6 +116,7 @@ def test_validate_subcommand_invokes_factory_validation(
 @pytest.mark.parametrize(
     ("option", "value"),
     [
+        ("--dtype", "float16"),
         ("--capability", "streaming_generation"),
         ("--tokenizer", "unused-tokenizer"),
         ("--allow-network", None),
@@ -146,6 +147,197 @@ def test_validate_rejects_inspection_only_options(
 
     assert raised.value.code == 2
     assert "unrecognized arguments" in capsys.readouterr().err
+
+
+def test_allow_network_help_names_its_only_effective_consumer(capsys):
+    with pytest.raises(SystemExit) as raised:
+        cli_profile.main(["inspect", "--help"])
+
+    assert raised.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "legacy tokenizer lookup" in help_text
+    assert "lazy loaders" not in help_text
+
+
+@pytest.mark.parametrize(
+    ("profile", "extra_arguments", "message"),
+    [
+        (
+            "qwen3_omni_reference",
+            ["--dtype", "float16"],
+            "--dtype is only valid for legacy_prototype inspection",
+        ),
+        (
+            "qwen3_omni_reference",
+            ["--allow-network"],
+            "--allow-network requires legacy_prototype inspection "
+            "with --tokenizer",
+        ),
+        (
+            "legacy_prototype",
+            ["--allow-network"],
+            "--allow-network requires legacy_prototype inspection "
+            "with --tokenizer",
+        ),
+    ],
+)
+def test_inspect_rejects_ineffective_option_combinations(
+    tmp_path,
+    capsys,
+    profile,
+    extra_arguments,
+    message,
+):
+    source = (
+        QWEN3_OMNI_MODEL_ID
+        if profile == "qwen3_omni_reference"
+        else str(_write_tiny_legacy_config(tmp_path / "legacy.yaml"))
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        cli_profile.main(
+            [
+                "inspect",
+                "--profile",
+                profile,
+                "--config-or-checkpoint",
+                source,
+                *extra_arguments,
+            ]
+        )
+
+    assert raised.value.code == 2
+    assert message in capsys.readouterr().err
+
+
+def test_legacy_inspect_allows_network_only_for_tokenizer_lookup(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from qwen3_omni_pretrain.profiles.legacy_prototype import (
+        factory as factory_module,
+    )
+
+    calls = []
+
+    class FakeTokenizer:
+        def get_vocab(self):
+            return {
+                "<|image_pad|>": 1,
+                "<|video_pad|>": 2,
+                "<|audio_pad|>": 3,
+                "<|audio_start|>": 4,
+                "<|audio_end|>": 5,
+            }
+
+        def __len__(self):
+            return 6
+
+    def load_tokenizer(source, **kwargs):
+        calls.append((source, kwargs))
+        return FakeTokenizer()
+
+    monkeypatch.setattr(
+        factory_module.AutoTokenizer,
+        "from_pretrained",
+        load_tokenizer,
+    )
+    config_path = _write_tiny_legacy_config(tmp_path / "legacy.yaml")
+
+    result = cli_profile.main(
+        [
+            "inspect",
+            "--profile",
+            "legacy_prototype",
+            "--config-or-checkpoint",
+            str(config_path),
+            "--tokenizer",
+            "example/tokenizer",
+            "--allow-network",
+            "--json",
+        ]
+    )
+
+    assert result == 0
+    assert calls == [
+        (
+            "example/tokenizer",
+            {"use_fast": True, "local_files_only": False},
+        )
+    ]
+    json.loads(capsys.readouterr().out)
+
+
+def test_validate_old_legacy_identity_reads_once_and_warns_once(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from qwen3_omni_pretrain.profiles.legacy_prototype import (
+        factory as factory_module,
+    )
+
+    config_path = tmp_path / "legacy.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_omni_moe",
+                "vocab_size": 32,
+                "thinker_config": {
+                    "hidden_size": 8,
+                    "intermediate_size": 16,
+                    "num_hidden_layers": 1,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 1,
+                    "max_position_embeddings": 16,
+                    "use_moe": False,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        factory_module,
+        "Qwen3OmniMoeThinkerTextModel",
+        lambda *args, **kwargs: pytest.fail("model was allocated"),
+    )
+    reads = []
+    real_load = factory_module._load_adapted_mapping
+
+    def record_load(path_value):
+        reads.append(path_value)
+        return real_load(path_value)
+
+    monkeypatch.setattr(
+        factory_module,
+        "_load_adapted_mapping",
+        record_load,
+    )
+    monkeypatch.setattr(
+        factory_module.LegacyPrototypeFactory,
+        "manifest",
+        lambda *args, **kwargs: pytest.fail(
+            "manifest was parsed a second time"
+        ),
+    )
+
+    with pytest.warns(DeprecationWarning) as warnings:
+        result = cli_profile.main(
+            [
+                "validate",
+                "--profile",
+                "legacy_prototype",
+                "--config-or-checkpoint",
+                str(config_path),
+                "--json",
+            ]
+        )
+
+    assert result == 0
+    assert len(warnings) == 1
+    assert reads == [str(config_path)]
+    json.loads(capsys.readouterr().out)
 
 
 def test_inspect_builds_on_meta_and_reports_unsupported_capability(

@@ -8,6 +8,9 @@ from pathlib import Path
 import re
 from typing import Mapping
 
+from qwen3_omni_pretrain.profiles.qwen3_omni_reference.contract import (
+    config_contract_to_dict,
+)
 from qwen3_omni_pretrain.profiles.qwen3_omni_reference.oracle import (
     QWEN3_OMNI_MODEL_ID,
     QWEN3_OMNI_REVISION,
@@ -32,6 +35,18 @@ PINNED_ARTIFACT_SHA256 = {
         "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
     ),
 }
+
+
+def validate_contract_parity(
+    extracted: Mapping[str, object],
+) -> None:
+    """Fail extraction if its output drifts from the production pin."""
+
+    if extracted != config_contract_to_dict():
+        raise ValueError(
+            "extracted contract does not match the production pinned "
+            "contract"
+        )
 
 
 def _regular_vocab_size(tokenizer_vocab: Mapping[str, int]) -> int:
@@ -306,6 +321,7 @@ def main() -> None:
         "config.json",
         local_files_only=local_files_only,
     )
+    validate_contract_parity(contract)
     payload = json.dumps(
         contract,
         indent=2,
