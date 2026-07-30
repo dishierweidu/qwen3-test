@@ -346,16 +346,22 @@ class SequenceSpan:
             return
 
         if self.kind is SequenceSpanKind.TIMESTAMP:
-            if self.source_token_indices is not None:
+            if self.source is None:
                 raise ValueError(
-                    "timestamp spans cannot contain "
-                    "source_token_indices"
+                    "timestamp spans require a complete source"
                 )
-            if self.seconds_per_grid is not None:
-                raise ValueError(
-                    "seconds_per_grid is only valid for video media "
-                    "spans"
-                )
+            if self.modality is None:
+                raise ValueError("timestamp spans require a modality")
+            for name in (
+                "grid",
+                "timestamps",
+                "seconds_per_grid",
+                "source_token_indices",
+            ):
+                if getattr(self, name) is not None:
+                    raise ValueError(
+                        f"timestamp spans cannot contain {name}"
+                    )
             return
 
         if self.source is None:

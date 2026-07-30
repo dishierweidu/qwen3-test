@@ -629,17 +629,39 @@ def test_text_span_forbids_all_media_metadata():
             span.validate()
 
 
-def test_timestamp_span_retains_optional_source_but_has_no_token_indices():
+def test_timestamp_span_requires_canonical_source_and_modality():
     make_span(
         kind=SequenceSpanKind.TIMESTAMP,
         source=MediaSource(0, 0, "audio-0"),
+        modality=MediaModality.AUDIO,
     ).validate()
 
-    with pytest.raises(ValueError, match="source_token_indices"):
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("source", None),
+        ("modality", None),
+        ("grid", MediaGrid(1, 1, 1)),
+        ("timestamps", torch.tensor([0.0])),
+        ("seconds_per_grid", 0.08),
+        ("source_token_indices", (0,)),
+    ],
+)
+def test_timestamp_span_rejects_missing_or_noncanonical_metadata(
+    field,
+    value,
+):
+    values = {
+        "kind": SequenceSpanKind.TIMESTAMP,
+        "source": MediaSource(0, 0, "audio-0"),
+        "modality": MediaModality.AUDIO,
+    }
+    values[field] = value
+
+    with pytest.raises(ValueError, match=field):
         make_span(
-            kind=SequenceSpanKind.TIMESTAMP,
-            source=MediaSource(0, 0, "audio-0"),
-            source_token_indices=(0,),
+            **values,
         ).validate()
 
 
@@ -654,6 +676,8 @@ def test_non_video_spans_reject_seconds_per_grid():
     with pytest.raises(ValueError, match="seconds_per_grid"):
         make_span(
             kind=SequenceSpanKind.TIMESTAMP,
+            source=MediaSource(0, 0, "video-0"),
+            modality=MediaModality.VIDEO,
             seconds_per_grid=0.08,
         ).validate()
 
