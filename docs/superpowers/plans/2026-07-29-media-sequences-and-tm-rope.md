@@ -305,11 +305,14 @@ Complete `validate()` with:
 - `MediaSource` rejects bool/non-integer/negative indices and empty IDs in
   `__post_init__`; `MediaGrid` rejects bool/non-integer/non-positive axes in
   `__post_init__`;
-- boolean/integer masks only;
+- floating non-complex embeddings only;
+- boolean/integer masks only, with every value exactly `0` or `1`;
+- embeddings, mask and optional timestamps on one device;
 - grid tuple length equals batch;
 - grid token count equals valid tokens for image/video rows;
 - seconds-per-grid tuple length equals batch; present values reject booleans,
-  NaN/Inf and non-positive numbers;
+  NaN/Inf and non-positive numbers, and only VIDEO may carry a non-`None`
+  value;
 - timestamps shape `[B, M]`;
 - valid timestamps finite, non-negative and monotonic;
 - `source_id` non-empty and `(sample_index, item_index)` non-negative;
@@ -384,7 +387,11 @@ naturally reset per row and later timestamped spans may reuse a temporal ID.
 Only the one-axis legacy builder applies monotonic sequence validation.
 Use `PositionBatch.validate(attention_mask)` so validity/padding is explicit;
 it requires mask shape `[B,S]`, unique axis names matching the axis count,
-numeric non-complex tensors, and zero positions at masked slots.
+numeric non-complex tensors, a binary mask, all tensors on one device, and zero
+positions at masked slots. `AssembledSequence` requires non-negative long IDs,
+floating non-complex embeddings, optional long labels, binary masks, all
+coupled tensors/span timestamps on one device, and spans in canonical
+`(sample_index,start)` order.
 
 - [ ] **Step 5: Run focused tests**
 
