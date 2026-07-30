@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError, version
+import shutil
 import sys
 import types
 
+import pytest
 import torch
 
 
@@ -69,3 +72,62 @@ class TinyTokenizer:
             return {"input_ids": input_ids, "attention_mask": attention_mask}
         result_ids = encoded[0] if single else encoded
         return {"input_ids": result_ids}
+
+
+REFERENCE_DISTRIBUTION_VERSIONS = {
+    "torch": "2.10.0",
+    "torchvision": "0.25.0",
+    "torchaudio": "2.10.0",
+    "transformers": "5.2.0",
+    "qwen-omni-utils": "0.0.9",
+}
+TORCH_DISTRIBUTIONS = frozenset({"torch", "torchvision", "torchaudio"})
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--run-large-model-tests",
+        action="store_true",
+        default=False,
+        help="run tests that require locally cached large model weights",
+    )
+
+
+def _reference_environment_issue() -> str | None:
+    for distribution, expected in REFERENCE_DISTRIBUTION_VERSIONS.items():
+        try:
+            actual = version(distribution)
+        except PackageNotFoundError:
+            return f"{distribution} is not installed"
+        comparable = (
+            actual.partition("+")[0]
+            if distribution in TORCH_DISTRIBUTIONS
+            else actual
+        )
+        if comparable != expected:
+            return (
+                f"{distribution}=={actual}; reference tests require "
+                f"{distribution}=={expected}"
+            )
+    if shutil.which("ffmpeg") is None:
+        return "ffmpeg is not available in PATH"
+    return None
+
+
+def pytest_collection_modifyitems(config, items):
+    reference_issue = _reference_environment_issue()
+    run_large = config.getoption("--run-large-model-tests")
+    for item in items:
+        if item.get_closest_marker("reference") and reference_issue is not None:
+            item.add_marker(
+                pytest.mark.skip(
+                    reason=f"official reference environment unavailable: "
+                    f"{reference_issue}"
+                )
+            )
+        if item.get_closest_marker("large_model") and not run_large:
+            item.add_marker(
+                pytest.mark.skip(
+                    reason="requires explicit --run-large-model-tests"
+                )
+            )
