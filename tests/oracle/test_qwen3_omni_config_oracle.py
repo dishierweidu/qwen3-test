@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import copy
+import importlib
 import json
 from pathlib import Path
+import re
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from qwen3_omni_pretrain.architecture.profiles import (
     ArchitectureProfile,
@@ -61,8 +65,8 @@ def _pinned_config() -> SimpleNamespace:
                 rope_scaling={
                     "interleaved": True,
                     "mrope_section": [24, 20, 20],
+                    "rope_theta": 1_000_000,
                 },
-                rope_theta=1_000_000,
                 vocab_size=152_064,
             ),
         ),
@@ -156,16 +160,61 @@ def test_checked_in_contract_is_a_small_pinned_provenance_extract():
         "code2wav",
     }
     assert contract["schema_version"] == 1
-    assert contract["source"] == {
+    source = contract["source"]
+    assert set(source) == {
+        "model_id",
+        "revision",
+        "transformers_version",
+        "artifacts",
+        "derived_fields",
+    }
+    assert {
+        key: source[key]
+        for key in ("model_id", "revision", "transformers_version")
+    } == {
         "model_id": QWEN3_OMNI_MODEL_ID,
         "revision": QWEN3_OMNI_REVISION,
         "transformers_version": "5.2.0",
-        "config_files": ["config.json", "preprocessor_config.json"],
-        "derived_fields": {
-            "audio_conv_kernel_and_stride": "transformers==5.2.0",
-            "output_sample_rate_hz": "Qwen3-Omni Technical Report",
-            "regular_vocab_size": "Qwen3-Omni Technical Report",
+    }
+    assert source["artifacts"] == {
+        "README.md": {
+            "revision": QWEN3_OMNI_REVISION,
+            "sha256": (
+                "0e44065c4c4a27071f7239afd5b5a33af5bc2e437dd7ea9950e51aafabfde3df"
+            ),
         },
+        "config.json": {
+            "revision": QWEN3_OMNI_REVISION,
+            "sha256": (
+                "eab5093d47807aaf894119506b238b2b1cee70d08456e894fee9a012d88f2e0d"
+            ),
+        },
+        "preprocessor_config.json": {
+            "revision": QWEN3_OMNI_REVISION,
+            "sha256": (
+                "b10e27fd4542cf89ec7145942b87f3e65408d4e9f9d031a29acdd293c15fb3fc"
+            ),
+        },
+        "vocab.json": {
+            "revision": QWEN3_OMNI_REVISION,
+            "sha256": (
+                "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+            ),
+        },
+    }
+    assert source["derived_fields"]["audio_conv_kernel_and_stride"] == {
+        "artifact": (
+            "src/transformers/models/qwen3_omni_moe/"
+            "modeling_qwen3_omni_moe.py"
+        ),
+        "extraction": (
+            "AST of Qwen3OmniMoeAudioEncoder.__init__ "
+            "conv2d1/2/3 assignments"
+        ),
+        "revision": "7d9754a05193eb79b1d86aa744b622b8068008cd",
+        "sha256": (
+            "0b6e9a6e9d88814de3e25b1ca65c49d0677be7331b8118b6a0cd022c6c1dd270"
+        ),
     }
     assert contract["vocabulary"] == {
         "regular_vocab_size": 151_643,
@@ -190,6 +239,13 @@ def test_contract_extractor_selects_only_the_pinned_architecture_fields():
     extracted = extract_contract(
         _pinned_config(),
         preprocessor_config={"sampling_rate": 16_000},
+        tokenizer_vocab={"a": 0, "b": 1, "c": 2},
+        model_readme="sf.write('audio.wav', audio, samplerate=24_000)",
+        audio_implementation_contract={
+            "audio_encoder.conv_layers": 3,
+            "audio_encoder.conv_kernel_size": 3,
+            "audio_encoder.conv_stride": 2,
+        },
     )
 
     assert extracted["audio_encoder"] == {
@@ -237,7 +293,11 @@ def test_load_reference_config_uses_the_pinned_revision_and_local_only(
             return expected
 
     monkeypatch.setattr(oracle, "_require_reference_environment", lambda: None)
-    monkeypatch.setattr(oracle, "Qwen3OmniMoeConfig", FakeConfigLoader)
+    monkeypatch.setattr(
+        oracle,
+        "_reference_config_class",
+        lambda: FakeConfigLoader,
+    )
 
     loaded = load_reference_config()
 
@@ -266,7 +326,11 @@ def test_load_reference_processor_uses_the_pinned_revision_and_local_only(
             return expected
 
     monkeypatch.setattr(oracle, "_require_reference_environment", lambda: None)
-    monkeypatch.setattr(oracle, "Qwen3OmniMoeProcessor", FakeProcessorLoader)
+    monkeypatch.setattr(
+        oracle,
+        "_reference_processor_class",
+        lambda: FakeProcessorLoader,
+    )
 
     loaded = load_reference_processor()
 
@@ -280,6 +344,35 @@ def test_load_reference_processor_uses_the_pinned_revision_and_local_only(
             },
         )
     ]
+
+
+def test_local_processor_loader_scopes_and_restores_hub_offline_mode(
+    monkeypatch,
+):
+    import huggingface_hub.constants as hub_constants
+
+    observed_offline_modes = []
+    expected = object()
+
+    class FakeProcessorLoader:
+        @classmethod
+        def from_pretrained(cls, source, **kwargs):
+            observed_offline_modes.append(hub_constants.HF_HUB_OFFLINE)
+            return expected
+
+    monkeypatch.setattr(hub_constants, "HF_HUB_OFFLINE", False)
+    monkeypatch.setattr(oracle, "_require_reference_environment", lambda: None)
+    monkeypatch.setattr(
+        oracle,
+        "_reference_processor_class",
+        lambda: FakeProcessorLoader,
+    )
+
+    loaded = load_reference_processor(local_files_only=True)
+
+    assert loaded is expected
+    assert observed_offline_modes == [True]
+    assert hub_constants.HF_HUB_OFFLINE is False
 
 
 def test_load_reference_model_requires_explicit_hardware_and_validates_first(
@@ -306,8 +399,8 @@ def test_load_reference_model_requires_explicit_hardware_and_validates_first(
     monkeypatch.setattr(oracle, "load_reference_config", fake_config_loader)
     monkeypatch.setattr(
         oracle,
-        "Qwen3OmniMoeForConditionalGeneration",
-        FakeModelLoader,
+        "_reference_model_class",
+        lambda: FakeModelLoader,
     )
 
     loaded = load_reference_model(
@@ -353,8 +446,8 @@ def test_model_loader_rejects_config_contradiction_before_construction(
     )
     monkeypatch.setattr(
         oracle,
-        "Qwen3OmniMoeForConditionalGeneration",
-        ForbiddenModelLoader,
+        "_reference_model_class",
+        lambda: ForbiddenModelLoader,
     )
 
     with pytest.raises(ValueError, match="model_type"):
@@ -366,18 +459,153 @@ def test_model_loader_rejects_config_contradiction_before_construction(
     assert not model_called
 
 
+def _set_config_path(config, path, value):
+    target = config
+    components = path.split(".")
+    for component in components[:-1]:
+        target = (
+            target[component]
+            if isinstance(target, dict)
+            else getattr(target, component)
+        )
+    if isinstance(target, dict):
+        target[components[-1]] = value
+    else:
+        setattr(target, components[-1], value)
+
+
+@pytest.mark.parametrize(
+    ("config_path", "contract_path", "contradiction"),
+    [
+        (
+            "thinker_config.text_config.rope_scaling.rope_theta",
+            "tm_rope.rope_theta",
+            10_000,
+        ),
+        (
+            "thinker_config.audio_config.num_mel_bins",
+            "audio_encoder.num_mel_bins",
+            64,
+        ),
+        (
+            "thinker_config.vision_config.patch_size",
+            "vision_encoder.patch_kernel",
+            14,
+        ),
+        (
+            "talker_config.text_config.shared_expert_intermediate_size",
+            "talker.shared_expert_intermediate_size",
+            1_024,
+        ),
+        (
+            "talker_config.code_predictor_config.num_code_groups",
+            "code_predictor.num_code_groups",
+            8,
+        ),
+        (
+            "code2wav_config.upsample_rates",
+            "code2wav.upsample_rates",
+            [8, 5, 4, 2],
+        ),
+    ],
+    ids=["tm-rope", "audio", "vision", "talker", "predictor", "code2wav"],
+)
+def test_model_loader_rejects_each_major_contract_contradiction(
+    monkeypatch,
+    config_path,
+    contract_path,
+    contradiction,
+):
+    incompatible = copy.deepcopy(_pinned_config())
+    _set_config_path(incompatible, config_path, contradiction)
+    model_called = False
+
+    class ForbiddenModelLoader:
+        @classmethod
+        def from_pretrained(cls, source, **kwargs):
+            nonlocal model_called
+            model_called = True
+            raise AssertionError("model construction must not be reached")
+
+    monkeypatch.setattr(oracle, "_require_reference_environment", lambda: None)
+    monkeypatch.setattr(
+        oracle,
+        "load_reference_config",
+        lambda source, *, local_files_only: incompatible,
+    )
+    monkeypatch.setattr(
+        oracle,
+        "_reference_model_class",
+        lambda: ForbiddenModelLoader,
+    )
+
+    with pytest.raises(ValueError, match=re.escape(contract_path)):
+        load_reference_model(
+            torch_dtype="bfloat16",
+            device_map={"": "cpu"},
+        )
+
+    assert not model_called
+
+
+def test_model_loader_rejects_audio_convolution_contract_before_construction(
+    monkeypatch,
+):
+    class ContradictoryAudioEncoder:
+        def __init__(self, config):
+            self.conv2d1 = torch.nn.Conv2d(1, 480, 5, 2, padding=1)
+            self.conv2d2 = torch.nn.Conv2d(480, 480, 5, 2, padding=1)
+            self.conv2d3 = torch.nn.Conv2d(480, 480, 5, 2, padding=1)
+
+    model_called = False
+
+    class ForbiddenModelLoader:
+        @classmethod
+        def from_pretrained(cls, source, **kwargs):
+            nonlocal model_called
+            model_called = True
+            raise AssertionError("model construction must not be reached")
+
+    monkeypatch.setattr(oracle, "_require_reference_environment", lambda: None)
+    monkeypatch.setattr(
+        oracle,
+        "load_reference_config",
+        lambda source, *, local_files_only: _pinned_config(),
+    )
+    monkeypatch.setattr(
+        oracle,
+        "_reference_audio_encoder_class",
+        lambda: ContradictoryAudioEncoder,
+    )
+    monkeypatch.setattr(
+        oracle,
+        "_reference_model_class",
+        lambda: ForbiddenModelLoader,
+    )
+
+    with pytest.raises(ValueError, match="audio_encoder.conv_kernel_size"):
+        load_reference_model(
+            torch_dtype="bfloat16",
+            device_map={"": "cpu"},
+        )
+
+    assert not model_called
+
+
 def test_environment_mismatch_fails_before_external_loading(monkeypatch):
     external_called = False
 
-    class ForbiddenConfigLoader:
-        @classmethod
-        def from_pretrained(cls, source, **kwargs):
-            nonlocal external_called
-            external_called = True
-            raise AssertionError("external loading must not be reached")
+    def forbidden_config_class():
+        nonlocal external_called
+        external_called = True
+        raise AssertionError("external loading must not be reached")
 
     monkeypatch.setattr(oracle.transformers, "__version__", "4.57.6")
-    monkeypatch.setattr(oracle, "Qwen3OmniMoeConfig", ForbiddenConfigLoader)
+    monkeypatch.setattr(
+        oracle,
+        "_reference_config_class",
+        forbidden_config_class,
+    )
 
     with pytest.raises(RuntimeError, match="transformers==5.2.0"):
         load_reference_config()
@@ -424,3 +652,73 @@ def test_reference_environment_rejects_non_torch_local_build_suffixes(
 
     with pytest.raises(RuntimeError, match="qwen-omni-utils"):
         oracle._require_reference_environment()
+
+
+def test_oracle_import_does_not_bind_reference_only_transformers_classes():
+    eager_reference_types = {
+        "Qwen3OmniMoeConfig",
+        "Qwen3OmniMoeForConditionalGeneration",
+        "Qwen3OmniMoeProcessor",
+    }
+
+    assert eager_reference_types.isdisjoint(vars(oracle))
+
+
+def test_collection_and_runtime_consume_the_same_lightweight_pins():
+    pins = importlib.import_module(
+        "qwen3_omni_pretrain.profiles.qwen3_omni_reference.pins"
+    )
+    conftest = importlib.import_module("conftest")
+
+    assert oracle.REFERENCE_DISTRIBUTION_VERSIONS is (
+        pins.REFERENCE_DISTRIBUTION_VERSIONS
+    )
+    assert conftest.REFERENCE_DISTRIBUTION_VERSIONS is (
+        pins.REFERENCE_DISTRIBUTION_VERSIONS
+    )
+    assert "transformers" not in vars(pins)
+
+
+def test_contract_provenance_is_immutable_and_machine_reproducible():
+    contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+    provenance = contract["source"]["derived_fields"]
+
+    regular_vocab = provenance["regular_vocab_size"]
+    assert regular_vocab["artifact"] == "vocab.json"
+    assert regular_vocab["revision"] == QWEN3_OMNI_REVISION
+    assert regular_vocab["extraction"] == "len(top-level token-to-id mapping)"
+    assert regular_vocab["sha256"] == (
+        "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+    )
+
+    output_rate = provenance["output_sample_rate_hz"]
+    assert output_rate["artifact"] == "README.md"
+    assert output_rate["revision"] == QWEN3_OMNI_REVISION
+    assert output_rate["locator"] == (
+        "lines 257-277; samplerate=24000 at line 277"
+    )
+    assert output_rate["extraction"] == (
+        "samplerate used to serialize audio returned by model.generate"
+    )
+    assert output_rate["sha256"] == (
+        "0e44065c4c4a27071f7239afd5b5a33af5bc2e437dd7ea9950e51aafabfde3df"
+    )
+
+
+def test_contract_extractor_derives_vocab_and_sample_rate_from_sources():
+    config = _pinned_config()
+
+    extracted = extract_contract(
+        config,
+        preprocessor_config={"sampling_rate": 16_000},
+        tokenizer_vocab={"a": 0, "b": 1, "c": 2},
+        model_readme="sf.write('audio.wav', audio, samplerate=12_345)",
+        audio_implementation_contract={
+            "audio_encoder.conv_layers": 3,
+            "audio_encoder.conv_kernel_size": 3,
+            "audio_encoder.conv_stride": 2,
+        },
+    )
+
+    assert extracted["vocabulary"]["regular_vocab_size"] == 3
+    assert extracted["code2wav"]["output_sample_rate_hz"] == 12_345

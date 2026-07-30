@@ -8,6 +8,11 @@ import types
 import pytest
 import torch
 
+from qwen3_omni_pretrain.profiles.qwen3_omni_reference.pins import (
+    REFERENCE_DISTRIBUTION_VERSIONS,
+    distribution_version_matches,
+)
+
 
 try:
     import transformers  # noqa: F401
@@ -74,16 +79,6 @@ class TinyTokenizer:
         return {"input_ids": result_ids}
 
 
-REFERENCE_DISTRIBUTION_VERSIONS = {
-    "torch": "2.10.0",
-    "torchvision": "0.25.0",
-    "torchaudio": "2.10.0",
-    "transformers": "5.2.0",
-    "qwen-omni-utils": "0.0.9",
-}
-TORCH_DISTRIBUTIONS = frozenset({"torch", "torchvision", "torchaudio"})
-
-
 def pytest_addoption(parser):
     parser.addoption(
         "--run-large-model-tests",
@@ -99,12 +94,7 @@ def _reference_environment_issue() -> str | None:
             actual = version(distribution)
         except PackageNotFoundError:
             return f"{distribution} is not installed"
-        comparable = (
-            actual.partition("+")[0]
-            if distribution in TORCH_DISTRIBUTIONS
-            else actual
-        )
-        if comparable != expected:
+        if not distribution_version_matches(distribution, actual, expected):
             return (
                 f"{distribution}=={actual}; reference tests require "
                 f"{distribution}=={expected}"

@@ -48,14 +48,47 @@
   },
   "schema_version": 1,
   "source": {
-    "config_files": [
-      "config.json",
-      "preprocessor_config.json"
-    ],
+    "artifacts": {
+      "README.md": {
+        "revision": "26291f793822fb6be9555850f06dfe95f2d7e695",
+        "sha256": "0e44065c4c4a27071f7239afd5b5a33af5bc2e437dd7ea9950e51aafabfde3df"
+      },
+      "config.json": {
+        "revision": "26291f793822fb6be9555850f06dfe95f2d7e695",
+        "sha256": "eab5093d47807aaf894119506b238b2b1cee70d08456e894fee9a012d88f2e0d"
+      },
+      "preprocessor_config.json": {
+        "revision": "26291f793822fb6be9555850f06dfe95f2d7e695",
+        "sha256": "b10e27fd4542cf89ec7145942b87f3e65408d4e9f9d031a29acdd293c15fb3fc"
+      },
+      "vocab.json": {
+        "revision": "26291f793822fb6be9555850f06dfe95f2d7e695",
+        "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+      }
+    },
     "derived_fields": {
-      "audio_conv_kernel_and_stride": "transformers==5.2.0",
-      "output_sample_rate_hz": "Qwen3-Omni Technical Report",
-      "regular_vocab_size": "Qwen3-Omni Technical Report"
+      "audio_conv_kernel_and_stride": {
+        "artifact": "src/transformers/models/qwen3_omni_moe/modeling_qwen3_omni_moe.py",
+        "extraction": "AST of Qwen3OmniMoeAudioEncoder.__init__ conv2d1/2/3 assignments",
+        "revision": "7d9754a05193eb79b1d86aa744b622b8068008cd",
+        "sha256": "0b6e9a6e9d88814de3e25b1ca65c49d0677be7331b8118b6a0cd022c6c1dd270"
+      },
+      "output_sample_rate_hz": {
+        "artifact": "README.md",
+        "extraction": "samplerate used to serialize audio returned by model.generate",
+        "locator": "lines 257-277; samplerate=24000 at line 277",
+        "revision": "26291f793822fb6be9555850f06dfe95f2d7e695",
+        "sha256": "0e44065c4c4a27071f7239afd5b5a33af5bc2e437dd7ea9950e51aafabfde3df",
+        "url": "https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/resolve/26291f793822fb6be9555850f06dfe95f2d7e695/README.md"
+      },
+      "regular_vocab_size": {
+        "artifact": "vocab.json",
+        "extraction": "len(top-level token-to-id mapping)",
+        "revision": "26291f793822fb6be9555850f06dfe95f2d7e695",
+        "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+        "url": "https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/resolve/26291f793822fb6be9555850f06dfe95f2d7e695/vocab.json",
+        "validation": "IDs are contiguous from 0 through 151642"
+      }
     },
     "model_id": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
     "revision": "26291f793822fb6be9555850f06dfe95f2d7e695",

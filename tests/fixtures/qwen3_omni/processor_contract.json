@@ -1,0 +1,164 @@
+{
+  "expected": {
+    "attention_mask": {
+      "dtype": "int64",
+      "rle": [
+        [
+          1,
+          21
+        ]
+      ],
+      "shape": [
+        1,
+        21
+      ]
+    },
+    "feature_attention_mask": {
+      "dtype": "int32",
+      "rle": [
+        [
+          1,
+          100
+        ]
+      ],
+      "shape": [
+        1,
+        100
+      ],
+      "sum": 100
+    },
+    "image_grid_thw": {
+      "dtype": "int64",
+      "values": [
+        [
+          1,
+          4,
+          4
+        ]
+      ]
+    },
+    "input_features": {
+      "dtype": "float32",
+      "shape": [
+        1,
+        128,
+        100
+      ]
+    },
+    "input_ids": {
+      "dtype": "int64",
+      "values": [
+        [
+          151652,
+          151655,
+          151655,
+          151655,
+          151655,
+          151653,
+          151669,
+          151675,
+          151675,
+          151675,
+          151675,
+          151675,
+          151675,
+          151675,
+          151675,
+          151675,
+          151675,
+          151675,
+          151675,
+          151675,
+          151670
+        ]
+      ]
+    },
+    "sentinels": {
+      "audio_end": {
+        "positions": [
+          20
+        ],
+        "token_id": 151670
+      },
+      "audio_pad": {
+        "positions": [
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19
+        ],
+        "token_id": 151675
+      },
+      "audio_start": {
+        "positions": [
+          6
+        ],
+        "token_id": 151669
+      },
+      "image_pad": {
+        "positions": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "token_id": 151655
+      },
+      "vision_end": {
+        "positions": [
+          5
+        ],
+        "token_id": 151653
+      },
+      "vision_start": {
+        "positions": [
+          0
+        ],
+        "token_id": 151652
+      }
+    }
+  },
+  "input": {
+    "image": {
+      "construction": "np.arange(32 * 32 * 3, dtype=np.uint8).reshape(32, 32, 3)",
+      "mode": "RGB",
+      "shape": [
+        32,
+        32,
+        3
+      ]
+    },
+    "text": "<|vision_start|><|image_pad|><|vision_end|><|audio_start|><|audio_pad|><|audio_end|>",
+    "waveform": {
+      "construction": "np.linspace(-0.25, 0.25, 16000, dtype=np.float32)",
+      "num_samples": 16000,
+      "sample_rate_hz": 16000
+    }
+  },
+  "schema_version": 1,
+  "source": {
+    "artifact_sha256": {
+      "chat_template.json": "90c1b81f29e41b7642b0cc02c877a10c8bf6751a8d8fa1d16ac9a718cf1c3d86",
+      "config.json": "eab5093d47807aaf894119506b238b2b1cee70d08456e894fee9a012d88f2e0d",
+      "merges.txt": "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3",
+      "preprocessor_config.json": "b10e27fd4542cf89ec7145942b87f3e65408d4e9f9d031a29acdd293c15fb3fc",
+      "tokenizer_config.json": "dc3c31c3bdaedd5016382bb3cbe07323026775ad51f5a4fb564505992ae4a670",
+      "vocab.json": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+    },
+    "extraction": "Qwen3OmniMoeProcessor.from_pretrained at the pinned revision with local_files_only=True, HF_HUB_OFFLINE=1, and socket.connect forbidden",
+    "model_id": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+    "numpy_version": "2.2.6",
+    "revision": "26291f793822fb6be9555850f06dfe95f2d7e695",
+    "torch_base_version": "2.10.0",
+    "transformers_version": "5.2.0"
+  }
+}
