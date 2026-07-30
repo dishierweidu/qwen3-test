@@ -17,6 +17,55 @@ architecture-faithful reproduction of the official Qwen3-Omni model**:
 The P0 correctness work in this branch stabilizes the existing baseline before
 those modules are replaced.
 
+## Architecture profiles
+
+The profile registry exposes only implementations that can currently be built
+or inspected. Compatibility labels describe the demonstrated boundary; a
+structure-aligned, paper-inspired, or experimental profile is not
+checkpoint-compatible with an official model.
+
+| Profile | Status | Compatibility | Exact official checkpoint compatibility |
+| --- | --- | --- | --- |
+| `legacy_prototype` | Implemented local Thinker | `legacy-prototype` | No |
+| `qwen3_omni_reference` | Pinned oracle/config implemented; runtime pending | `structure-aligned` | No |
+| `qwen35_omni_inspired` | Planned | `paper-inspired` | No |
+| `mimo_v25_experimental` | Planned | `MiMo-style-experiment` | No |
+
+Qwen3.5-inspired work always remains non-exact unless a separate official
+profile is introduced. The MiMo-style experiment does not claim an official
+MiMo model type, repository identity, or checkpoint format. Planned profiles
+are deliberately absent from the registry until they have real factories.
+
+New legacy saves use the non-colliding model type
+`qwen3_omni_prototype`. Old saves that used `qwen3_omni_moe` are accepted only
+through the explicit one-way legacy adapter, which emits a deprecation warning;
+new files are never written with that old identity.
+
+Profile validation is read-only and allocates no model:
+
+```bash
+.venv-prototype/bin/python -m qwen3_omni_pretrain.cli_profile validate \
+  --profile legacy_prototype \
+  --config-or-checkpoint configs/model/qwen3_omni_1_3b_moe.yaml
+```
+
+Inspection constructs the legacy Thinker on the meta device and reports its
+manifest, layer topology, parameter counts, and unsupported capabilities:
+
+```bash
+.venv-prototype/bin/python -m qwen3_omni_pretrain.cli_profile inspect \
+  --profile legacy_prototype \
+  --config-or-checkpoint configs/model/qwen3_omni_1_3b_moe.yaml \
+  --json
+```
+
+Both commands are offline by default. `--allow-network` is inspect-only and
+must be supplied explicitly before a legacy tokenizer lookup may use the
+network. Reference inspection returns a pinned oracle artifact with lazy
+config and processor loaders, but the CLI invokes neither loader; it does not
+load weights or claim an inference runtime. Unavailable tokenizer, layer, and
+parameter metrics remain zero and are marked unsupported.
+
 ## Environment
 
 Use Python 3.10 and keep the prototype and official-reference dependencies in
