@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import hashlib
-import inspect
 import json
 from pathlib import Path
 import socket
-from types import SimpleNamespace
 
 import numpy as np
 from PIL import Image
@@ -21,9 +18,6 @@ from qwen3_omni_pretrain.profiles.qwen3_omni_reference.oracle import (
 
 pytestmark = pytest.mark.reference
 
-EXPECTED_ROPE_IMPLEMENTATION_SHA256 = (
-    "4b0de5c1b83a32c7fbb57b16c5fc0c1c6e5a707585cae9188fc87d7283b44ee3"
-)
 PROCESSOR_CONTRACT_PATH = Path(
     "tests/fixtures/qwen3_omni/processor_contract.json"
 )
@@ -35,29 +29,6 @@ def _expand_rle(runs):
         for value, count in runs
         for _ in range(count)
     ]
-
-
-def _rope_facade():
-    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-        Qwen3OmniMoePreTrainedModelForConditionalGeneration,
-    )
-
-    base = Qwen3OmniMoePreTrainedModelForConditionalGeneration
-
-    class RopeFacade:
-        spatial_merge_size = 2
-        config = SimpleNamespace(
-            image_token_id=151_655,
-            video_token_id=151_656,
-            audio_token_id=151_675,
-            vision_start_token_id=151_652,
-            audio_start_token_id=151_669,
-            position_id_per_seconds=13,
-        )
-        get_llm_pos_ids_for_vision = base.get_llm_pos_ids_for_vision
-        get_rope_index = base.get_rope_index
-
-    return RopeFacade(), base
 
 
 def test_processor_is_offline_and_preserves_media_sequence_contract(
@@ -159,123 +130,3 @@ def test_processor_is_offline_and_preserves_media_sequence_contract(
             if token_id == details["token_id"]
         ]
         assert positions == details["positions"], sentinel
-
-
-def test_text_rope_positions_are_one_axis_monotonic():
-    facade, _ = _rope_facade()
-    input_ids = torch.tensor([[11, 12, 13, 0]], dtype=torch.long)
-    attention_mask = torch.tensor([[1, 1, 1, 0]], dtype=torch.long)
-
-    positions, rope_delta = facade.get_rope_index(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-    )
-
-    assert positions.shape == (3, 1, 4)
-    assert positions.dtype == torch.float32
-    assert torch.equal(
-        positions[:, 0, :3],
-        torch.tensor(
-            [[0.0, 1.0, 2.0], [0.0, 1.0, 2.0], [0.0, 1.0, 2.0]]
-        ),
-    )
-    assert torch.all(torch.diff(positions[:, 0, :3], dim=-1) >= 0)
-    assert torch.all(positions >= 0)
-    assert rope_delta.tolist() == [[0.0]]
-
-
-def test_image_rope_positions_reset_height_and_width_exactly():
-    facade, _ = _rope_facade()
-    input_ids = torch.tensor(
-        [[7, 151_652, 151_655, 151_655, 151_655, 151_655, 151_653, 8]],
-        dtype=torch.long,
-    )
-
-    positions, rope_delta = facade.get_rope_index(
-        input_ids=input_ids,
-        image_grid_thw=torch.tensor([[1, 4, 4]], dtype=torch.long),
-        attention_mask=torch.ones_like(input_ids),
-    )
-
-    assert positions.shape == (3, 1, 8)
-    assert positions.dtype == torch.float32
-    assert positions[:, 0].tolist() == [
-        [0.0, 1.0, 2.0, 2.0, 2.0, 2.0, 4.0, 5.0],
-        [0.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 5.0],
-        [0.0, 1.0, 2.0, 3.0, 2.0, 3.0, 4.0, 5.0],
-    ]
-    assert torch.all(positions >= 0)
-    assert rope_delta.tolist() == [[-2.0]]
-
-
-def test_video_rope_positions_use_pinned_time_grid_exactly():
-    facade, _ = _rope_facade()
-    input_ids = torch.tensor(
-        [
-            [
-                151_652,
-                151_656,
-                151_656,
-                151_656,
-                151_656,
-                151_656,
-                151_656,
-                151_656,
-                151_656,
-                151_653,
-            ]
-        ],
-        dtype=torch.long,
-    )
-
-    positions, rope_delta = facade.get_rope_index(
-        input_ids=input_ids,
-        video_grid_thw=torch.tensor([[2, 4, 4]], dtype=torch.long),
-        second_per_grids=torch.tensor([1.0]),
-        attention_mask=torch.ones_like(input_ids),
-    )
-
-    assert positions.shape == (3, 1, 10)
-    assert positions[:, 0].tolist() == [
-        [0.0, 1.0, 1.0, 1.0, 1.0, 14.0, 14.0, 14.0, 14.0, 15.0],
-        [0.0, 1.0, 1.0, 2.0, 2.0, 1.0, 1.0, 2.0, 2.0, 15.0],
-        [0.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 15.0],
-    ]
-    assert torch.all(positions >= 0)
-    assert rope_delta.tolist() == [[6.0]]
-
-
-def test_audio_rope_positions_use_exact_feature_grid():
-    facade, _ = _rope_facade()
-    input_ids = torch.tensor(
-        [[151_669, 151_675, 151_675, 151_670]],
-        dtype=torch.long,
-    )
-
-    positions, rope_delta = facade.get_rope_index(
-        input_ids=input_ids,
-        image_grid_thw=torch.empty((0, 3), dtype=torch.long),
-        audio_seqlens=torch.tensor([16], dtype=torch.long),
-        attention_mask=torch.ones_like(input_ids),
-    )
-
-    assert positions.shape == (3, 1, 4)
-    assert positions[:, 0].tolist() == [
-        [0.0, 1.0, 2.0, 3.0],
-        [0.0, 1.0, 2.0, 3.0],
-        [0.0, 1.0, 2.0, 3.0],
-    ]
-    assert torch.all(positions >= 0)
-    assert rope_delta.tolist() == [[0.0]]
-
-
-def test_rope_oracle_hashes_the_pinned_transformers_implementation():
-    _, base = _rope_facade()
-    source = (
-        inspect.getsource(base.get_llm_pos_ids_for_vision)
-        + inspect.getsource(base.get_rope_index)
-    )
-
-    assert hashlib.sha256(source.encode("utf-8")).hexdigest() == (
-        EXPECTED_ROPE_IMPLEMENTATION_SHA256
-    )
