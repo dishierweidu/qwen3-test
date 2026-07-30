@@ -30,6 +30,10 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from transformers import PreTrainedModel
 
+from qwen3_omni_pretrain.architecture.config_validation import (
+    parse_layer_indices,
+)
+
 from .configuration_qwen3_omni_moe import Qwen3OmniMoeConfig, Qwen3OmniMoeThinkerConfig
 from .modeling_thinker_text import (
     RMSNorm,
@@ -557,22 +561,21 @@ class Qwen3OmniMoeThinkerTextModelTP(PreTrainedModel):
         
         self.use_flash_attention = getattr(thinker_cfg, "use_flash_attention", False)
         
-        # Parse layer indices
-        moe_layer_set = None
-        if getattr(thinker_cfg, "use_moe", False) and getattr(thinker_cfg, "moe_layer_indices", None):
-            indices_str = thinker_cfg.moe_layer_indices
-            if isinstance(indices_str, str) and indices_str.strip():
-                moe_layer_set = set(
-                    int(x) for x in indices_str.split(",") if x.strip().isdigit()
-                )
-        
-        deltanet_layer_set = None
-        if getattr(thinker_cfg, "deltanet_layer_indices", None) is not None:
-            indices_str = thinker_cfg.deltanet_layer_indices
-            if isinstance(indices_str, str) and indices_str.strip():
-                deltanet_layer_set = set(
-                    int(x) for x in indices_str.split(",") if x.strip().isdigit()
-                )
+        moe_layers = parse_layer_indices(
+            thinker_cfg.moe_layer_indices,
+            layer_count=thinker_cfg.num_hidden_layers,
+            field="moe_layer_indices",
+        )
+        moe_layer_set = set(moe_layers) if moe_layers else None
+
+        deltanet_layers = parse_layer_indices(
+            thinker_cfg.deltanet_layer_indices,
+            layer_count=thinker_cfg.num_hidden_layers,
+            field="deltanet_layer_indices",
+        )
+        deltanet_layer_set = (
+            set(deltanet_layers) if deltanet_layers else None
+        )
         
         use_deltanet_global = getattr(thinker_cfg, "use_deltanet", False)
         self.gradient_checkpointing = getattr(thinker_cfg, "gradient_checkpointing", False)

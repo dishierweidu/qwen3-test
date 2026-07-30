@@ -1,5 +1,14 @@
 import torch
 
+from qwen3_omni_pretrain.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+    Qwen3OmniMoeConfig,
+)
+from qwen3_omni_pretrain.models.qwen3_omni_moe.modeling_thinker_text import (
+    Qwen3OmniMoeThinkerTextModel,
+)
+from qwen3_omni_pretrain.models.qwen3_omni_moe import (
+    modeling_thinker_text_tp,
+)
 from qwen3_omni_pretrain.models.qwen3_omni_moe.modeling_thinker_text_tp import (
     TensorParallelMoeMLP,
 )
@@ -51,3 +60,47 @@ def test_tp_world_size_one_matches_standard_routing_and_state_keys():
     }
     assert set(standard.state_dict()) == expected_keys
     assert set(parallel.state_dict()) == expected_keys
+
+
+def test_standard_and_tp_constructors_choose_the_same_moe_layers(monkeypatch):
+    monkeypatch.setattr(
+        modeling_thinker_text_tp,
+        "is_model_parallel_initialized",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        modeling_thinker_text_tp,
+        "get_tensor_model_parallel_world_size",
+        lambda: 1,
+    )
+    config = Qwen3OmniMoeConfig(
+        vocab_size=8,
+        thinker_config={
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "max_position_embeddings": 8,
+            "use_moe": True,
+            "routing_kind": "sparse",
+            "num_experts": 2,
+            "num_experts_per_tok": 1,
+            "moe_layer_indices": "1,3",
+            "use_flash_attention": False,
+        },
+    )
+
+    standard = Qwen3OmniMoeThinkerTextModel(config)
+    parallel = modeling_thinker_text_tp.Qwen3OmniMoeThinkerTextModelTP(config)
+
+    assert [
+        index
+        for index, layer in enumerate(standard.layers)
+        if layer.moe_mlp is not None
+    ] == [1, 3]
+    assert [
+        index
+        for index, layer in enumerate(parallel.layers)
+        if layer.moe_mlp is not None
+    ] == [1, 3]

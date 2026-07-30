@@ -10,6 +10,10 @@ from qwen3_omni_pretrain.architecture import (
     CompatibilityLevel,
     ProfileManifest,
 )
+from qwen3_omni_pretrain.architecture.config_validation import (
+    RoutingKind,
+    validate_legacy_thinker_config,
+)
 from qwen3_omni_pretrain.profiles.legacy_prototype.config_adapter import (
     LEGACY_MODEL_TYPE,
     load_legacy_config_dict,
@@ -38,7 +42,7 @@ class Qwen3OmniMoeThinkerConfig:
     max_position_embeddings: int = 4096
 
     use_moe: bool = False
-    routing_kind: str = "dense"
+    routing_kind: RoutingKind | str = RoutingKind.DENSE
     num_experts: int = 8
     num_experts_per_tok: int = 2
     
@@ -273,6 +277,11 @@ class Qwen3OmniMoeConfig(PretrainedConfig):
                 "shared_intermediate_size must be removed when the MoE module "
                 "contains routed experts only."
             )
+        if not 0 < rope_partial_factor <= 1:
+            raise ValueError(
+                "rope_partial_factor must be greater than 0 and at most 1"
+            )
+        validate_legacy_thinker_config(self.thinker_config)
 
         self.headwise_attn_output_gate = self.thinker_config.headwise_attn_output_gate
         self.elementwise_attn_output_gate = self.thinker_config.elementwise_attn_output_gate

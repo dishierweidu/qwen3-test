@@ -70,7 +70,7 @@ def test_thinker_structural_values_override_top_level_mirrors():
         use_moe=False,
         num_experts=1,
         num_experts_per_tok=1,
-        thinker_config=thinker_values,
+        thinker_config={**thinker_values, "routing_kind": "sparse"},
     )
 
     saved = config.to_dict()
