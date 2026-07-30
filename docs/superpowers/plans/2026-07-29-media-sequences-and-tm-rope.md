@@ -368,8 +368,13 @@ Position tensors may be integer or floating point: the exact Qwen3 oracle emits
 `float32` and may produce fractional temporal IDs, while the legacy builder
 emits integer IDs. `SequenceSpanKind.MEDIA` requires a complete `MediaSource`
 and `source_token_indices` with one original row-major token index per output
-token. Timestamp spans retain their associated source when one exists but have
-no source-token indices. Text spans have no
+token. `SequenceSpanKind.TIMESTAMP` requires a complete source and modality,
+and requires grid, timestamps, seconds-per-grid and source-token indices all
+to be `None`. During `AssembledSequence.validate()`, every timestamp source
+must correspond to a MEDIA source in that assembled sample and its modality
+must exactly match that source's canonical MEDIA modality; timestamp spans may
+appear before the matching media span, so this check occurs after collecting
+all spans. Text spans have no
 source/modality/grid/timestamps/seconds-per-grid/indices.
 Video media spans preserve explicit `seconds_per_grid` when supplied by their
 source; the Qwen3 disjoint builder requires it instead of guessing cadence from
@@ -945,6 +950,7 @@ git commit -m "feat: preserve media token sequences"
 ### Task 5: Replace media sentinels with encoded sequences
 
 **Files:**
+- Create: `src/qwen3_omni_pretrain/multimodal/time_quantization.py`
 - Create: `src/qwen3_omni_pretrain/multimodal/sequence_assembler.py`
 - Create: `tests/multimodal/test_sequence_assembler.py`
 
@@ -956,7 +962,8 @@ git commit -m "feat: preserve media token sequences"
 - Produces: `MediaPlaceholder`, `MediaExpansionGroup`, `MediaTokenRef`,
   `ExpansionToken`, `ExpandedMediaRow`, `ExpandedMediaSample`,
   `MediaExpansionPolicy`, `IdentityMediaExpansion`,
-  `TimestampInterleaveExpansion`, and
+  `TimestampInterleaveExpansion`, `AssembledLengthError`, shared
+  `quantize_timestamps_half_up(...)`, and
   `SequenceAssembler.assemble(...) -> AssembledSequence`.
 
 - [ ] **Step 1: Write a failing exact replacement test**
@@ -1021,6 +1028,38 @@ class SequenceAssembler:
         ...
 ```
 
+Shared temporal quantization has the exact public signature:
+
+```python
+def quantize_timestamps_half_up(
+    timestamps: torch.Tensor,
+    seconds_per_bucket: float,
+) -> torch.LongTensor:
+    ...
+```
+
+It requires a floating non-complex tensor and a real, non-boolean, finite,
+positive step; every timestamp must be finite and non-negative. It first
+downcasts any input dtype to float32 on the same device, constructs the step as
+a float32 scalar there, and returns
+`floor(value / step + 0.5).long()` with the exact input shape/device. It
+rejects malformed values itself rather than relying on a caller's validation.
+
+`SequenceAssembler` is a strict tensor boundary. `input_ids` is non-empty,
+non-negative long `[B,T]`; `text_embeddings` is floating non-complex
+`[B,T,H]` with `H > 0`; `attention_mask` is binary boolean/integer `[B,T]`;
+and `labels` is either `None` or long `[B,T]` containing only `-100` or
+non-negative values. Coupled text tensors share one device. Every row has a
+non-empty right-padded prefix mask; masked IDs equal `pad_token_id` and masked
+labels equal `-100`. A valid token may equal `pad_token_id`; only the mask
+defines validity.
+
+Every input `MediaSequence` is validated. Each media row must likewise have a
+non-empty prefix mask so `MediaTokenRef.token_index` is simultaneously its
+physical embedding column and complete-source row-major index. All media
+embeddings exactly match the text hidden size, dtype, and device; the
+assembler never silently casts them.
+
 Define the profile extension point:
 
 ```python
@@ -1077,6 +1116,14 @@ class MediaExpansionPolicy(Protocol):
         groups: tuple[MediaExpansionGroup, ...],
     ) -> ExpandedMediaSample:
         ...
+
+
+class AssembledLengthError(ValueError):
+    sample_index: int
+    assembled_length: int
+    max_assembled_length: int
+    retained_text_tokens: int
+    inserted_expansion_tokens: int
 ```
 
 `SequenceSpanKind.MEDIA` expansion tokens require an in-range `media_ref`;
@@ -1096,67 +1143,115 @@ This makes exact source consumption independently verifiable instead of
 trusting a policy's self-reported consumed-source list.
 
 `TimestampInterleaveExpansion` is the production experimental policy. It stores
-only `seconds_per_bucket` and a finite bucket→ordinary-token-ID mapping. Inside
-each assembler-approved group it stable-sorts timestamped audio/video
-`MediaTokenRef` objects by `(timestamp, item_index, token_index)`, optionally
-emits `SequenceSpanKind.TIMESTAMP` tokens when the rounded bucket changes, and
-assigns the jointly sorted output to the first placeholder with empty
-replacements for the remaining placeholders. A missing/non-finite timestamp or
-unmapped bucket is an error. It never groups across a boundary itself.
+only `seconds_per_bucket` and an immutable snapshot of a finite
+bucket→ordinary-token-ID mapping. `bucket_token_ids` must be a
+`Mapping[int,int]`; an empty mapping is valid so image-only groups can use
+identity expansion, while any AV bucket encountered with no entry is an
+unmapped-bucket error. The constructor validates the entire mapping and copies
+it, so later caller mutation cannot affect policy behavior. For an AV-only
+assembler-approved group it
+stable-sorts timestamped audio/video `MediaTokenRef` objects by
+`(timestamp,item_index,token_index)`. It computes buckets through the shared
+helper using float32 tensor arithmetic: convert timestamps to float32 without
+promoting them, create a float32 step on the same device, then evaluate
+`floor(timestamp / step + 0.5).long()`. Python `round`, float64 promotion and
+precomputed Python buckets are forbidden. It emits exactly one
+`SequenceSpanKind.TIMESTAMP` token immediately before the first media token in
+every bucket, including the first. The marker uses the mapped ordinary token
+ID and the source of that bucket's first deterministically sorted media ref.
+It assigns the jointly sorted output to the first placeholder with exactly
+empty replacements for later placeholders. Image-only groups use identity
+expansion per placeholder with no timestamp token; one group mixing IMAGE with
+AUDIO/VIDEO is rejected. Images and AV may coexist in a sample when text puts
+them in separate groups. A missing/non-finite timestamp or unmapped bucket is
+an error. It never groups across a boundary itself.
 Its constructor rejects booleans, NaN/Inf or non-positive
 `seconds_per_bucket`, non-integer/negative bucket keys, and
 non-integer/negative token IDs.
 
 Both policies are pure, parameter-free non-modules and never own or alias the
 language-model embedding. `embedding_lookup` is used only by the assembler to
-materialize ordinary timestamp tokens. A policy may not bypass source-span or
-label validation.
+materialize ordinary timestamp tokens. For each timestamp-bearing row, the
+assembler makes exactly one lookup call with final-order long IDs on
+`input_ids.device`; it requires a floating
+`[timestamp_token_count,hidden_size]` result on the exact text-embedding
+dtype/device. It does not call the lookup for rows without timestamp tokens.
+A policy may not bypass source-span or label validation.
 
 For each batch row:
 
-1. ignore padded text positions;
+1. validate all scalar/text fields, then every `MediaSequence`, global source
+   uniqueness, hidden size/dtype/device, and non-empty prefix masks;
 2. map media sources by `(sample_index, item_index)`, require item indices to be
    exactly `0..N-1`, and pair the row's `k`th sentinel only with
    `(sample_index,k)`; transport/container order is never pairing semantics;
-3. build `MediaExpansionGroup` objects. Two placeholders share a group only
-   when every valid text token between them belongs to the explicit
-   `joint_separator_token_ids` whitelist. Labels do not grant adjacency:
-   unsupervised natural-language tokens still split groups;
+3. build maximal `MediaExpansionGroup` objects over consecutive placeholders
+   in original valid-text order. A consecutive pair joins iff every valid
+   token strictly between it belongs to `joint_separator_token_ids`; an empty
+   interval joins vacuously. Group bounds are inclusive first/last placeholder
+   positions. Labels do not grant adjacency: unsupervised natural-language
+   tokens still split groups;
 4. collect all validated groups for that sample and call
-   `expand_sample()` exactly once;
+   `expand_sample()` exactly once, including `groups=()` for a no-media row,
+   whose only valid replacement mapping is empty;
 5. verify the result has exactly the placeholder-position keys (a joint policy
-   may assign a zero-length replacement to later placeholders), every media
-   ref belongs to the same approved group as its replacement, and the output
+   may assign a zero-length replacement to later placeholders), validate every
+   result/container/token type and exact non-negative ID, and require one of
+   two shapes per group: either each replacement contains only its own source,
+   or the first replacement may contain any group source while all later
+   replacements are exactly empty. Refs may never move to a later placeholder
+   or split between first and later replacements. The output
    media refs are an exact permutation of every valid input
    `(MediaSource, token_index)` pair. Filtering the output by any one source
    must yield token indices exactly `0..valid_count-1`, preserving that
    source's temporal/row-major order even when sources are interleaved;
-6. walk text tokens left-to-right and copy ordinary text embeddings;
-7. splice the symbolic replacement, gathering media embeddings from their refs
-   and timestamp embeddings through `embedding_lookup`;
-8. emit typed text/media/timestamp `SequenceSpan` objects with the complete
-   `MediaSource`, exact `source_token_indices`, the complete source grid,
-   timestamp values selected by those indices and per-source
-   `seconds_per_grid`; mask every inserted label with `-100`;
-9. right-pad assembled IDs with the validated caller-supplied `pad_token_id`
-   and pad masks/labels/embeddings to the batch maximum.
+6. count `retained_text_tokens` as valid non-sentinel input tokens and
+   `inserted_expansion_tokens` as all MEDIA and TIMESTAMP policy output. Before
+   lookup/materialization, raise `AssembledLengthError` when their sum exceeds
+   the limit; expose all five declared attributes in its message;
+7. walk valid text tokens left-to-right, remove sentinels, and copy every
+   ordinary text ID/embedding/label exactly;
+8. splice the symbolic replacement, gathering media embeddings from canonical
+   refs and timestamp embeddings through the one-per-row lookup contract;
+9. emit maximal deterministic spans. TEXT carries no media metadata. MEDIA is
+   maximal for one source with consecutive indices and carries its canonical
+   modality, complete grid, timestamps selected by canonical indices,
+   `seconds_per_grid`, and exact indices. TIMESTAMP is maximal for one source,
+   carries its canonical source/modality, and has no grid/timestamps/cadence/
+   source indices. Empty replacements emit no span. Mask every inserted label
+   with `-100`;
+10. right-pad to the maximum assembled valid row length with the validated
+    caller `pad_token_id`, zero embeddings, boolean false masks and `-100`
+    labels. Preserve `labels=None` and call `AssembledSequence.validate()`.
 
 A policy that combines AV items may emit their jointly sorted sequence at the
 first placeholder and zero tokens at the remaining placeholders only inside
 one pre-approved group. It therefore cannot reorder media across supervised or
 unsupervised natural-language content.
 
-Do not encode media and do not compute position IDs.
-Validate `pad_token_id >= 0`, every separator ID non-negative, the separator
-set is disjoint from pad/media-sentinel IDs, and `max_assembled_length > 0`
-before row assembly. Fail before batch padding as soon as a row's expanded
-token count exceeds it. The error records sample index and separate
-retained-text and inserted-expansion token counts.
+Do not encode media and do not compute position IDs. Require `tokens` to be
+`ResolvedMultimodalTokens`. Every present resolved token ID, `pad_token_id`,
+`max_assembled_length`, and separator ID uses exact integer semantics
+(booleans rejected). Present resolved IDs are non-negative and pairwise
+distinct; pad is non-negative and distinct from all media sentinels; the hard
+limit is positive. `joint_separator_token_ids` is a `frozenset` of
+non-negative integers disjoint from pad/media sentinels. Wrapper IDs may be
+whitelisted separators. `expansion_policy=None` means a fresh parameter-free
+`IdentityMediaExpansion()` for that call.
 
 - [ ] **Step 4: Fail on every ambiguous mapping**
 
 Add exact errors for:
 
+- wrong text ID/label dtype, non-binary or holey text/media masks, a masked
+  supervised label, zero-valid row, text/media dtype/device mismatch, and a
+  malformed timestamp-lookup result;
+- wrong text rank/coupled shape, integer or complex text embeddings, a
+  negative input ID, any negative label other than `-100` (including `-1` and
+  `-2`), and a masked input ID unequal to `pad_token_id`, all before policy
+  invocation;
+- invalid/bool/colliding resolved token IDs, a pad/media-sentinel collision,
+  bool scalar values, and a mutable/non-frozen separator collection;
 - sentinel with no media item;
 - extra media item;
 - modality mismatch;
@@ -1167,6 +1262,8 @@ Add exact errors for:
 - all-masked media sequence;
 - a media ref duplicated, missing, out of range or moved across an approved
   expansion group;
+- refs moved to the last placeholder or split between first/later
+  replacements, and malformed policy result/container/token types;
 - a media expansion token whose ID is not the referenced source modality's
   exact sentinel;
 - a source's media refs reordered even when the global ref set remains an
@@ -1183,7 +1280,9 @@ Cover:
 - image and video in one sample;
 - no-media sample sharing a batch with media samples;
 - inference with `labels=None`;
-- text padding and target labels after expansion;
+- text padding and target labels after expansion; exact output padding is the
+  non-zero pad ID, zero embedding, `False` mask and `-100` label, while every
+  retained text field is bitwise equal to its valid input value;
 - exact complete-source span start/end positions;
 - expanded token IDs for every media position;
 - a custom sample policy that inserts two ordinary timestamp tokens through the
@@ -1191,6 +1290,24 @@ Cover:
 - a joint policy fixture with timestamps
   `[audio0=0.00, video0=0.08, audio1=0.16, video1=0.24]` whose assembled media
   spans are exactly audio→video→audio→video;
+- half-up bucket boundaries at `0.5` and `1.5` bucket units, a marker before
+  the first bucket, one marker for repeated refs in a bucket, and marker source
+  equal to that bucket's first sorted ref;
+- missing AV timestamps and an unmapped current bucket fail explicitly;
+- `bucket_token_ids` rejects non-mappings and bool/negative keys or IDs;
+  empty mapping passes for image-only groups and fails when AV is encountered;
+  mutating the caller's mapping after policy construction does not change
+  output;
+- direct shared-helper tests cover non-Tensor/integer/complex timestamps,
+  negative/NaN/Inf values, bool/NaN/Inf/non-positive steps, exact shape/device
+  preservation and float64 input downcast before the boundary calculation;
+- timestamp lookup is called exactly once for each timestamp-bearing row and
+  never for other rows; wrong count/rank/hidden-size/dtype/device results fail;
+- image-only groups use identity expansion, image and AV work in separate
+  groups in one sample, and a single mixed image+AV group fails;
+- groups are maximal: adjacent/whitelist-only placeholder intervals join,
+  natural text splits even when unsupervised, and a no-media row calls the
+  policy once with `groups=()` and requires an empty mapping;
 - direct assembler tests shuffle both the `media_sequences` container and rows
   inside a `MediaSequence` while preserving keys and require identical output;
 - a non-zero `pad_token_id` test where neither original row has padding but
@@ -1198,8 +1315,16 @@ Cover:
 - the same joint expansion rejects supervised or unsupervised natural-language
   separators, duplicated/missing/foreign/reordered media refs, item-index gaps,
   or an unknown replacement key;
+- a holey media mask `[1,0,1]` fails before policy invocation, while
+  `[1,1,0]` gathers exact columns/indices `(0,1)`;
 - interleaved video fragments retain original row-major token indices so later
   position builders reconstruct exact H/W coordinates;
+- MEDIA spans preserve canonical complete grid, selected timestamps, cadence
+  and exact source indices after interleaving; TIMESTAMP spans carry only the
+  chosen source/modality and empty replacements create no zero-length span;
+- the hard limit passes at equality and fails at `limit+1` with timestamp
+  tokens counted as inserted expansion and replaced sentinels excluded from
+  retained text, asserting all `AssembledLengthError` fields;
 - arbitrary/negative/cross-modality media token IDs are rejected even when the
   symbolic ref and embedding are otherwise valid.
 
@@ -1216,6 +1341,7 @@ Expected: all tests pass.
 
 ```bash
 git add src/qwen3_omni_pretrain/multimodal/sequence_assembler.py \
+  src/qwen3_omni_pretrain/multimodal/time_quantization.py \
   tests/multimodal/test_sequence_assembler.py
 git commit -m "feat: assemble multimodal token sequences"
 ```
@@ -1301,20 +1427,23 @@ class Qwen3DisjointPositionConfig:
     rotary_sections: tuple[int, int, int] = (24, 20, 20)
 
     def __post_init__(self) -> None:
+        if isinstance(self.position_id_per_seconds, bool) or not isinstance(
+            self.position_id_per_seconds, Real
+        ):
+            raise TypeError("position_id_per_seconds must be a real number")
         if (
-            isinstance(self.position_id_per_seconds, bool)
-            or not isinstance(self.position_id_per_seconds, (int, float))
-            or not math.isfinite(self.position_id_per_seconds)
+            not math.isfinite(float(self.position_id_per_seconds))
             or self.position_id_per_seconds <= 0
         ):
             raise ValueError("position_id_per_seconds must be finite and positive")
-        if (
-            not isinstance(self.rotary_sections, tuple)
-            or len(self.rotary_sections) != 3
-            or any(type(section) is not int or section <= 0
-                   for section in self.rotary_sections)
-        ):
+        if not isinstance(self.rotary_sections, tuple):
+            raise TypeError("rotary_sections must be a tuple")
+        if len(self.rotary_sections) != 3:
             raise ValueError("rotary_sections must contain three positive integers")
+        if any(type(section) is not int for section in self.rotary_sections):
+            raise TypeError("rotary_sections must contain integers")
+        if any(section <= 0 for section in self.rotary_sections):
+            raise ValueError("rotary_sections must contain positive integers")
 
 
 @dataclass(frozen=True)
@@ -1324,32 +1453,54 @@ class TMRoPEConfig:
     interleaved: bool = True
 
     def __post_init__(self) -> None:
+        if isinstance(self.temporal_seconds_per_id, bool) or not isinstance(
+            self.temporal_seconds_per_id, Real
+        ):
+            raise TypeError("temporal_seconds_per_id must be a real number")
         if (
-            isinstance(self.temporal_seconds_per_id, bool)
-            or not isinstance(self.temporal_seconds_per_id, (int, float))
-            or not math.isfinite(self.temporal_seconds_per_id)
+            not math.isfinite(float(self.temporal_seconds_per_id))
             or self.temporal_seconds_per_id <= 0
         ):
             raise ValueError(
                 "temporal_seconds_per_id must be finite and positive"
             )
-        if (
-            not isinstance(self.rotary_sections, tuple)
-            or len(self.rotary_sections) != 3
-            or any(type(section) is not int or section <= 0
-                   for section in self.rotary_sections)
-        ):
+        if not isinstance(self.rotary_sections, tuple):
+            raise TypeError("rotary_sections must be a tuple")
+        if len(self.rotary_sections) != 3:
             raise ValueError(
                 "rotary_sections must contain three positive integers"
             )
+        if any(type(section) is not int for section in self.rotary_sections):
+            raise TypeError("rotary_sections must contain integers")
+        if any(section <= 0 for section in self.rotary_sections):
+            raise ValueError("rotary_sections must contain positive integers")
+        if type(self.interleaved) is not bool:
+            raise TypeError("interleaved must be a boolean")
 ```
 
 Both configs reject booleans, NaN/Inf and non-positive temporal values, require
 exactly three positive integer rotary sections, and expose the sections as a
 downstream rotary-layout contract. Position generation does not itself split
 head dimensions; tests assert the pinned `(24,20,20)` contract explicitly.
+`TMRoPEConfig` additionally requires `type(interleaved) is bool`; version one
+preserves either value only as downstream rotary-layout metadata because
+position generation does not consume it. Wrong types raise `TypeError` and
+invalid numeric values raise `ValueError` consistently. Define exact module
+constants for axis names `("sequence",)` and
+`("temporal","height","width")`.
 
-`LegacyPositionBuilder` returns `[1,B,S]`, axis `("sequence",)`.
+Every `build()` first calls `assembled.validate()`, then requires a non-empty
+batch and sequence plus one or more valid tokens in every non-empty
+right-padded prefix row. It allocates outputs on
+`assembled.attention_mask.device`, zeroes every masked returned position, and
+calls `PositionBatch.validate(assembled.attention_mask)` before return.
+
+`LegacyPositionBuilder` returns exactly `torch.long [1,B,S]` with axis
+`("sequence",)`. For valid row length `L`, valid IDs are `0..L-1`, padded IDs
+are zero, and `rope_deltas` is an exact long zero tensor `[B,1]`. It checks
+monotonicity only over valid positions. This matches the current legacy
+model's default arange at every supported valid prefix position; legacy does
+not consume Qwen-style deltas.
 Both three-axis builders return `float32 [3,B,S]`, axes
 `("temporal","height","width")`, and `float32 rope_deltas [B,1]`.
 
@@ -1357,24 +1508,34 @@ Both three-axis builders return `float32 [3,B,S]`, axes
 
 `Qwen3DisjointPositionBuilder` reproduces the pinned
 `use_audio_in_video=False` branches, not the joint-AV facade and not the
-experimental timestamp grid. It rejects interleaved/split media sources:
-every media source must occupy one contiguous block with source-token indices
-`0..valid_count-1`.
+experimental timestamp grid. It groups by complete `MediaSource`, requires
+exactly one MEDIA span per source (even adjacent split fragments fail), and
+requires that span's indices to be exactly `0..valid_count-1`. Qwen3 profile
+wiring must use `IdentityMediaExpansion`; the builder cannot infer policy
+provenance from an already assembled tensor and therefore makes no broader
+categorical joint-policy claim.
 
-- use `position_id_per_seconds=13.0` and preserve the official floating
-  multiplication (no 80 ms rounding);
+- use `position_id_per_seconds=13.0` and preserve the official float32 eager
+  operation order (no 80 ms rounding): cast original frame index to float32,
+  multiply by a float32 `seconds_per_grid`, then separately multiply by a
+  float32 rate and add the float32 continuation. Never precompute/fold the two
+  scalar factors or round-trip continuation/max through Python scalars;
 - text and timestamp spans advance all axes together from one plus the maximum
   value across **all** axes emitted so far;
-- image T/H/W follow the official merged-grid layout;
+- image T/H/W follow the official merged-grid layout and require
+  `grid.temporal == 1`. Project `MediaGrid` H/W are post-spatial-merge output
+  token axes; the oracle maps them to official pre-merge axes by the pinned
+  spatial merge factor (`project 1x2x2 <-> official 1x4x4`);
 - video requires explicit finite positive `seconds_per_grid` whenever
-  `grid.temporal > 1`; temporal IDs are original frame indices multiplied by
-  exact `seconds_per_grid * position_id_per_seconds`, then offset by the
-  current continuation cursor;
+  `grid.temporal > 1`; temporal IDs use the separate float32 operations above
+  and then the current continuation tensor;
 - image/video H/W and frame indices are reconstructed from each span's
   `source_token_indices`, never from the fragment's new output offset;
 - audio media IDs follow the pinned sequential feature-grid behavior;
 - after every block, continuation is based on the maximum across T/H/W;
-- padded positions are normalized to zero. For a batch with any media span,
+- padded positions are normalized to zero. Select the pure-text fallback only
+  when the entire batch contains no MEDIA span. If any row has media, every
+  row uses the multimodal continuation/delta branch. For such a batch,
   `rope_deltas` is
   `max(position_ids over all valid axes) + 1 - valid_sequence_length`;
 - for a pure-text batch (the facade branch with all media metadata `None`),
@@ -1388,27 +1549,41 @@ The common builder deliberately normalizes masked padding positions to zero.
 The pinned text-only facade fills them with one; masked values are outside the
 numerical compatibility claim. Oracle comparisons are exact on valid
 positions, dtype/shape, attention-mask behavior and rope delta. Add a
-non-skippable single-valid-token-plus-padding vector to prevent this branch
-from regressing.
+non-skippable single-valid-token-plus-padding vector and a
+two-valid-token-plus-padding vector to prevent this branch from regressing.
+Also add a mixed image/one-token-text batch proving the text row's delta is
+`0.0`, while the identical row in an all-text batch has delta `1.0`.
+
+The mandatory non-skippable fractional oracle uses project
+`MediaGrid(8,1,1)` (official `[8,2,2]`), `seconds_per_grid=0.08`, one start
+token and one end token. Its exact float32 temporal row is
+`[0.0, 1.0, 2.0399999618530273, 3.0799999237060547,
+4.119999885559082, 5.159999847412109, 6.199999809265137,
+7.239999771118164, 8.280000686645508, 9.280000686645508]` and its delta is
+`0.2800006866455078`; this must distinguish sequential multiplication from a
+folded step.
 
 `TMRoPEPositionBuilder` is explicitly experimental. For each sample, start
 `text_cursor=0`, `timeline_anchor=None`, and `max_position_seen=-1`:
 
-- text and `SequenceSpanKind.TIMESTAMP` spans use
-  `max(text_cursor, max_position_seen + 1) + arange(length)` on all axes, then
-  advance `text_cursor`;
-- on the first timestamped audio/video span, set `timeline_anchor` to the
-  current `text_cursor`;
-- timestamped audio: quantize each sample-global timestamp with explicit
-  non-negative half-up rounding
-  `floor(timestamp / temporal_seconds_per_id + 0.5)`, add `timeline_anchor`,
-  and use the same IDs on T/H/W;
-- image without timestamps: temporal is the current `text_cursor`; H/W are
-  row/column grid IDs plus that cursor;
-- timestamped video: temporal is
-  `timeline_anchor + half_up(global_frame_seconds / grid)` expanded across
-  spatial patches; H/W are reconstructed from original source-token indices
-  and repeat per frame;
+- before each span use
+  `continuation=max(text_cursor,max_position_seen+1)`;
+- text and canonical `SequenceSpanKind.TIMESTAMP` spans use
+  `continuation + arange(length)` on all axes, then set
+  `text_cursor=continuation+length`;
+- image requires no timestamps and `grid.temporal == 1`; T is continuation,
+  while H/W are continuation plus row/column reconstructed from original
+  complete-source indices. Consecutive images therefore cannot reuse a base;
+- on the first timestamped audio/video span, set the single sample-global
+  `timeline_anchor=continuation`;
+- timestamped audio uses
+  `timeline_anchor + quantize_timestamps_half_up(timestamp,
+  temporal_seconds_per_id)` on all T/H/W axes;
+- timestamped video uses the same value for T and
+  `timeline_anchor + row/column` for H/W. Aggregate all fragments for a source,
+  derive frame from `source_index // (grid.height * grid.width)`, require every
+  patch in one frame to have exactly one identical global timestamp, quantize
+  one value per frame and scatter back to each fragment;
 - update `max_position_seen` from all three axes after every span, but do not
   add a new per-modality timeline origin. Two audio/video tokens at the same
   global timestamp therefore receive the same T ID even if their spans are
@@ -1417,32 +1592,78 @@ from regressing.
   ID; causal order remains the assembled token order, not numeric position
   monotonicity;
 - padded output positions are zero and ignored by the attention mask;
-- `rope_deltas` has shape `[B,1]` and uses the maximum across every valid axis.
+- `rope_deltas` is exactly
+  `max_position_seen + 1 - valid_sequence_length` in float32 `[B,1]`.
 
-Reject non-finite/negative timestamps, timestamps that are non-monotonic
-within one source after quantization, and complete grids whose token count
-disagrees with that source's total referenced token count. Never compare a
-fragment span length to the full grid token count. Add a fixture where audio
-and video at global `0.32s` share their experimental temporal ID while their
-spatial IDs remain modality-specific. Add timestamp-span tests proving its IDs
-are text-like and that it advances the next block. Add a fragmented video
-fixture whose original indices recover exact T/H/W coordinates. For the
-disjoint builder, add rejection tests for split/interleaved sources and
-missing/invalid multi-frame video cadence.
+The experimental builder supports exactly untimestamped static IMAGE,
+timestamped AUDIO with no grid, timestamped VIDEO with a complete grid, and
+canonical text-like TIMESTAMP spans. Video `seconds_per_grid` may remain as
+metadata but explicit timestamps are authoritative. Every IMAGE source must
+occupy exactly one complete MEDIA span; split/fragmented images are rejected,
+while validated AUDIO/VIDEO source fragmentation remains supported. Reject untimestamped
+AUDIO/VIDEO, timestamped IMAGE, non-finite/negative/non-monotonic source
+timestamps, inconsistent timestamps within a video frame, and a complete grid
+whose token count disagrees with the source's total referenced token count.
+Never compare one fragment length to the full grid count.
+
+Experimental quantization imports the Task 5 shared helper and stays in
+float32: convert timestamps to float32 without promotion, construct a float32
+step on the same device, then compute `floor(value / step + 0.5).long()`.
+Python round and float64 promotion are forbidden. Add cross-component tests at
+0.5 and 1.5 bucket boundaries and float32 epsilon neighbors that assert both
+the Task 5 timestamp marker ID and Task 6 media T coordinate. Add a fixture
+where audio and video at global `0.32s` share T while spatial IDs differ,
+timestamp spans that advance continuation, consecutive image and image→first
+AV literal vectors, and an A/B/A fragmented video fixture with exact original
+coordinates. Qwen disjoint tests reject split sources and missing/invalid
+multi-frame cadence; experimental accepts validated fragmentation.
+
+Add strict common and legacy coverage:
+
+- every builder rejects invalid `AssembledSequence`, empty batch/sequence,
+  all-masked or holey rows, non-binary masks and device mismatch before output;
+- CPU dtype/device/axis names and masked zeros are exact, CUDA is covered when
+  available, and every result passes `PositionBatch.validate(mask)`;
+- a two-row unequal-length legacy batch (including non-zero pad ID), one-token
+  padded row, and a media-containing row all receive long sequential valid
+  IDs and long zero deltas;
+- config tests reject booleans/lists/zero/NaN/Inf as specified and verify both
+  boolean `interleaved` values are preserved without changing positions;
+- Qwen covers no-padding text, both padded-text quirks, batch-global mixed
+  branch, pinned image/audio/integer-video/fractional-video vectors,
+  continuation across multiple disjoint blocks, original-index H/W, a
+  temporal-one video without cadence, and adjacent/A-B-A source fragmentation
+  failures;
+- experimental covers distinct 80 ms/160 ms configs, exact float32 boundary
+  quantization, fixed anchor across later text/marker spans, consecutive
+  images, image-to-first-AV anchor, split-image rejection, fragmented A/B/A
+  AV sources, inconsistent
+  frame-patch timestamps, every unsupported metadata combination, exact delta,
+  padding independence, and permitted spatial/temporal reuse.
 
 - [ ] **Step 5: Compare Qwen3 disjoint builder with official `get_rope_index()`**
 
 Extract the pinned configuration-only facade and fixed vectors from
 `test_qwen3_omni_processor_oracle.py` into the reusable
 `tests/oracle/qwen3_omni_rope_oracle.py`. Both oracle test modules import that
-helper. The hard-coded text (including one-valid-token-plus-padding),
-image/video/audio vectors and implementation hash must run offline without
-processor/model artifacts, construct no model layers, and may not skip.
-Convert those vectors into `AssembledSequence` metadata and compare valid
-Qwen3 position IDs, dtype, shape and rope deltas exactly.
-These vectors intentionally cover `use_audio_in_video=False`; this builder
-rejects joint AV rather than claiming parity. The Qwen3 reference-runtime plan
-keeps the official facade for its audio-video parity fixture.
+helper. The helper contains only immutable constants/fresh vector factories,
+the lightweight facade, pinned Transformers version, expected implementation
+SHA-256 and hash function. It never imports pytest, calls `from_pretrained`,
+constructs model layers, or skips. The non-skippable oracle test first requires
+`transformers==5.2.0`, verifies the implementation hash and official facade
+against every fixed vector, then independently converts each vector to
+`AssembledSequence` and compares the project builder. Missing/wrong
+Transformers, a hash mismatch, or a fixed-vector mismatch fails.
+
+The checked-in set includes no-padding text, one-valid-plus-padding text,
+two-valid-plus-padding text, the mixed image/text batch-global branch, image,
+audio, integer-cadence video and the fractional 0.08-second eight-frame video.
+Oracle conversion explicitly maps official pre-merge H/W grids to project
+post-merge grids. Compare valid Qwen3 IDs, exact dtype/device-independent
+values, shapes and rope deltas. These vectors cover
+`use_audio_in_video=False`; profile wiring owns `IdentityMediaExpansion`, and
+Task 6 makes no full joint-AV parity claim. The later Qwen3 reference-runtime
+plan keeps the official facade for its audio-video parity fixture.
 
 Keep the processor-derived integration case separate and
 `@pytest.mark.reference`; only that integration case may explicitly skip when
