@@ -18,6 +18,9 @@ class ParameterStats:
     estimated_active_parameters_per_token: int
     routed_modules: int
     is_estimate: bool = True
+    routed_parameters: int = 0
+    shared_parameters: int = 0
+    dense_parameters: int = 0
 
     def to_dict(self) -> Dict[str, int | bool]:
         return asdict(self)
@@ -58,9 +61,24 @@ def collect_parameter_stats(model: torch.nn.Module) -> ParameterStats:
     active_parameters = total_parameters
     routed_modules = 0
     accounted_expert_parameter_ids: Set[int] = set()
+    shared_parameter_ids: Set[int] = set()
 
-    for module in model.modules():
-        if not isinstance(module, Qwen3OmniMoeMLP):
+    for name, module in model.named_modules():
+        if name.endswith("shared_mlp"):
+            shared_parameter_ids.update(
+                id(parameter)
+                for parameter in _unique_parameters(module.parameters())
+            )
+
+        if not (
+            isinstance(module, Qwen3OmniMoeMLP)
+            or (
+                hasattr(module, "experts")
+                and hasattr(module, "num_experts")
+                and hasattr(module, "num_experts_per_tok")
+                and hasattr(module, "gate")
+            )
+        ):
             continue
         routed_modules += 1
         expert_parameters = list(
@@ -92,11 +110,29 @@ def collect_parameter_stats(model: torch.nn.Module) -> ParameterStats:
         active_parameters -= all_expert_parameters
         active_parameters += selected_expert_parameters
 
+    routed_parameters = sum(
+        int(parameter.numel())
+        for parameter in all_parameters
+        if id(parameter) in accounted_expert_parameter_ids
+    )
+    shared_parameters = sum(
+        int(parameter.numel())
+        for parameter in all_parameters
+        if id(parameter) in shared_parameter_ids
+        and id(parameter) not in accounted_expert_parameter_ids
+    )
+    dense_parameters = (
+        total_parameters - routed_parameters - shared_parameters
+    )
+
     return ParameterStats(
         total_parameters=total_parameters,
         trainable_parameters=trainable_parameters,
         estimated_active_parameters_per_token=int(active_parameters),
         routed_modules=routed_modules,
+        routed_parameters=routed_parameters,
+        shared_parameters=shared_parameters,
+        dense_parameters=dense_parameters,
         is_estimate=True,
     )
 

@@ -30,5 +30,8 @@ def test_parameter_stats_count_unique_total_and_active_moe_parameters():
     assert stats.total_parameters == expected_total
     assert stats.trainable_parameters == expected_total
     assert stats.estimated_active_parameters_per_token == expected_active
+    assert stats.routed_parameters == 4 * one_expert
+    assert stats.shared_parameters == 0
+    assert stats.dense_parameters == dense + gate
     assert stats.routed_modules == 1
     assert stats.is_estimate is True
