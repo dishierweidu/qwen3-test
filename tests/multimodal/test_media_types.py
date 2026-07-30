@@ -840,6 +840,71 @@ def test_assembled_sequence_allows_cross_source_interleaving():
     ).validate()
 
 
+def test_assembled_sequence_rejects_orphan_timestamp_source():
+    source = MediaSource(0, 0, "audio-0")
+    timestamp_span = make_span(
+        kind=SequenceSpanKind.TIMESTAMP,
+        modality=MediaModality.AUDIO,
+        source=source,
+    )
+
+    with pytest.raises(ValueError, match="MEDIA source"):
+        make_assembled(
+            attention_mask=torch.ones(1, 1, dtype=torch.bool),
+            spans=(timestamp_span,),
+        ).validate()
+
+
+def test_assembled_sequence_rejects_timestamp_source_modality_mismatch():
+    source = MediaSource(0, 0, "audio-0")
+    spans = (
+        make_media_span(
+            start=0,
+            end=1,
+            modality=MediaModality.AUDIO,
+            grid=None,
+            source=source,
+            source_token_indices=(0,),
+        ),
+        make_span(
+            start=1,
+            end=2,
+            kind=SequenceSpanKind.TIMESTAMP,
+            modality=MediaModality.VIDEO,
+            source=source,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="modality"):
+        make_assembled(spans=spans).validate()
+
+
+def test_assembled_sequence_allows_timestamp_before_canonical_media_source():
+    source = MediaSource(0, 0, "audio-0")
+    spans = (
+        make_span(
+            start=0,
+            end=1,
+            kind=SequenceSpanKind.TIMESTAMP,
+            modality=MediaModality.AUDIO,
+            source=source,
+        ),
+        make_media_span(
+            start=1,
+            end=3,
+            modality=MediaModality.AUDIO,
+            grid=None,
+            source=source,
+            source_token_indices=(0, 1),
+        ),
+    )
+
+    make_assembled(
+        attention_mask=torch.ones(1, 3, dtype=torch.bool),
+        spans=spans,
+    ).validate()
+
+
 @pytest.mark.parametrize(
     "fragments",
     [

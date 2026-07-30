@@ -505,6 +505,7 @@ class AssembledSequence:
         valid_mask = attention_mask.to(dtype=torch.bool)
         coverage = torch.zeros_like(valid_mask)
         media_by_source: dict[MediaSource, list[SequenceSpan]] = {}
+        timestamp_spans: list[SequenceSpan] = []
         item_sources: dict[tuple[int, int], MediaSource] = {}
         id_sources: dict[tuple[int, str], MediaSource] = {}
 
@@ -562,16 +563,20 @@ class AssembledSequence:
                         "(sample_index, source_id)"
                     )
                 id_sources[id_key] = span.source
+            elif span.kind is SequenceSpanKind.TIMESTAMP:
+                timestamp_spans.append(span)
 
         if not torch.equal(coverage, valid_mask):
             raise ValueError(
                 "assembled span coverage must equal all valid tokens"
             )
 
+        media_modalities: dict[MediaSource, MediaModality] = {}
         for source, source_spans in media_by_source.items():
             ordered_spans = sorted(source_spans, key=lambda span: span.start)
             complete_grid = ordered_spans[0].grid
             modality = ordered_spans[0].modality
+            assert modality is not None
             seconds_per_grid = ordered_spans[0].seconds_per_grid
             if any(span.grid != complete_grid for span in ordered_spans):
                 raise ValueError(
@@ -604,6 +609,22 @@ class AssembledSequence:
                 raise ValueError(
                     "media source indices must preserve complete "
                     "row-major coverage"
+                )
+            media_modalities[source] = modality
+
+        for span in timestamp_spans:
+            assert span.source is not None
+            assert span.modality is not None
+            media_modality = media_modalities.get(span.source)
+            if media_modality is None:
+                raise ValueError(
+                    "timestamp span source must reference an assembled "
+                    "MEDIA source"
+                )
+            if span.modality is not media_modality:
+                raise ValueError(
+                    "timestamp span modality must match its MEDIA "
+                    "source modality"
                 )
 
 
