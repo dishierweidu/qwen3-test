@@ -193,7 +193,23 @@ def test_training_stage1_initialization_adapts_config_before_weights(
     monkeypatch,
 ):
     events = []
-    config = object()
+    expected_architecture = object()
+    expected_tokenizer_sha256 = "a" * 64
+    manifest = SimpleNamespace(
+        architecture_profile="legacy-profile",
+        compatibility_level="legacy-compatibility",
+    )
+
+    class AdaptedConfig:
+        profile_manifest = manifest
+
+        def to_dict(self):
+            return {
+                "model_type": "qwen3_omni_prototype",
+                "architecture_profile": "legacy_prototype",
+            }
+
+    config = AdaptedConfig()
 
     class SpyConfig:
         @classmethod
@@ -208,15 +224,37 @@ def test_training_stage1_initialization_adapts_config_before_weights(
             assert kwargs["config"] is config
             return cls()
 
+    def gate(checkpoint, **kwargs):
+        events.append("metadata-gate")
+        assert checkpoint == "checkpoint"
+        assert kwargs == {
+            "expected_profile": "legacy-profile",
+            "expected_compatibility": "legacy-compatibility",
+            "expected_architecture": expected_architecture,
+            "expected_tokenizer_sha256": expected_tokenizer_sha256,
+            "legacy_config": config.to_dict(),
+        }
+
     monkeypatch.setattr(trainer_thinker, "Qwen3OmniMoeConfig", SpyConfig)
     monkeypatch.setattr(
         trainer_thinker, "Qwen3OmniMoeThinkerTextModel", SpyModel
     )
+    monkeypatch.setattr(
+        trainer_thinker,
+        "load_checkpoint_metadata",
+        gate,
+    )
 
-    model = trainer_thinker._load_legacy_stage1_model("checkpoint")
+    model = trainer_thinker._load_legacy_stage1_model(
+        "checkpoint",
+        expected_profile=manifest.architecture_profile,
+        expected_compatibility=manifest.compatibility_level,
+        expected_architecture=expected_architecture,
+        expected_tokenizer_sha256=expected_tokenizer_sha256,
+    )
 
     assert isinstance(model, SpyModel)
-    assert events == ["legacy-adapt", "weight-load"]
+    assert events == ["legacy-adapt", "metadata-gate", "weight-load"]
 
 
 def test_inference_entry_calls_reconciled_loader(monkeypatch):

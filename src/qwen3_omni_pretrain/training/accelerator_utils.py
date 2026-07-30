@@ -23,6 +23,9 @@ from qwen3_omni_pretrain.architecture.profiles import (
     CompatibilityLevel,
 )
 from qwen3_omni_pretrain.architecture.summary import ArchitectureSummary
+from qwen3_omni_pretrain.training.checkpoint import (
+    _raise_if_accelerator_checkpoint_failed,
+)
 
 try:
     from accelerate import Accelerator, DistributedType
@@ -361,43 +364,90 @@ def save_tp_sharded_checkpoint(
 
     accelerator.wait_for_everyone()
 
+    setup_error: BaseException | None = None
     if accelerator.is_main_process:
-        os.makedirs(checkpoint_dir, exist_ok=True)
+        try:
+            os.makedirs(checkpoint_dir, exist_ok=True)
+        except BaseException as exc:
+            setup_error = exc
+    _raise_if_accelerator_checkpoint_failed(
+        accelerator,
+        setup_error,
+        "setup",
+    )
     accelerator.wait_for_everyone()
 
     rank = dist.get_rank() if dist.is_initialized() else 0
-    world = accelerator.num_processes
-    tp_size = get_tensor_model_parallel_world_size() if dist.is_initialized() else 1
     tp_rank = get_tensor_model_parallel_rank() if dist.is_initialized() else 0
 
-    # 所有 rank 都获取 state_dict，确保 TP 内部 collective 对齐
-    unwrapped = accelerator.unwrap_model(model)
-    print(f"[rank{rank}] >>> save: before state_dict (tp_rank={tp_rank})", flush=True)
-    model_sd = unwrapped.state_dict()
-    optim_sd = optimizer.state_dict() if optimizer is not None else None
-    sched_sd = scheduler.state_dict() if scheduler is not None else None
-    print(f"[rank{rank}] >>> save: after state_dict", flush=True)
+    state_error: BaseException | None = None
+    try:
+        # All ranks participate so TP state-dict collectives stay aligned.
+        unwrapped = accelerator.unwrap_model(model)
+        print(
+            f"[rank{rank}] >>> save: before state_dict "
+            f"(tp_rank={tp_rank})",
+            flush=True,
+        )
+        model_sd = unwrapped.state_dict()
+        optim_sd = (
+            optimizer.state_dict() if optimizer is not None else None
+        )
+        sched_sd = (
+            scheduler.state_dict() if scheduler is not None else None
+        )
+        print(f"[rank{rank}] >>> save: after state_dict", flush=True)
+    except BaseException as exc:
+        state_error = exc
+    _raise_if_accelerator_checkpoint_failed(
+        accelerator,
+        state_error,
+        "state collection",
+    )
 
     accelerator.wait_for_everyone()
 
+    payload_error: BaseException | None = None
     if accelerator.is_main_process:
-        # 写单文件 train.pt，包含模型权重与基本训练状态
-        train_payload = {
-            "model": model_sd,
-            "epoch": epoch,
-            "global_step": global_step,
-            "best_val_loss": best_val_loss,
-        }
-        if optim_sd is not None:
-            train_payload["optimizer"] = optim_sd
-        if sched_sd is not None:
-            train_payload["scheduler"] = sched_sd
+        try:
+            train_payload = {
+                "model": model_sd,
+                "epoch": epoch,
+                "global_step": global_step,
+                "best_val_loss": best_val_loss,
+            }
+            if optim_sd is not None:
+                train_payload["optimizer"] = optim_sd
+            if sched_sd is not None:
+                train_payload["scheduler"] = sched_sd
+            torch.save(
+                train_payload,
+                os.path.join(checkpoint_dir, "train.pt"),
+            )
+            if tokenizer is not None:
+                tokenizer.save_pretrained(checkpoint_dir)
+        except BaseException as exc:
+            payload_error = exc
+    _raise_if_accelerator_checkpoint_failed(
+        accelerator,
+        payload_error,
+        "payload",
+    )
 
-        torch.save(train_payload, os.path.join(checkpoint_dir, "train.pt"))
+    # Do not publish architecture.json until every payload writer is done.
+    accelerator.wait_for_everyone()
 
-        if tokenizer is not None:
-            tokenizer.save_pretrained(checkpoint_dir)
-        write_checkpoint_metadata(checkpoint_dir, metadata)
+    publication_error: BaseException | None = None
+    if accelerator.is_main_process:
+        try:
+            write_checkpoint_metadata(checkpoint_dir, metadata)
+        except BaseException as exc:
+            publication_error = exc
+    _raise_if_accelerator_checkpoint_failed(
+        accelerator,
+        publication_error,
+        "publication",
+    )
 
     accelerator.wait_for_everyone()
     print(f"[rank{rank}] >>> save: done", flush=True)
@@ -437,19 +487,43 @@ def save_accelerator_checkpoint(
             metadata=metadata,
         )
 
-    # 非 TP：使用 Accelerate 内建保存
-    accelerator.save_state(checkpoint_dir)
+    payload_error: BaseException | None = None
+    try:
+        accelerator.save_state(checkpoint_dir)
+        if accelerator.is_main_process:
+            state = {
+                "epoch": epoch,
+                "global_step": global_step,
+                "best_val_loss": best_val_loss,
+            }
+            torch.save(
+                state,
+                os.path.join(checkpoint_dir, "trainer_state.pt"),
+            )
+            if tokenizer is not None:
+                tokenizer.save_pretrained(checkpoint_dir)
+    except BaseException as exc:
+        payload_error = exc
+    _raise_if_accelerator_checkpoint_failed(
+        accelerator,
+        payload_error,
+        "payload",
+    )
 
+    # architecture.json is a readiness signal, so payload completion is global.
+    accelerator.wait_for_everyone()
+
+    publication_error: BaseException | None = None
     if accelerator.is_main_process:
-        state = {
-            "epoch": epoch,
-            "global_step": global_step,
-            "best_val_loss": best_val_loss,
-        }
-        torch.save(state, os.path.join(checkpoint_dir, "trainer_state.pt"))
-        if tokenizer is not None:
-            tokenizer.save_pretrained(checkpoint_dir)
-        write_checkpoint_metadata(checkpoint_dir, metadata)
+        try:
+            write_checkpoint_metadata(checkpoint_dir, metadata)
+        except BaseException as exc:
+            publication_error = exc
+    _raise_if_accelerator_checkpoint_failed(
+        accelerator,
+        publication_error,
+        "publication",
+    )
 
     accelerator.wait_for_everyone()
     return checkpoint_dir

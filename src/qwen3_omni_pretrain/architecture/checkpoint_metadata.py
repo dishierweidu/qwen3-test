@@ -18,7 +18,6 @@ from qwen3_omni_pretrain.architecture.profiles import (
 from qwen3_omni_pretrain.architecture.summary import ArchitectureSummary
 from qwen3_omni_pretrain.profiles.legacy_prototype.config_adapter import (
     LEGACY_MODEL_TYPE,
-    adapt_legacy_config_dict,
 )
 
 
@@ -158,28 +157,11 @@ def write_checkpoint_metadata(
         raise
 
 
-def _legacy_manifest_from_adapted_config(
+def _validate_adapted_legacy_identity(
     legacy_config: object,
-) -> ProfileManifest:
-    profile_manifest = getattr(legacy_config, "profile_manifest", None)
-    if profile_manifest is not None:
-        if not isinstance(profile_manifest, ProfileManifest):
-            raise TypeError(
-                "adapted legacy config profile_manifest must be "
-                "ProfileManifest"
-            )
-        profile_manifest.validate()
-        if (
-            profile_manifest.architecture_profile
-            is not ArchitectureProfile.LEGACY_PROTOTYPE
-        ):
-            raise ValueError(
-                "adapted config is not a legacy prototype profile"
-            )
-        return profile_manifest
-
+) -> None:
     if not isinstance(legacy_config, Mapping):
-        raise TypeError("adapted legacy config must be a mapping or config")
+        raise TypeError("adapted legacy config must be a mapping")
     if legacy_config.get("model_type") != LEGACY_MODEL_TYPE:
         raise ValueError(
             "adapted config is not a legacy prototype model"
@@ -191,14 +173,6 @@ def _legacy_manifest_from_adapted_config(
         raise ValueError(
             "adapted config is not a legacy prototype profile"
         )
-    adapt_legacy_config_dict(legacy_config)
-    return ProfileManifest(
-        architecture_profile=ArchitectureProfile.LEGACY_PROTOTYPE,
-        compatibility_level=CompatibilityLevel.LEGACY_PROTOTYPE,
-        sources={},
-        assumptions=("custom research architecture",),
-        exact_official_checkpoint_compatible=False,
-    )
 
 
 def load_checkpoint_metadata(
@@ -258,10 +232,11 @@ def load_checkpoint_metadata(
             raise ValueError(
                 "missing architecture.json requires an adapted legacy config"
             )
-        manifest = _legacy_manifest_from_adapted_config(legacy_config)
+        _validate_adapted_legacy_identity(legacy_config)
         if (
             expected_compatibility is not None
-            and manifest.compatibility_level is not expected_compatibility
+            and expected_compatibility
+            is not CompatibilityLevel.LEGACY_PROTOTYPE
         ):
             raise ValueError(
                 "adapted legacy config contradicts expected compatibility"

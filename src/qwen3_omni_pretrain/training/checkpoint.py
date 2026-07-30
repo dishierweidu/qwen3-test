@@ -33,6 +33,49 @@ def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
 	return model.module if hasattr(model, "module") else model
 
 
+def _raise_if_accelerator_checkpoint_failed(
+	accelerator: "Accelerator",
+	error: BaseException | None,
+	phase: str,
+) -> None:
+	"""Collectively propagate a checkpoint phase failure to every rank."""
+	world_size = int(getattr(accelerator, "num_processes", 1))
+	if world_size <= 1:
+		if error is not None:
+			raise RuntimeError(
+				f"Accelerator checkpoint {phase} failed: {error}"
+			) from error
+		return
+
+	device = getattr(accelerator, "device", torch.device("cpu"))
+	status = torch.tensor(
+		[int(error is not None)],
+		dtype=torch.int64,
+		device=device,
+	)
+	reduce = getattr(accelerator, "reduce", None)
+	if callable(reduce):
+		failed = reduce(status, reduction="sum")
+	elif dist.is_available() and dist.is_initialized():
+		failed = status.clone()
+		dist.all_reduce(failed, op=dist.ReduceOp.SUM)
+	else:
+		raise RuntimeError(
+			"Accelerator checkpoint failure coordination is unavailable"
+		)
+
+	if int(failed.item()) == 0:
+		return
+	if error is not None:
+		raise RuntimeError(
+			f"Accelerator checkpoint {phase} failed: {error}"
+		) from error
+	raise RuntimeError(
+		"Accelerator checkpoint failed on another rank during "
+		f"{phase}"
+	)
+
+
 def verify_checkpoint_integrity(checkpoint_dir: str, check_model: bool = True) -> bool:
 	"""
 	验证 checkpoint 的完整性。
@@ -253,6 +296,15 @@ def load_checkpoint(
 				legacy_config=legacy_config,
 			)
 			return _load_checkpoint_impl(try_dir, model, optimizer, scheduler, scaler, map_location)
+		except ValueError as e:
+			if try_dir != checkpoint_dir or not os.path.exists(backup_dir):
+				raise
+			last_error = e
+			warnings.warn(
+				f"[checkpoint] Failed to load from {try_dir}: {e}\n"
+				f"Trying backup: {backup_dir}"
+			)
+			continue
 		except (RuntimeError, FileNotFoundError) as e:
 			last_error = e
 			if try_dir == checkpoint_dir and os.path.exists(backup_dir):
@@ -368,44 +420,87 @@ def save_checkpoint_accelerator(
 	temp_dir = checkpoint_dir + ".tmp"
 	backup_dir = checkpoint_dir + ".backup"
 	
-	# 清理可能存在的临时目录（仅主进程）
+	cleanup_error: BaseException | None = None
 	if accelerator.is_main_process:
-		if os.path.exists(temp_dir):
-			shutil.rmtree(temp_dir)
+		try:
+			if os.path.exists(temp_dir):
+				shutil.rmtree(temp_dir)
+		except BaseException as exc:
+			cleanup_error = exc
+	_raise_if_accelerator_checkpoint_failed(
+		accelerator,
+		cleanup_error,
+		"cleanup",
+	)
 	
 	accelerator.wait_for_everyone()
-	os.makedirs(temp_dir, exist_ok=True)
-	
-	# 保存 accelerator 状态到临时目录
-	accelerator.save_state(temp_dir)
-	
-	# 主进程保存额外的训练状态信息
-	if accelerator.is_main_process:
-		state = {
-			"epoch": epoch,
-			"global_step": global_step,
-			"best_val_loss": best_val_loss,
-		}
-		torch.save(state, os.path.join(temp_dir, "trainer_state.pt"))
-		
-		# 保存 tokenizer
-		if tokenizer is not None:
-			tokenizer.save_pretrained(temp_dir)
-		write_checkpoint_metadata(temp_dir, metadata)
-		
-		# 验证 trainer_state 完整性
-		try:
-			torch.load(os.path.join(temp_dir, "trainer_state.pt"), map_location="cpu")
-		except Exception as e:
+
+	payload_error: BaseException | None = None
+	try:
+		os.makedirs(temp_dir, exist_ok=True)
+		accelerator.save_state(temp_dir)
+		if accelerator.is_main_process:
+			state = {
+				"epoch": epoch,
+				"global_step": global_step,
+				"best_val_loss": best_val_loss,
+			}
+			torch.save(
+				state,
+				os.path.join(temp_dir, "trainer_state.pt"),
+			)
+			if tokenizer is not None:
+				tokenizer.save_pretrained(temp_dir)
+	except BaseException as exc:
+		payload_error = exc
+
+	try:
+		_raise_if_accelerator_checkpoint_failed(
+			accelerator,
+			payload_error,
+			"payload",
+		)
+	except BaseException:
+		if accelerator.is_main_process and os.path.exists(temp_dir):
 			shutil.rmtree(temp_dir)
-			raise RuntimeError(f"Checkpoint verification failed: {e}")
-		
-		# 原子替换
-		if os.path.exists(backup_dir):
-			shutil.rmtree(backup_dir)
-		if os.path.exists(checkpoint_dir):
-			os.rename(checkpoint_dir, backup_dir)
-		os.rename(temp_dir, checkpoint_dir)
+		raise
+
+	# The readiness sidecar is written only after every rank finishes payload.
+	accelerator.wait_for_everyone()
+
+	publication_error: BaseException | None = None
+	if accelerator.is_main_process:
+		try:
+			write_checkpoint_metadata(temp_dir, metadata)
+			torch.load(
+				os.path.join(temp_dir, "trainer_state.pt"),
+				map_location="cpu",
+			)
+			if os.path.exists(backup_dir):
+				shutil.rmtree(backup_dir)
+			if os.path.exists(checkpoint_dir):
+				os.rename(checkpoint_dir, backup_dir)
+			os.rename(temp_dir, checkpoint_dir)
+		except BaseException as exc:
+			publication_error = exc
+			try:
+				if os.path.exists(temp_dir):
+					shutil.rmtree(temp_dir)
+				if (
+					os.path.exists(backup_dir)
+					and not os.path.exists(checkpoint_dir)
+				):
+					os.rename(backup_dir, checkpoint_dir)
+			except BaseException as rollback_exc:
+				publication_error = RuntimeError(
+					f"{exc}; rollback also failed: {rollback_exc}"
+				)
+
+	_raise_if_accelerator_checkpoint_failed(
+		accelerator,
+		publication_error,
+		"publication",
+	)
 	
 	accelerator.wait_for_everyone()
 	return checkpoint_dir
@@ -469,6 +564,15 @@ def load_checkpoint_accelerator(
 				return start_epoch, global_step, best_val_loss
 			
 			return 0, 0, float("inf")
+		except ValueError as e:
+			if try_dir != checkpoint_dir or not os.path.exists(backup_dir):
+				raise
+			last_error = e
+			warnings.warn(
+				f"[checkpoint] Failed to load from {try_dir}: {e}\n"
+				f"Trying backup: {backup_dir}"
+			)
+			continue
 		except (RuntimeError, FileNotFoundError) as e:
 			last_error = e
 			if try_dir == checkpoint_dir and os.path.exists(backup_dir):
@@ -506,24 +610,68 @@ def save_model_only_accelerator(
 	accelerator.wait_for_everyone()
 
 	rank = dist.get_rank() if dist.is_initialized() else 0
-	unwrapped_model = accelerator.unwrap_model(model)
-	print(f"[rank{rank}] >>> save_only_model: before state_dict", flush=True)
-	state_dict = accelerator.get_state_dict(unwrapped_model)
-	print(f"[rank{rank}] >>> save_only_model: after state_dict", flush=True)
+	state_error: BaseException | None = None
+	try:
+		unwrapped_model = accelerator.unwrap_model(model)
+		print(
+			f"[rank{rank}] >>> save_only_model: before state_dict",
+			flush=True,
+		)
+		state_dict = accelerator.get_state_dict(unwrapped_model)
+		print(
+			f"[rank{rank}] >>> save_only_model: after state_dict",
+			flush=True,
+		)
+	except BaseException as exc:
+		state_error = exc
+	_raise_if_accelerator_checkpoint_failed(
+		accelerator,
+		state_error,
+		"state collection",
+	)
 
 	accelerator.wait_for_everyone()
 
+	payload_error: BaseException | None = None
 	if accelerator.is_main_process:
-		os.makedirs(save_dir, exist_ok=True)
-		print("[rank0] >>> save_only_model: before save_pretrained", flush=True)
-		unwrapped_model.save_pretrained(
-			save_dir,
-			state_dict=state_dict,
-			safe_serialization=safe_serialization,
-			max_shard_size="2GB",
+		try:
+			os.makedirs(save_dir, exist_ok=True)
+			print(
+				"[rank0] >>> save_only_model: before save_pretrained",
+				flush=True,
+			)
+			unwrapped_model.save_pretrained(
+				save_dir,
+				state_dict=state_dict,
+				safe_serialization=safe_serialization,
+				max_shard_size="2GB",
+			)
+		except BaseException as exc:
+			payload_error = exc
+	_raise_if_accelerator_checkpoint_failed(
+		accelerator,
+		payload_error,
+		"payload",
+	)
+
+	# All model artifacts must be complete before publishing the sidecar.
+	accelerator.wait_for_everyone()
+
+	publication_error: BaseException | None = None
+	if accelerator.is_main_process:
+		try:
+			write_checkpoint_metadata(save_dir, metadata)
+			print(
+				"[rank0] >>> save_only_model: after save_pretrained",
+				flush=True,
+			)
+		except BaseException as exc:
+			publication_error = exc
+	_raise_if_accelerator_checkpoint_failed(
+		accelerator,
+		publication_error,
+		"publication",
 		)
-		write_checkpoint_metadata(save_dir, metadata)
-		print("[rank0] >>> save_only_model: after save_pretrained", flush=True)
 
 	accelerator.wait_for_everyone()
 	print(f"[rank{rank}] >>> save_only_model: done", flush=True)

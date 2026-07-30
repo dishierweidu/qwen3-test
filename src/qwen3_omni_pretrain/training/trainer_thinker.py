@@ -9,6 +9,7 @@ import hashlib
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, Union, List, Optional
@@ -76,7 +77,14 @@ from qwen3_omni_pretrain.architecture.checkpoint_metadata import (
     write_checkpoint_metadata,
 )
 from qwen3_omni_pretrain.architecture.manifest import ProfileManifest
-from qwen3_omni_pretrain.architecture.summary import summarize_model
+from qwen3_omni_pretrain.architecture.profiles import (
+    ArchitectureProfile,
+    CompatibilityLevel,
+)
+from qwen3_omni_pretrain.architecture.summary import (
+    ArchitectureSummary,
+    summarize_model,
+)
 from qwen3_omni_pretrain.training.stage2_config import (
     Stage2RuntimeConfig,
     Stage2TrainConfig,
@@ -89,22 +97,6 @@ from qwen3_omni_pretrain.multimodal.tokenization.special_tokens import (
 
 
 def _tokenizer_identity_sha256(tokenizer: object) -> str:
-    get_vocab = getattr(tokenizer, "get_vocab", None)
-    if not callable(get_vocab):
-        raise ValueError("tokenizer identity evidence is unavailable")
-    vocabulary = get_vocab()
-    if not isinstance(vocabulary, dict) or any(
-        not isinstance(token, str) or type(index) is not int
-        for token, index in vocabulary.items()
-    ):
-        raise ValueError("tokenizer identity evidence is malformed")
-    get_added_vocab = getattr(tokenizer, "get_added_vocab", None)
-    added_vocabulary = get_added_vocab() if callable(get_added_vocab) else {}
-    if not isinstance(added_vocabulary, dict) or any(
-        not isinstance(token, str) or type(index) is not int
-        for token, index in added_vocabulary.items()
-    ):
-        raise ValueError("tokenizer added-vocabulary evidence is malformed")
     special_token_roles: dict[str, int | None | list[int]] = {}
     for name in (
         "bos_token_id",
@@ -131,13 +123,68 @@ def _tokenizer_identity_sha256(tokenizer: object) -> str:
     special_token_roles["additional_special_tokens_ids"] = list(
         additional_ids
     )
+
+    serialization: dict[str, object] | None = None
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    backend_to_str = getattr(backend, "to_str", None)
+    if callable(backend_to_str):
+        try:
+            serialized_backend = backend_to_str()
+            if not isinstance(serialized_backend, str):
+                raise TypeError("backend serialization must be text")
+            backend_payload = json.loads(serialized_backend)
+            if not isinstance(backend_payload, dict):
+                raise TypeError("backend serialization must be an object")
+        except Exception:
+            pass
+        else:
+            serialization = {
+                "kind": "backend_tokenizer",
+                "payload": backend_payload,
+            }
+
+    if serialization is None:
+        save_pretrained = getattr(tokenizer, "save_pretrained", None)
+        if callable(save_pretrained):
+            try:
+                with tempfile.TemporaryDirectory() as directory:
+                    save_pretrained(directory)
+                    root = Path(directory)
+                    artifacts = []
+                    for artifact in sorted(
+                        path
+                        for path in root.rglob("*")
+                        if path.is_file()
+                    ):
+                        artifacts.append(
+                            {
+                                "path": artifact.relative_to(root).as_posix(),
+                                "sha256": hashlib.sha256(
+                                    artifact.read_bytes()
+                                ).hexdigest(),
+                            }
+                        )
+            except Exception:
+                artifacts = []
+            if artifacts:
+                serialization = {
+                    "kind": "saved_artifacts",
+                    "artifacts": artifacts,
+                }
+
+    if serialization is None:
+        raise ValueError(
+            "tokenizer identity evidence is unavailable: full serialization "
+            "is required"
+        )
+
     payload = json.dumps(
         {
-            "vocabulary": sorted(vocabulary.items()),
-            "added_vocabulary": sorted(added_vocabulary.items()),
+            "serialization": serialization,
             "special_token_roles": special_token_roles,
         },
         ensure_ascii=True,
+        sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
@@ -190,6 +237,57 @@ def _build_checkpoint_metadata(
     )
 
 
+def _raise_if_distributed_checkpoint_failed(
+    error: BaseException | None,
+    phase: str,
+) -> None:
+    local_failure = (
+        f"{phase} failed: {type(error).__name__}: {error}"
+        if error is not None
+        else None
+    )
+    failures: list[str | None]
+    if dist.is_available() and dist.is_initialized():
+        failures = [None] * dist.get_world_size()
+        dist.all_gather_object(failures, local_failure)
+    else:
+        failures = [local_failure]
+
+    first_failure = next(
+        (failure for failure in failures if failure is not None),
+        None,
+    )
+    if first_failure is None:
+        return
+    if error is not None:
+        raise RuntimeError(
+            f"DeepSpeed checkpoint {phase} failed: {error}"
+        ) from error
+    raise RuntimeError(
+        "DeepSpeed checkpoint failed on another rank: "
+        f"{first_failure}"
+    )
+
+
+def _cleanup_failed_deepspeed_publication(
+    temporary: str,
+    backup: str,
+    checkpoint_dir: str,
+) -> BaseException | None:
+    errors: list[str] = []
+    try:
+        if os.path.exists(temporary):
+            shutil.rmtree(temporary)
+    except BaseException as exc:
+        errors.append(f"temporary cleanup failed: {exc}")
+    try:
+        if os.path.exists(backup) and not os.path.exists(checkpoint_dir):
+            os.rename(backup, checkpoint_dir)
+    except BaseException as exc:
+        errors.append(f"backup restore failed: {exc}")
+    return RuntimeError("; ".join(errors)) if errors else None
+
+
 def _save_deepspeed_checkpoint_atomic(
     *,
     model_engine: object,
@@ -202,40 +300,81 @@ def _save_deepspeed_checkpoint_atomic(
 ) -> None:
     temporary = f"{checkpoint_dir}.tmp"
     backup = f"{checkpoint_dir}.backup"
-    if is_main and os.path.exists(temporary):
-        shutil.rmtree(temporary)
+    cleanup_error: BaseException | None = None
+    if is_main:
+        try:
+            if os.path.exists(temporary):
+                shutil.rmtree(temporary)
+        except BaseException as exc:
+            cleanup_error = exc
+    _raise_if_distributed_checkpoint_failed(cleanup_error, "cleanup")
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
 
-    save = getattr(model_engine, "save_checkpoint", None)
-    if not callable(save):
-        raise TypeError("DeepSpeed engine does not expose save_checkpoint")
-    save(temporary, client_state=client_state)
-
-    if is_main:
-        save_tokenizer = getattr(tokenizer, "save_pretrained", None)
-        state_dict = getattr(scheduler, "state_dict", None)
-        if not callable(save_tokenizer) or not callable(state_dict):
+    payload_error: BaseException | None = None
+    try:
+        save = getattr(model_engine, "save_checkpoint", None)
+        if not callable(save):
             raise TypeError(
-                "tokenizer and scheduler must expose checkpoint state"
+                "DeepSpeed engine does not expose save_checkpoint"
             )
-        save_tokenizer(temporary)
-        scheduler_path = os.path.join(temporary, "scheduler.pt")
-        torch.save(state_dict(), scheduler_path)
-        write_checkpoint_metadata(temporary, metadata)
-        try:
-            torch.load(scheduler_path, map_location="cpu")
-        except Exception as exc:
-            shutil.rmtree(temporary)
-            raise RuntimeError(
-                f"Checkpoint verification failed: {exc}"
-            ) from exc
-        if os.path.exists(backup):
-            shutil.rmtree(backup)
-        if os.path.exists(checkpoint_dir):
-            os.rename(checkpoint_dir, backup)
-        os.rename(temporary, checkpoint_dir)
+        save(temporary, client_state=client_state)
+    except BaseException as exc:
+        payload_error = exc
+    try:
+        _raise_if_distributed_checkpoint_failed(
+            payload_error,
+            "payload",
+        )
+    except BaseException:
+        if is_main:
+            _cleanup_failed_deepspeed_publication(
+                temporary,
+                backup,
+                checkpoint_dir,
+            )
+        raise
 
+    # Payload completion is global before the sidecar can become a readiness
+    # signal or the temporary directory can be published.
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+    publication_error: BaseException | None = None
+    if is_main:
+        try:
+            save_tokenizer = getattr(tokenizer, "save_pretrained", None)
+            state_dict = getattr(scheduler, "state_dict", None)
+            if not callable(save_tokenizer) or not callable(state_dict):
+                raise TypeError(
+                    "tokenizer and scheduler must expose checkpoint state"
+                )
+            save_tokenizer(temporary)
+            scheduler_path = os.path.join(temporary, "scheduler.pt")
+            torch.save(state_dict(), scheduler_path)
+            write_checkpoint_metadata(temporary, metadata)
+            torch.load(scheduler_path, map_location="cpu")
+            if os.path.exists(backup):
+                shutil.rmtree(backup)
+            if os.path.exists(checkpoint_dir):
+                os.rename(checkpoint_dir, backup)
+            os.rename(temporary, checkpoint_dir)
+        except BaseException as exc:
+            publication_error = exc
+            rollback_error = _cleanup_failed_deepspeed_publication(
+                temporary,
+                backup,
+                checkpoint_dir,
+            )
+            if rollback_error is not None:
+                publication_error = RuntimeError(
+                    f"{exc}; rollback also failed: {rollback_error}"
+                )
+
+    _raise_if_distributed_checkpoint_failed(
+        publication_error,
+        "publication",
+    )
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
 
@@ -696,7 +835,7 @@ def _train_with_accelerator(
             expected_tokenizer_sha256=(
                 checkpoint_metadata.tokenizer_sha256
             ),
-            legacy_config=model_cfg,
+            legacy_config=model_cfg.to_dict(),
         )
         if accelerator.is_main_process:
             print(f"Resumed from {resume_path}: epoch={start_epoch}, step={global_step}, best_val_loss={best_val_loss}")
@@ -1201,7 +1340,7 @@ def train_thinker_stage1(
                     expected_tokenizer_sha256=(
                         checkpoint_metadata.tokenizer_sha256
                     ),
-                    legacy_config=model_cfg,
+                    legacy_config=model_cfg.to_dict(),
                 )
                 # DeepSpeed 的 load_checkpoint 需要传入目录路径
                 # 它会自动加载 model, optimizer, scheduler (如果 scheduler 是传给 initialize 的)
@@ -1243,7 +1382,7 @@ def train_thinker_stage1(
                     expected_tokenizer_sha256=(
                         checkpoint_metadata.tokenizer_sha256
                     ),
-                    legacy_config=model_cfg,
+                    legacy_config=model_cfg.to_dict(),
                 )
                 if is_main_process():
                     print(
@@ -1777,9 +1916,22 @@ def _build_reconciled_stage2_model(
 
 def _load_legacy_stage1_model(
     checkpoint: str,
+    *,
+    expected_profile: ArchitectureProfile,
+    expected_compatibility: CompatibilityLevel,
+    expected_architecture: ArchitectureSummary,
+    expected_tokenizer_sha256: str,
 ) -> Qwen3OmniMoeThinkerTextModel:
     model_config = Qwen3OmniMoeConfig.from_legacy_pretrained_config(
         checkpoint
+    )
+    load_checkpoint_metadata(
+        checkpoint,
+        expected_profile=expected_profile,
+        expected_compatibility=expected_compatibility,
+        expected_architecture=expected_architecture,
+        expected_tokenizer_sha256=expected_tokenizer_sha256,
+        legacy_config=model_config.to_dict(),
     )
     return Qwen3OmniMoeThinkerTextModel.from_pretrained(
         checkpoint,
@@ -1860,7 +2012,19 @@ def train_thinker_stage2(
     # ✅ 从 Stage1 ckpt 初始化 Thinker 权重（仅在不从已有 stage2 ckpt 恢复时）
     if stage1_init_ckpt and not resume_path:
         print(f"Loading Stage1 checkpoint from {stage1_init_ckpt}")
-        base_thinker = _load_legacy_stage1_model(stage1_init_ckpt)
+        base_thinker = _load_legacy_stage1_model(
+            stage1_init_ckpt,
+            expected_profile=(
+                checkpoint_metadata.manifest.architecture_profile
+            ),
+            expected_compatibility=(
+                checkpoint_metadata.manifest.compatibility_level
+            ),
+            expected_architecture=checkpoint_metadata.architecture,
+            expected_tokenizer_sha256=(
+                checkpoint_metadata.tokenizer_sha256
+            ),
+        )
         missing, unexpected = model.thinker.load_state_dict(
             base_thinker.state_dict(), strict=False
         )
@@ -1939,7 +2103,7 @@ def train_thinker_stage2(
             expected_tokenizer_sha256=(
                 checkpoint_metadata.tokenizer_sha256
             ),
-            legacy_config=model_config,
+            legacy_config=model_config.to_dict(),
         )
         print(
             f"Resumed Stage2 from {resume_path}: start_epoch={start_epoch}, "

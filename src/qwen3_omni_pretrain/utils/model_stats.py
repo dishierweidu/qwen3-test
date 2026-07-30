@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import json
+import math
 from typing import Dict, Iterable, Set
 
 import torch
@@ -39,6 +40,28 @@ def _unique_parameters(parameters: Iterable[torch.nn.Parameter]):
         yield parameter
 
 
+def _parameter_numel(parameter: torch.nn.Parameter) -> int:
+    """Return the logical size of ordinary and ZeRO-3 placeholder parameters."""
+    deepspeed_numel = getattr(parameter, "ds_numel", None)
+    if type(deepspeed_numel) is int and deepspeed_numel >= 0:
+        return deepspeed_numel
+
+    local_numel = int(parameter.numel())
+    if local_numel:
+        return local_numel
+
+    deepspeed_shape = getattr(parameter, "ds_shape", None)
+    if deepspeed_shape is not None:
+        try:
+            dimensions = tuple(int(size) for size in deepspeed_shape)
+        except (TypeError, ValueError):
+            dimensions = ()
+        if dimensions and all(size >= 0 for size in dimensions):
+            return math.prod(dimensions)
+
+    return local_numel
+
+
 def collect_parameter_stats(model: torch.nn.Module) -> ParameterStats:
     """
     Count unique parameters and estimate parameters active for one token.
@@ -50,10 +73,10 @@ def collect_parameter_stats(model: torch.nn.Module) -> ParameterStats:
     """
     all_parameters = list(_unique_parameters(model.parameters()))
     total_parameters = sum(
-        int(parameter.numel()) for parameter in all_parameters
+        _parameter_numel(parameter) for parameter in all_parameters
     )
     trainable_parameters = sum(
-        int(parameter.numel())
+        _parameter_numel(parameter)
         for parameter in all_parameters
         if parameter.requires_grad
     )
@@ -97,7 +120,8 @@ def collect_parameter_stats(model: torch.nn.Module) -> ParameterStats:
             id(parameter) for parameter in new_expert_parameters
         )
         all_expert_parameters = sum(
-            int(parameter.numel()) for parameter in new_expert_parameters
+            _parameter_numel(parameter)
+            for parameter in new_expert_parameters
         )
         if module.num_experts <= 0:
             raise ValueError("MoE module has no experts")
@@ -111,12 +135,12 @@ def collect_parameter_stats(model: torch.nn.Module) -> ParameterStats:
         active_parameters += selected_expert_parameters
 
     routed_parameters = sum(
-        int(parameter.numel())
+        _parameter_numel(parameter)
         for parameter in all_parameters
         if id(parameter) in accounted_expert_parameter_ids
     )
     shared_parameters = sum(
-        int(parameter.numel())
+        _parameter_numel(parameter)
         for parameter in all_parameters
         if id(parameter) in shared_parameter_ids
         and id(parameter) not in accounted_expert_parameter_ids
