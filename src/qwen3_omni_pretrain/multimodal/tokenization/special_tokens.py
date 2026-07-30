@@ -4,14 +4,31 @@ from types import MappingProxyType
 from typing import Any
 import warnings
 
+from qwen3_omni_pretrain.architecture.profiles import (
+    ArchitectureProfile,
+)
+from qwen3_omni_pretrain.multimodal.tokenization.schema import (
+    resolve_token_schema,
+    schema_for_profile,
+)
 
+
+_LEGACY_CONFIG_FIELDS = MappingProxyType(
+    {
+        "image_token_id": "image_pad",
+        "video_token_id": "video_pad",
+        "audio_token_id": "audio_pad",
+        "audio_start_token_id": "audio_start",
+        "audio_end_token_id": "audio_end",
+    }
+)
+_LEGACY_SCHEMA = schema_for_profile(
+    ArchitectureProfile.LEGACY_PROTOTYPE
+)
 MULTIMODAL_SPECIAL_TOKENS = MappingProxyType(
     {
-        "image_token_id": "<|image_pad|>",
-        "video_token_id": "<|video_pad|>",
-        "audio_token_id": "<|audio_pad|>",
-        "audio_start_token_id": "<|audio_start|>",
-        "audio_end_token_id": "<|audio_end|>",
+        config_field: getattr(_LEGACY_SCHEMA, schema_field)
+        for config_field, schema_field in _LEGACY_CONFIG_FIELDS.items()
     }
 )
 
@@ -20,42 +37,21 @@ def reconcile_multimodal_token_ids(
     config: Any,
     tokenizer: Any,
 ) -> dict[str, int]:
-    vocab = tokenizer.get_vocab()
-    missing = [
-        token
-        for token in MULTIMODAL_SPECIAL_TOKENS.values()
-        if token not in vocab
-    ]
-    if missing:
-        raise ValueError(
-            f"tokenizer is missing required multimodal token {missing[0]!r}"
-        )
-
-    resolved = {
-        field: int(vocab[token])
-        for field, token in MULTIMODAL_SPECIAL_TOKENS.items()
-    }
-    if len(set(resolved.values())) != len(resolved):
-        raise ValueError(
-            "multimodal special tokens must resolve to distinct IDs"
-        )
-
     vocab_size = int(config.vocab_size)
+    schema_ids = resolve_token_schema(
+        tokenizer,
+        _LEGACY_SCHEMA,
+        vocab_size,
+    )
     if len(tokenizer) > vocab_size:
         raise ValueError(
             f"tokenizer length {len(tokenizer)} exceeds "
             f"model vocab_size {vocab_size}"
         )
-    invalid = {
-        field: token_id
-        for field, token_id in resolved.items()
-        if not 0 <= token_id < vocab_size
+    resolved = {
+        config_field: int(getattr(schema_ids, schema_field))
+        for config_field, schema_field in _LEGACY_CONFIG_FIELDS.items()
     }
-    if invalid:
-        field, token_id = next(iter(invalid.items()))
-        raise ValueError(
-            f"{field}={token_id} is outside model vocab_size={vocab_size}"
-        )
 
     for field, token_id in resolved.items():
         current = getattr(config, field, None)
