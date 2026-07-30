@@ -118,6 +118,11 @@ class ProfileManifest:
         if any(not item.strip() for item in self.assumptions):
             raise ValueError("assumptions must be non-empty strings")
 
+    def __deepcopy__(self, memo: dict[int, object]) -> "ProfileManifest":
+        """Immutable manifests are safe to share across config deep copies."""
+        memo[id(self)] = self
+        return self
+
     def to_dict(self) -> dict[str, object]:
         self.validate()
         return {

@@ -48,21 +48,29 @@ def inspect_architecture(
     model_config: Path,
     *,
     tokenizer_path: Path | None = None,
+    allow_network: bool = False,
+    allow_remote_code: bool = False,
 ) -> ArchitectureSummary:
     config = Qwen3OmniMoeConfig(
         **load_and_adapt_legacy_yaml(model_config)
     )
+    tokenizer_vocab_size: int | None = None
     if tokenizer_path is not None:
         tokenizer = AutoTokenizer.from_pretrained(
             str(tokenizer_path),
-            trust_remote_code=True,
+            local_files_only=not allow_network,
+            trust_remote_code=allow_remote_code,
         )
         reconcile_multimodal_token_ids(config, tokenizer)
-        config._tokenizer_vocab_size = len(tokenizer)
+        tokenizer_vocab_size = len(tokenizer)
     config.profile_manifest.validate()
     with torch.device("meta"):
         model = Qwen3OmniMoeThinkerTextModel(config)
-    return summarize_model(model, config.profile_manifest)
+    return summarize_model(
+        model,
+        config.profile_manifest,
+        tokenizer_vocab_size=tokenizer_vocab_size,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,6 +92,16 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Optional tokenizer path used to reconcile special token IDs",
     )
+    parser.add_argument(
+        "--allow-network",
+        action="store_true",
+        help="Allow tokenizer downloads; inspection is offline by default",
+    )
+    parser.add_argument(
+        "--allow-remote-code",
+        action="store_true",
+        help="Allow tokenizer repository code independently of networking",
+    )
     return parser.parse_args()
 
 
@@ -92,6 +110,8 @@ def main() -> None:
     summary = inspect_architecture(
         args.model_config,
         tokenizer_path=args.tokenizer,
+        allow_network=args.allow_network,
+        allow_remote_code=args.allow_remote_code,
     )
     if args.json:
         print(json.dumps(summary.to_dict(), indent=2, sort_keys=True))

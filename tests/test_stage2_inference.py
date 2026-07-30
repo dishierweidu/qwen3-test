@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from safetensors import SafetensorError
 
 from qwen3_omni_pretrain import cli_infer_thinker as cli
 from qwen3_omni_pretrain.data.collators import (
@@ -47,6 +48,37 @@ class TinyInferenceModel(torch.nn.Module):
         logits = torch.zeros(input_ids.size(0), input_ids.size(1), 4)
         logits[:, -1, 2] = 1
         return {"logits": logits}
+
+
+def test_strict_inference_load_retries_backup_after_safetensor_corruption():
+    calls: list[str] = []
+    expected = TinyInferenceModel()
+
+    class RecoveringModel:
+        @classmethod
+        def from_pretrained(cls, checkpoint, **kwargs):
+            calls.append(checkpoint)
+            if checkpoint == "checkpoint":
+                raise SafetensorError("invalid header length")
+            return (
+                expected,
+                {
+                    "missing_keys": [],
+                    "unexpected_keys": [],
+                    "mismatched_keys": [],
+                    "error_msgs": [],
+                },
+            )
+
+    restored = cli._strict_from_pretrained_with_backup(
+        RecoveringModel,
+        ("checkpoint", "checkpoint.backup"),
+        config=object(),
+        load_kwargs={},
+    )
+
+    assert restored is expected
+    assert calls == ["checkpoint", "checkpoint.backup"]
 
 
 def test_parse_args_accepts_explicit_skip_bad_media(monkeypatch):
@@ -169,6 +201,11 @@ def test_run_stage2_uses_skip_flag_and_emits_json_error(
         classmethod(
             lambda cls, checkpoint, **kwargs: TinyInferenceModel()
         ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_preflight_inference_identity",
+        lambda **kwargs: None,
     )
     monkeypatch.setattr(
         cli,

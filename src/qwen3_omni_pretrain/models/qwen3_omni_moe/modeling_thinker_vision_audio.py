@@ -69,6 +69,7 @@ class Qwen3OmniMoeThinkerVisionAudioModel(PreTrainedModel):
     """Stage-2 wrapper that prepends one vision and one audio token."""
 
     config_class = Qwen3OmniMoeConfig
+    _tied_weights_keys = ["thinker.lm_head.weight"]
 
     def __init__(self, config: Qwen3OmniMoeConfig):
         super().__init__(config)

@@ -220,11 +220,10 @@ def train_one_epoch_accelerator(
         data_iter = iter(dataloader) if is_tp_src else None
         step_idx = 0
         while True:
-            stop_tensor = torch.zeros(1, device=accelerator.device, dtype=torch.int32)
-            if is_tp_src and should_stop_fn is not None and should_stop_fn():
-                stop_tensor.fill_(1)
-            dist.broadcast(stop_tensor, src=tp_src_global, group=tp_group)
-            if stop_tensor.item() == 1:
+            # The production callback performs a global reduction.  Every
+            # global rank must therefore enter it before TP leaders and peers
+            # diverge into source-only iteration and TP-group broadcasts.
+            if should_stop_fn is not None and should_stop_fn():
                 break
 
             has_batch = torch.zeros(1, device=accelerator.device, dtype=torch.int32)

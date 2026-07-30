@@ -5,14 +5,12 @@ import time
 import math
 import signal
 import json
-import hashlib
 from pathlib import Path
 import shutil
 import subprocess
-import tempfile
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, Dict, Union, List, Optional
+from typing import Any, Dict, Union, List, Mapping, Optional
 
 import torch
 import torch.distributed as dist
@@ -70,10 +68,16 @@ from qwen3_omni_pretrain.models.qwen3_omni_moe.modeling_thinker_vision_audio imp
 from qwen3_omni_pretrain.data.datasets.text_dataset import TextJsonlDataset, PackedTokenDataset
 from qwen3_omni_pretrain.data.collators import TextCausalLMCollator, PackedCausalLMCollator
 from qwen3_omni_pretrain.training.loop import train_one_epoch, evaluate, _move_batch_to_device, _is_global_bad_loss
-from qwen3_omni_pretrain.training.checkpoint import save_checkpoint, load_checkpoint
+from qwen3_omni_pretrain.training.checkpoint import (
+    load_checkpoint,
+    save_checkpoint,
+)
 from qwen3_omni_pretrain.architecture.checkpoint_metadata import (
+    CheckpointArtifactKind,
     CheckpointMetadata,
+    describe_model_topology,
     load_checkpoint_metadata,
+    tokenizer_identity_sha256,
     write_checkpoint_metadata,
 )
 from qwen3_omni_pretrain.architecture.manifest import ProfileManifest
@@ -97,97 +101,7 @@ from qwen3_omni_pretrain.multimodal.tokenization.special_tokens import (
 
 
 def _tokenizer_identity_sha256(tokenizer: object) -> str:
-    special_token_roles: dict[str, int | None | list[int]] = {}
-    for name in (
-        "bos_token_id",
-        "eos_token_id",
-        "pad_token_id",
-        "unk_token_id",
-        "sep_token_id",
-        "cls_token_id",
-        "mask_token_id",
-    ):
-        value = getattr(tokenizer, name, None)
-        if value is not None and type(value) is not int:
-            raise ValueError("tokenizer special-token evidence is malformed")
-        special_token_roles[name] = value
-    additional_ids = getattr(
-        tokenizer,
-        "additional_special_tokens_ids",
-        [],
-    )
-    if not isinstance(additional_ids, (list, tuple)) or any(
-        type(index) is not int for index in additional_ids
-    ):
-        raise ValueError("tokenizer special-token evidence is malformed")
-    special_token_roles["additional_special_tokens_ids"] = list(
-        additional_ids
-    )
-
-    serialization: dict[str, object] | None = None
-    backend = getattr(tokenizer, "backend_tokenizer", None)
-    backend_to_str = getattr(backend, "to_str", None)
-    if callable(backend_to_str):
-        try:
-            serialized_backend = backend_to_str()
-            if not isinstance(serialized_backend, str):
-                raise TypeError("backend serialization must be text")
-            backend_payload = json.loads(serialized_backend)
-            if not isinstance(backend_payload, dict):
-                raise TypeError("backend serialization must be an object")
-        except Exception:
-            pass
-        else:
-            serialization = {
-                "kind": "backend_tokenizer",
-                "payload": backend_payload,
-            }
-
-    if serialization is None:
-        save_pretrained = getattr(tokenizer, "save_pretrained", None)
-        if callable(save_pretrained):
-            try:
-                with tempfile.TemporaryDirectory() as directory:
-                    save_pretrained(directory)
-                    root = Path(directory)
-                    artifacts = []
-                    for artifact in sorted(
-                        path
-                        for path in root.rglob("*")
-                        if path.is_file()
-                    ):
-                        artifacts.append(
-                            {
-                                "path": artifact.relative_to(root).as_posix(),
-                                "sha256": hashlib.sha256(
-                                    artifact.read_bytes()
-                                ).hexdigest(),
-                            }
-                        )
-            except Exception:
-                artifacts = []
-            if artifacts:
-                serialization = {
-                    "kind": "saved_artifacts",
-                    "artifacts": artifacts,
-                }
-
-    if serialization is None:
-        raise ValueError(
-            "tokenizer identity evidence is unavailable: full serialization "
-            "is required"
-        )
-
-    payload = json.dumps(
-        {
-            "serialization": serialization,
-            "special_token_roles": special_token_roles,
-        },
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+    return tokenizer_identity_sha256(tokenizer)
 
 
 def _implementation_commit() -> str:
@@ -215,19 +129,49 @@ def _build_checkpoint_metadata(
     model: torch.nn.Module,
     tokenizer: object,
     *,
+    artifact_kind: CheckpointArtifactKind | str,
     implementation_commit: str | None = None,
 ) -> CheckpointMetadata:
-    graph = model.module if hasattr(model, "module") else model
-    graph = graph.thinker if hasattr(graph, "thinker") else graph
-    config = getattr(graph, "config", None)
+    full_graph = model.module if hasattr(model, "module") else model
+    thinker = (
+        full_graph.thinker
+        if hasattr(full_graph, "thinker")
+        else full_graph
+    )
+    config = getattr(thinker, "config", None)
     manifest = getattr(config, "profile_manifest", None)
     if not isinstance(manifest, ProfileManifest):
         raise ValueError(
             "built graph does not expose a validated profile manifest"
         )
+    try:
+        tokenizer_vocab_size = len(tokenizer)  # type: ignore[arg-type]
+    except (TypeError, AttributeError) as exc:
+        raise ValueError(
+            "tokenizer length evidence is unavailable"
+        ) from exc
+    if (
+        type(tokenizer_vocab_size) is not int
+        or tokenizer_vocab_size < 0
+    ):
+        raise ValueError(
+            "tokenizer length evidence must be a non-negative integer"
+        )
+    try:
+        kind = CheckpointArtifactKind(artifact_kind)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"unsupported checkpoint artifact kind: {artifact_kind!r}"
+        ) from exc
     return CheckpointMetadata(
         manifest=manifest,
-        architecture=summarize_model(graph, manifest),
+        architecture=summarize_model(
+            thinker,
+            manifest,
+            tokenizer_vocab_size=tokenizer_vocab_size,
+        ),
+        artifact_kind=kind,
+        topology=describe_model_topology(full_graph),
         tokenizer_sha256=_tokenizer_identity_sha256(tokenizer),
         implementation_commit=(
             implementation_commit
@@ -235,6 +179,64 @@ def _build_checkpoint_metadata(
             else _implementation_commit()
         ),
     )
+
+
+def _preflight_training_resume(
+    *,
+    checkpoint: str,
+    model_config: Qwen3OmniMoeConfig,
+    tokenizer: object,
+    artifact_kind: CheckpointArtifactKind | str,
+    model_class,
+) -> CheckpointMetadata | None:
+    """Validate resume identity using only a meta-device model graph."""
+    kind = CheckpointArtifactKind(artifact_kind)
+    with torch.device("meta"):
+        graph = model_class(model_config)
+    thinker = graph.thinker if hasattr(graph, "thinker") else graph
+    manifest = getattr(thinker.config, "profile_manifest", None)
+    if not isinstance(manifest, ProfileManifest):
+        raise ValueError(
+            "meta graph does not expose a validated profile manifest"
+        )
+    expected = {
+        "expected_profile": manifest.architecture_profile,
+        "expected_compatibility": manifest.compatibility_level,
+        "expected_architecture": summarize_model(
+            thinker,
+            manifest,
+            tokenizer_vocab_size=len(tokenizer),  # type: ignore[arg-type]
+        ),
+        "expected_artifact_kind": kind,
+        "expected_topology": describe_model_topology(graph),
+        "expected_tokenizer_sha256": _tokenizer_identity_sha256(
+            tokenizer
+        ),
+        "legacy_config": model_config.to_dict(),
+    }
+    backup = checkpoint + ".backup"
+    candidates = [checkpoint]
+    if os.path.isdir(backup):
+        primary_sidecar = os.path.isfile(
+            os.path.join(checkpoint, "architecture.json")
+        )
+        backup_sidecar = os.path.isfile(
+            os.path.join(backup, "architecture.json")
+        )
+        if backup_sidecar and not primary_sidecar:
+            candidates = [backup, checkpoint]
+        else:
+            candidates.append(backup)
+    for candidate in candidates:
+        try:
+            if not os.path.isdir(candidate):
+                raise FileNotFoundError(candidate)
+            return load_checkpoint_metadata(candidate, **expected)
+        except (ValueError, TypeError, FileNotFoundError, OSError):
+            if candidate == candidates[0] and len(candidates) > 1:
+                continue
+            raise
+    raise RuntimeError("unreachable checkpoint preflight state")
 
 
 def _raise_if_distributed_checkpoint_failed(
@@ -267,6 +269,134 @@ def _raise_if_distributed_checkpoint_failed(
         "DeepSpeed checkpoint failed on another rank: "
         f"{first_failure}"
     )
+
+
+def _load_deepspeed_resume_collectively(
+    *,
+    model_engine: object,
+    scheduler: object,
+    resume_path: str,
+    resume_identity: Mapping[str, object],
+) -> tuple[str, str, Mapping[str, object]]:
+    """Restore one complete DeepSpeed generation on every rank.
+
+    Engine state, client state, and the separately persisted scheduler are one
+    transaction.  A failure on any rank rejects that candidate globally so all
+    ranks retry the same backup generation in the same order.
+    """
+    # Candidate order is derived only from the user-requested path, never
+    # from a rank-local resolver result.
+    candidates = [resume_path, resume_path + ".backup"]
+
+    last_error: BaseException | None = None
+    for candidate in candidates:
+        identity_error: BaseException | None = None
+        try:
+            load_checkpoint_metadata(
+                candidate,
+                **dict(resume_identity),
+            )
+        except BaseException as exc:
+            identity_error = exc
+        try:
+            _raise_if_distributed_checkpoint_failed(
+                identity_error,
+                f"validate candidate {candidate}",
+            )
+        except RuntimeError as exc:
+            last_error = exc
+            continue
+
+        payload_error: BaseException | None = None
+        load_path: object = None
+        client_state: object = None
+        normalized_state: dict[str, object] | None = None
+        try:
+            load = getattr(model_engine, "load_checkpoint", None)
+            if not callable(load):
+                raise TypeError(
+                    "DeepSpeed engine does not expose load_checkpoint"
+                )
+            loaded = load(candidate)
+            if not isinstance(loaded, tuple) or len(loaded) != 2:
+                raise TypeError(
+                    "DeepSpeed load_checkpoint must return "
+                    "(load_path, client_state)"
+                )
+            load_path, client_state = loaded
+            if not isinstance(load_path, str) or not load_path:
+                raise RuntimeError(
+                    "DeepSpeed returned no checkpoint load path"
+                )
+            if client_state is None:
+                client_state = {}
+            if not isinstance(client_state, Mapping):
+                raise TypeError(
+                    "DeepSpeed checkpoint client_state is not a mapping"
+                )
+            normalized_state = {
+                "step": int(client_state.get("step", 0)),
+                "epoch": int(client_state.get("epoch", 0)),
+                "best_val_loss": float(
+                    client_state.get(
+                        "best_val_loss",
+                        float("inf"),
+                    )
+                ),
+            }
+
+            scheduler_path = os.path.join(candidate, "scheduler.pt")
+            if not os.path.isfile(scheduler_path):
+                raise FileNotFoundError(
+                    f"DeepSpeed scheduler state is missing: "
+                    f"{scheduler_path}"
+                )
+            load_scheduler = getattr(
+                scheduler,
+                "load_state_dict",
+                None,
+            )
+            if not callable(load_scheduler):
+                raise TypeError(
+                    "scheduler does not expose load_state_dict"
+                )
+            load_scheduler(
+                torch.load(scheduler_path, map_location="cpu")
+            )
+        except BaseException as exc:
+            payload_error = exc
+
+        try:
+            _raise_if_distributed_checkpoint_failed(
+                payload_error,
+                f"restore candidate {candidate}",
+            )
+        except RuntimeError as exc:
+            last_error = exc
+            continue
+
+        assert isinstance(load_path, str)
+        assert normalized_state is not None
+        if dist.is_available() and dist.is_initialized():
+            rank_states: list[dict[str, object] | None] = [
+                None
+            ] * dist.get_world_size()
+            dist.all_gather_object(rank_states, normalized_state)
+            if any(
+                state != rank_states[0]
+                for state in rank_states[1:]
+            ):
+                last_error = RuntimeError(
+                    "DeepSpeed checkpoint client_state differs "
+                    "across ranks"
+                )
+                continue
+        return candidate, load_path, normalized_state
+
+    raise RuntimeError(
+        "DeepSpeed failed to restore a complete checkpoint generation "
+        "from the requested path or its valid backup"
+    ) from last_error
 
 
 def _cleanup_failed_deepspeed_publication(
@@ -354,10 +484,11 @@ def _save_deepspeed_checkpoint_atomic(
             torch.save(state_dict(), scheduler_path)
             write_checkpoint_metadata(temporary, metadata)
             torch.load(scheduler_path, map_location="cpu")
-            if os.path.exists(backup):
-                shutil.rmtree(backup)
             if os.path.exists(checkpoint_dir):
+                if os.path.exists(backup):
+                    shutil.rmtree(backup)
                 os.rename(checkpoint_dir, backup)
+            # Preserve an only-surviving backup until final publication.
             os.rename(temporary, checkpoint_dir)
         except BaseException as exc:
             publication_error = exc
@@ -596,6 +727,23 @@ def _train_with_accelerator(
         model_cfg.thinker_config.tensor_parallel_size = tensor_parallel_size
         if accelerator.is_main_process:
             print(f">> Tensor Parallelism enabled: TP={tensor_parallel_size}, PP={pipeline_parallel_size}")
+
+    stage1_model_class = Qwen3OmniMoeThinkerTextModel
+    if use_tensor_parallel and tensor_parallel_size > 1:
+        from qwen3_omni_pretrain.models.qwen3_omni_moe.modeling_thinker_text_tp import (
+            Qwen3OmniMoeThinkerTextModelTP,
+        )
+
+        stage1_model_class = Qwen3OmniMoeThinkerTextModelTP
+    resume_path = resume_from_checkpoint or cfg.resume_from_checkpoint
+    if resume_path:
+        _preflight_training_resume(
+            checkpoint=resume_path,
+            model_config=model_cfg,
+            tokenizer=tokenizer,
+            artifact_kind=CheckpointArtifactKind.STAGE1_TRAINING,
+            model_class=stage1_model_class,
+        )
     
     # 对于 DeepSpeed ZeRO-3，使用 zero.Init 上下文
     # 注意：ZeRO-2 不需要 zero.Init，只有 ZeRO-3 需要
@@ -655,14 +803,12 @@ def _train_with_accelerator(
     
     # 选择模型类型：TP 模型或标准模型
     with init_ctx:
-        if use_tensor_parallel and tensor_parallel_size > 1:
-            from qwen3_omni_pretrain.models.qwen3_omni_moe.modeling_thinker_text_tp import (
-                Qwen3OmniMoeThinkerTextModelTP,
-            )
-            model = Qwen3OmniMoeThinkerTextModelTP(model_cfg)
-        else:
-            model = Qwen3OmniMoeThinkerTextModel(model_cfg)
-    checkpoint_metadata = _build_checkpoint_metadata(model, tokenizer)
+        model = stage1_model_class(model_cfg)
+    checkpoint_metadata = _build_checkpoint_metadata(
+        model,
+        tokenizer,
+        artifact_kind=CheckpointArtifactKind.STAGE1_TRAINING,
+    )
 
     # 在非 DeepSpeed 模式下，尽早将参数迁移到 GPU 并降精度，降低 CPU 常驻占用
     if accelerator.distributed_type != DistributedType.DEEPSPEED:
@@ -832,6 +978,8 @@ def _train_with_accelerator(
                 checkpoint_metadata.manifest.compatibility_level
             ),
             expected_architecture=checkpoint_metadata.architecture,
+            expected_artifact_kind=checkpoint_metadata.artifact_kind,
+            expected_topology=checkpoint_metadata.topology,
             expected_tokenizer_sha256=(
                 checkpoint_metadata.tokenizer_sha256
             ),
@@ -896,16 +1044,30 @@ def _train_with_accelerator(
     signal.signal(signal.SIGINT, _request_stop)
     signal.signal(signal.SIGTERM, _request_stop)
 
+    def _poll_stop_requested():
+        nonlocal stop_requested
+        stop_requested = _synchronize_interrupt_request(
+            stop_requested,
+            device=accelerator.device,
+            accelerator=accelerator,
+        )
+        return stop_requested
+
     def _maybe_exit_gracefully():
         nonlocal stop_requested, received_signal
-        if not stop_requested:
+        def announce(tag: str) -> None:
+            if accelerator.is_main_process:
+                print(f"Saving emergency checkpoint: {tag}")
+
+        if not _save_interrupt_checkpoint_if_requested(
+            local_requested=stop_requested,
+            device=accelerator.device,
+            global_step=global_step,
+            save_fn=save_full_checkpoint,
+            accelerator=accelerator,
+            before_save=announce,
+        ):
             return
-        accelerator.wait_for_everyone()
-        tag = f"interrupted_step_{global_step}"
-        if accelerator.is_main_process:
-            print(f"Saving emergency checkpoint: {tag}")
-        save_full_checkpoint(tag)
-        accelerator.wait_for_everyone()
         signal.signal(signal.SIGINT, old_sigint)
         signal.signal(signal.SIGTERM, old_sigterm)
         raise SystemExit(0)
@@ -935,7 +1097,7 @@ def _train_with_accelerator(
                 eval_fn=lambda step, m: _eval_and_save(
                     accelerator, m, val_loader, step, cfg, save_full_checkpoint, best_val_loss
                 ),
-                should_stop_fn=lambda: stop_requested,
+                should_stop_fn=_poll_stop_requested,
             )
             
             global_step += steps_this_epoch
@@ -964,9 +1126,19 @@ def _train_with_accelerator(
         save_full_checkpoint("latest")
     
     except KeyboardInterrupt:
-        if accelerator.is_main_process:
+        if int(getattr(accelerator, "num_processes", 1)) <= 1:
             print("KeyboardInterrupt, saving emergency checkpoint...")
-            save_full_checkpoint(f"interrupted_step_{global_step}")
+            _save_accelerator_interrupt_collectively(
+                accelerator=accelerator,
+                global_step=global_step,
+                save_fn=save_full_checkpoint,
+            )
+        elif accelerator.is_main_process:
+            print(
+                "Unilateral KeyboardInterrupt: skipping collective "
+                "checkpoint to avoid a distributed deadlock. Use SIGINT/"
+                "SIGTERM for coordinated emergency checkpointing."
+            )
         raise
     finally:
         signal.signal(signal.SIGINT, old_sigint)
@@ -1002,6 +1174,99 @@ def _log_step(accelerator, step, loss, ce_loss, aux_loss, lr, logging_steps, sta
         "train/aux_loss": aux_loss,
         "train/lr": lr,
     }, step=step)
+
+
+def _save_deepspeed_best_collectively(
+    *,
+    tag: str,
+    local_val_loss: float,
+    best_val_loss: float,
+    device: torch.device,
+    save_fn,
+    before_save=None,
+) -> float:
+    """Make one global best decision before every DeepSpeed rank saves."""
+    candidate = torch.tensor(
+        float(local_val_loss),
+        dtype=torch.float64,
+        device=device,
+    )
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(candidate, op=dist.ReduceOp.SUM)
+        candidate /= dist.get_world_size()
+    global_val_loss = float(candidate.item())
+    if global_val_loss < best_val_loss:
+        if before_save is not None:
+            before_save(global_val_loss)
+        save_fn(tag)
+        return global_val_loss
+    return best_val_loss
+
+
+def _synchronize_interrupt_request(
+    local_requested: bool,
+    *,
+    device: torch.device,
+    accelerator=None,
+) -> bool:
+    """Poll a shared stop decision at a boundary every rank enters."""
+    requested = torch.tensor(
+        int(local_requested),
+        dtype=torch.int64,
+        device=device,
+    )
+    if accelerator is not None:
+        requested = accelerator.reduce(requested, reduction="max")
+    elif dist.is_available() and dist.is_initialized():
+        dist.all_reduce(requested, op=dist.ReduceOp.MAX)
+    return bool(requested.item())
+
+
+def _save_interrupt_checkpoint_if_requested(
+    *,
+    local_requested: bool,
+    device: torch.device,
+    global_step: int,
+    save_fn,
+    accelerator=None,
+    before_save=None,
+) -> bool:
+    """Make one all-rank stop decision, then enter one save transaction."""
+    if not _synchronize_interrupt_request(
+        local_requested,
+        device=device,
+        accelerator=accelerator,
+    ):
+        return False
+    if accelerator is not None:
+        accelerator.wait_for_everyone()
+    elif dist.is_available() and dist.is_initialized():
+        dist.barrier()
+    tag = f"interrupted_step_{global_step}"
+    if before_save is not None:
+        before_save(tag)
+    save_fn(tag)
+    if accelerator is not None:
+        accelerator.wait_for_everyone()
+    elif dist.is_available() and dist.is_initialized():
+        dist.barrier()
+    return True
+
+
+def _save_deepspeed_terminal_collectively(*, tag: str, save_fn) -> None:
+    """Keep terminal DeepSpeed save calls outside rank-zero branches."""
+    save_fn(tag)
+
+
+def _save_accelerator_interrupt_collectively(
+    *,
+    accelerator,
+    global_step: int,
+    save_fn,
+) -> None:
+    """Ensure every Accelerator rank joins an interrupt transaction."""
+    del accelerator
+    save_fn(f"interrupted_step_{global_step}")
 
 
 def _eval_and_save(accelerator, model, val_loader, step, cfg, save_fn, best_val_loss):
@@ -1118,6 +1383,17 @@ def train_thinker_stage1(
         # 4. 模型配置 & 模型
         model_cfg_dict = load_yaml(cfg.model_config_path)
         model_cfg = Qwen3OmniMoeConfig(**model_cfg_dict)
+        resume_path = (
+            resume_from_checkpoint or cfg.resume_from_checkpoint
+        )
+        if resume_path:
+            _preflight_training_resume(
+                checkpoint=resume_path,
+                model_config=model_cfg,
+                tokenizer=tokenizer,
+                artifact_kind=CheckpointArtifactKind.STAGE1_TRAINING,
+                model_class=Qwen3OmniMoeThinkerTextModel,
+            )
 
         # -------------------------------------------------------------------------
         # [FIX] 使用 ZeRO-3 Init 初始化模型 (防止 CPU OOM)
@@ -1132,7 +1408,11 @@ def train_thinker_stage1(
 
         with init_ctx:
             model = Qwen3OmniMoeThinkerTextModel(model_cfg)
-        checkpoint_metadata = _build_checkpoint_metadata(model, tokenizer)
+        checkpoint_metadata = _build_checkpoint_metadata(
+            model,
+            tokenizer,
+            artifact_kind=CheckpointArtifactKind.STAGE1_TRAINING,
+        )
         
         # 即使使用了 zero.Init，to(device) 也是安全的（通常只移动 buffer）
         if not use_deepspeed: 
@@ -1328,41 +1608,49 @@ def train_thinker_stage1(
         
         if resume_path:
             if use_deepspeed:
-                load_checkpoint_metadata(
-                    resume_path,
-                    expected_profile=(
+                resume_identity = {
+                    "expected_profile": (
                         checkpoint_metadata.manifest.architecture_profile
                     ),
-                    expected_compatibility=(
+                    "expected_compatibility": (
                         checkpoint_metadata.manifest.compatibility_level
                     ),
-                    expected_architecture=checkpoint_metadata.architecture,
-                    expected_tokenizer_sha256=(
+                    "expected_architecture": (
+                        checkpoint_metadata.architecture
+                    ),
+                    "expected_artifact_kind": (
+                        checkpoint_metadata.artifact_kind
+                    ),
+                    "expected_topology": checkpoint_metadata.topology,
+                    "expected_tokenizer_sha256": (
                         checkpoint_metadata.tokenizer_sha256
                     ),
-                    legacy_config=model_cfg.to_dict(),
+                    "legacy_config": model_cfg.to_dict(),
+                }
+                (
+                    _loaded_resume_root,
+                    load_path,
+                    client_state,
+                ) = _load_deepspeed_resume_collectively(
+                    model_engine=model_engine,
+                    scheduler=scheduler,
+                    resume_path=resume_path,
+                    resume_identity=resume_identity,
                 )
-                # DeepSpeed 的 load_checkpoint 需要传入目录路径
-                # 它会自动加载 model, optimizer, scheduler (如果 scheduler 是传给 initialize 的)
-                # 因为我们 scheduler 是后挂的，所以只能加载 model 和 optimizer 状态
-                load_path, client_state = model_engine.load_checkpoint(resume_path)
-                if load_path is None:
-                    if is_main_process():
-                        print(f"[Warn] DeepSpeed failed to load checkpoint from {resume_path}")
-                else:
-                    if is_main_process():
-                        print(f"DeepSpeed Resumed from {load_path}")
-                    # 尝试恢复 step 信息
-                    if client_state:
-                         global_step = client_state.get('step', global_step)
-                         start_epoch = client_state.get('epoch', start_epoch)
-                         best_val_loss = client_state.get('best_val_loss', best_val_loss)
-                    
-                    # 恢复 scheduler 状态
-                    # 注意：如果 DeepSpeed 没有管理 scheduler，需要手动 load
-                    scheduler_state = os.path.join(resume_path, "scheduler.pt")
-                    if os.path.exists(scheduler_state):
-                        scheduler.load_state_dict(torch.load(scheduler_state, map_location="cpu"))
+                if is_main_process():
+                    print(f"DeepSpeed Resumed from {load_path}")
+                global_step = int(
+                    client_state.get("step", global_step)
+                )
+                start_epoch = int(
+                    client_state.get("epoch", start_epoch)
+                )
+                best_val_loss = float(
+                    client_state.get(
+                        "best_val_loss",
+                        best_val_loss,
+                    )
+                )
 
             else:
                 start_epoch, global_step, best_val_loss = load_checkpoint(
@@ -1379,6 +1667,10 @@ def train_thinker_stage1(
                         checkpoint_metadata.manifest.compatibility_level
                     ),
                     expected_architecture=checkpoint_metadata.architecture,
+                    expected_artifact_kind=(
+                        checkpoint_metadata.artifact_kind
+                    ),
+                    expected_topology=checkpoint_metadata.topology,
                     expected_tokenizer_sha256=(
                         checkpoint_metadata.tokenizer_sha256
                     ),
@@ -1464,21 +1756,31 @@ def train_thinker_stage1(
         signal.signal(signal.SIGINT, _request_stop)
         signal.signal(signal.SIGTERM, _request_stop)
 
+        def _poll_stop_requested():
+            nonlocal stop_requested
+            stop_requested = _synchronize_interrupt_request(
+                stop_requested,
+                device=device,
+            )
+            return stop_requested
+
         def _maybe_exit_gracefully():
             nonlocal stop_requested, received_signal
-            if not stop_requested:
+            def announce(tag: str) -> None:
+                if is_main_process():
+                    print(
+                        f"Saving emergency checkpoint: {tag} "
+                        f"(signal={received_signal})"
+                    )
+
+            if not _save_interrupt_checkpoint_if_requested(
+                local_requested=stop_requested,
+                device=device,
+                global_step=global_step,
+                save_fn=save_full_checkpoint,
+                before_save=announce,
+            ):
                 return
-            if dist.is_available() and dist.is_initialized():
-                dist.barrier()
-            # DeepSpeed 下所有 rank 都要调 save
-            tag = f"interrupted_step_{global_step}"
-            if is_main_process():
-                print(f"Saving emergency checkpoint: {tag} (signal={received_signal})")
-            
-            save_full_checkpoint(tag)
-            
-            if dist.is_available() and dist.is_initialized():
-                dist.barrier()
             # 恢复信号处理后退出
             signal.signal(signal.SIGINT, old_sigint)
             signal.signal(signal.SIGTERM, old_sigterm)
@@ -1563,6 +1865,20 @@ def train_thinker_stage1(
                         writer.add_scalar("step/val_loss", val_loss, step)
                         writer.flush()
 
+                if use_deepspeed:
+                    def update_step_best(value: float) -> None:
+                        nonlocal best_val_loss
+                        best_val_loss = value
+
+                    best_val_loss = _save_deepspeed_best_collectively(
+                        tag=f"best_step_{global_step}",
+                        local_val_loss=val_loss,
+                        best_val_loss=best_val_loss,
+                        device=device,
+                        save_fn=save_full_checkpoint,
+                        before_save=update_step_best,
+                    )
+                elif is_main_process():
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
                         save_full_checkpoint(f"best_step_{global_step}")
@@ -1695,7 +2011,7 @@ def train_thinker_stage1(
                         autocast_dtype=autocast_dtype,
                         log_step_fn=log_step_fn,
                         after_step_fn=after_step_fn,
-                        should_stop_fn=lambda: stop_requested,
+                        should_stop_fn=_poll_stop_requested,
                     )
                 else:
                     train_loss = train_one_epoch(
@@ -1709,7 +2025,7 @@ def train_thinker_stage1(
                         autocast_dtype=autocast_dtype,
                         grad_scaler=grad_scaler,
                         after_step_fn=after_step_fn,
-                        should_stop_fn=lambda: stop_requested,
+                        should_stop_fn=_poll_stop_requested,
                     )
                 
                 if is_main_process():
@@ -1731,18 +2047,52 @@ def train_thinker_stage1(
                         writer.add_scalar("epoch/epoch", epoch, global_step)
                         writer.flush()
 
+                if use_deepspeed:
+                    def update_epoch_best(value: float) -> None:
+                        nonlocal best_val_loss
+                        best_val_loss = value
+
+                    best_val_loss = _save_deepspeed_best_collectively(
+                        tag=f"best_epoch{epoch}",
+                        local_val_loss=val_loss,
+                        best_val_loss=best_val_loss,
+                        device=device,
+                        save_fn=save_full_checkpoint,
+                        before_save=update_epoch_best,
+                    )
+                elif is_main_process():
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
                         save_full_checkpoint(f"best_epoch{epoch}")
 
             if is_main_process():
                 print("Saving final model to latest")
+            if use_deepspeed:
+                _save_deepspeed_terminal_collectively(
+                    tag="latest",
+                    save_fn=save_full_checkpoint,
+                )
+            elif is_main_process():
                 save_full_checkpoint("latest")
 
         except KeyboardInterrupt:
-            if is_main_process():
-                print("KeyboardInterrupt received, saving emergency checkpoint...")
+            distributed_world = (
+                dist.get_world_size()
+                if dist.is_available() and dist.is_initialized()
+                else 1
+            )
+            if distributed_world <= 1:
+                print(
+                    "KeyboardInterrupt received, saving emergency "
+                    "checkpoint..."
+                )
                 save_full_checkpoint(f"interrupted_step_{global_step}")
+            elif is_main_process():
+                print(
+                    "Unilateral KeyboardInterrupt: skipping collective "
+                    "checkpoint to avoid a distributed deadlock. Use SIGINT/"
+                    "SIGTERM for coordinated emergency checkpointing."
+                )
             raise
         finally:
             signal.signal(signal.SIGINT, old_sigint)
@@ -1920,23 +2270,71 @@ def _load_legacy_stage1_model(
     expected_profile: ArchitectureProfile,
     expected_compatibility: CompatibilityLevel,
     expected_architecture: ArchitectureSummary,
+    expected_artifact_kind: CheckpointArtifactKind,
+    expected_topology,
     expected_tokenizer_sha256: str,
 ) -> Qwen3OmniMoeThinkerTextModel:
-    model_config = Qwen3OmniMoeConfig.from_legacy_pretrained_config(
-        checkpoint
-    )
-    load_checkpoint_metadata(
-        checkpoint,
-        expected_profile=expected_profile,
-        expected_compatibility=expected_compatibility,
-        expected_architecture=expected_architecture,
-        expected_tokenizer_sha256=expected_tokenizer_sha256,
-        legacy_config=model_config.to_dict(),
-    )
-    return Qwen3OmniMoeThinkerTextModel.from_pretrained(
-        checkpoint,
-        config=model_config,
-    )
+    backup = checkpoint + ".backup"
+    candidates = [checkpoint]
+    if os.path.isdir(backup):
+        primary_sidecar = os.path.isfile(
+            os.path.join(checkpoint, "architecture.json")
+        )
+        backup_sidecar = os.path.isfile(
+            os.path.join(backup, "architecture.json")
+        )
+        if backup_sidecar and not primary_sidecar:
+            candidates = [backup, checkpoint]
+        else:
+            candidates.append(backup)
+
+    last_error: BaseException | None = None
+    for candidate in candidates:
+        try:
+            model_config = (
+                Qwen3OmniMoeConfig.from_legacy_pretrained_config(
+                    candidate
+                )
+            )
+            load_checkpoint_metadata(
+                candidate,
+                expected_profile=expected_profile,
+                expected_compatibility=expected_compatibility,
+                expected_architecture=expected_architecture,
+                expected_artifact_kind=expected_artifact_kind,
+                expected_topology=expected_topology,
+                expected_tokenizer_sha256=expected_tokenizer_sha256,
+                legacy_config=model_config.to_dict(),
+            )
+            loaded = Qwen3OmniMoeThinkerTextModel.from_pretrained(
+                candidate,
+                config=model_config,
+                output_loading_info=True,
+            )
+            if not isinstance(loaded, tuple) or len(loaded) != 2:
+                return loaded
+            model, loading_info = loaded
+            if any(
+                loading_info.get(key)
+                for key in (
+                    "missing_keys",
+                    "unexpected_keys",
+                    "mismatched_keys",
+                    "error_msgs",
+                )
+            ):
+                raise RuntimeError(
+                    "Stage-1 initialization checkpoint failed strict "
+                    f"source loading: {loading_info}"
+                )
+            return model
+        except Exception as exc:
+            last_error = exc
+
+    raise RuntimeError(
+        "Stage-1 initialization failed for the requested checkpoint "
+        "and its identity-compatible backup"
+    ) from last_error
 
 
 def train_thinker_stage2(
@@ -2005,10 +2403,23 @@ def train_thinker_stage2(
     with open(model_config_path, "r", encoding="utf-8") as f:
         model_conf_dict = yaml.safe_load(f)
     model_config = Qwen3OmniMoeConfig(**model_conf_dict)
+    if resume_path:
+        reconcile_multimodal_token_ids(model_config, tokenizer)
+        _preflight_training_resume(
+            checkpoint=resume_path,
+            model_config=model_config,
+            tokenizer=tokenizer,
+            artifact_kind=CheckpointArtifactKind.STAGE2_TRAINING,
+            model_class=Qwen3OmniMoeThinkerVisionAudioModel,
+        )
 
     # 3. model
     model = _build_reconciled_stage2_model(model_config, tokenizer)
-    checkpoint_metadata = _build_checkpoint_metadata(model, tokenizer)
+    checkpoint_metadata = _build_checkpoint_metadata(
+        model,
+        tokenizer,
+        artifact_kind=CheckpointArtifactKind.STAGE2_TRAINING,
+    )
     # ✅ 从 Stage1 ckpt 初始化 Thinker 权重（仅在不从已有 stage2 ckpt 恢复时）
     if stage1_init_ckpt and not resume_path:
         print(f"Loading Stage1 checkpoint from {stage1_init_ckpt}")
@@ -2021,14 +2432,19 @@ def train_thinker_stage2(
                 checkpoint_metadata.manifest.compatibility_level
             ),
             expected_architecture=checkpoint_metadata.architecture,
+            expected_artifact_kind=(
+                CheckpointArtifactKind.STAGE1_TRAINING
+            ),
+            expected_topology=describe_model_topology(model.thinker),
             expected_tokenizer_sha256=(
                 checkpoint_metadata.tokenizer_sha256
             ),
         )
-        missing, unexpected = model.thinker.load_state_dict(
-            base_thinker.state_dict(), strict=False
+        model.thinker.load_state_dict(
+            base_thinker.state_dict(),
+            strict=True,
         )
-        print(f"Loaded Stage1 weights into Thinker. missing={len(missing)}, unexpected={len(unexpected)}")
+        print("Loaded Stage1 weights into Thinker with strict schema.")
 
     model.to(device)  # type: ignore[arg-type]
 
@@ -2100,6 +2516,8 @@ def train_thinker_stage2(
                 checkpoint_metadata.manifest.compatibility_level
             ),
             expected_architecture=checkpoint_metadata.architecture,
+            expected_artifact_kind=checkpoint_metadata.artifact_kind,
+            expected_topology=checkpoint_metadata.topology,
             expected_tokenizer_sha256=(
                 checkpoint_metadata.tokenizer_sha256
             ),

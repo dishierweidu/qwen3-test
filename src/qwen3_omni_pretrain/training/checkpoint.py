@@ -1,15 +1,16 @@
 import os
+import pickle
 import shutil
 import warnings
-import tempfile
-import glob
-from typing import Optional, Tuple, TYPE_CHECKING
+from typing import Callable, Optional, Tuple, TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 
 from qwen3_omni_pretrain.architecture.checkpoint_metadata import (
+	CheckpointArtifactKind,
 	CheckpointMetadata,
+	ModelTopology,
 	load_checkpoint_metadata,
 	write_checkpoint_metadata,
 )
@@ -74,6 +75,115 @@ def _raise_if_accelerator_checkpoint_failed(
 		"Accelerator checkpoint failed on another rank during "
 		f"{phase}"
 	)
+
+
+def _remove_checkpoint_path(path: str) -> None:
+	if os.path.isdir(path):
+		shutil.rmtree(path)
+	elif os.path.exists(path):
+		os.unlink(path)
+
+
+def _publish_accelerator_checkpoint_transaction(
+	accelerator: "Accelerator",
+	checkpoint_dir: str,
+	metadata: CheckpointMetadata,
+	payload_writer: Callable[[str], None],
+	*,
+	rank_zero_finalizer: Callable[[str], None] | None = None,
+	all_rank_finalizer: Callable[[str], None] | None = None,
+	metadata_writer: Callable[
+		[str, CheckpointMetadata],
+		None,
+	] = write_checkpoint_metadata,
+) -> str:
+	"""Publish an all-rank payload as one recoverable checkpoint generation."""
+	temp_dir = checkpoint_dir + ".tmp"
+	backup_dir = checkpoint_dir + ".backup"
+
+	accelerator.wait_for_everyone()
+	cleanup_error: BaseException | None = None
+	if accelerator.is_main_process:
+		try:
+			_remove_checkpoint_path(temp_dir)
+			os.makedirs(temp_dir, exist_ok=False)
+		except BaseException as exc:
+			cleanup_error = exc
+	_raise_if_accelerator_checkpoint_failed(
+		accelerator,
+		cleanup_error,
+		"cleanup",
+	)
+	accelerator.wait_for_everyone()
+
+	payload_error: BaseException | None = None
+	try:
+		payload_writer(temp_dir)
+	except BaseException as exc:
+		payload_error = exc
+	try:
+		_raise_if_accelerator_checkpoint_failed(
+			accelerator,
+			payload_error,
+			"payload",
+		)
+	except BaseException:
+		if accelerator.is_main_process:
+			_remove_checkpoint_path(temp_dir)
+		raise
+
+	if all_rank_finalizer is not None:
+		accelerator.wait_for_everyone()
+		finalizer_error: BaseException | None = None
+		try:
+			all_rank_finalizer(temp_dir)
+		except BaseException as exc:
+			finalizer_error = exc
+		try:
+			_raise_if_accelerator_checkpoint_failed(
+				accelerator,
+				finalizer_error,
+				"manifest collection",
+			)
+		except BaseException:
+			if accelerator.is_main_process:
+				_remove_checkpoint_path(temp_dir)
+			raise
+
+	accelerator.wait_for_everyone()
+	publication_error: BaseException | None = None
+	if accelerator.is_main_process:
+		try:
+			if rank_zero_finalizer is not None:
+				rank_zero_finalizer(temp_dir)
+			# architecture.json is the readiness signal and is always last.
+			metadata_writer(temp_dir, metadata)
+			if os.path.exists(checkpoint_dir):
+				_remove_checkpoint_path(backup_dir)
+				os.rename(checkpoint_dir, backup_dir)
+			# When only .backup remains after an earlier crash, preserve it
+			# until the new generation has been published successfully.
+			os.rename(temp_dir, checkpoint_dir)
+		except BaseException as exc:
+			publication_error = exc
+			try:
+				_remove_checkpoint_path(temp_dir)
+				if (
+					os.path.exists(backup_dir)
+					and not os.path.exists(checkpoint_dir)
+				):
+					os.rename(backup_dir, checkpoint_dir)
+			except BaseException as rollback_exc:
+				publication_error = RuntimeError(
+					f"{exc}; rollback also failed: {rollback_exc}"
+				)
+	_raise_if_accelerator_checkpoint_failed(
+		accelerator,
+		publication_error,
+		"publication",
+	)
+	accelerator.wait_for_everyone()
+	return checkpoint_dir
 
 
 def verify_checkpoint_integrity(checkpoint_dir: str, check_model: bool = True) -> bool:
@@ -199,11 +309,11 @@ def atomic_save_checkpoint(
 			if not verify_checkpoint_integrity(temp_dir, check_model=False):
 				raise RuntimeError(f"Checkpoint verification failed for {temp_dir}")
 		
-		# 原子替换：先备份旧的，再 rename 新的
-		if os.path.exists(backup_dir):
-			shutil.rmtree(backup_dir)
-		
+		# 原子替换：仅当当前 generation 存在时才轮换备份。如果一次
+		# 旧发布崩溃后只剩 .backup，则在新 generation 成功前保留它。
 		if os.path.exists(checkpoint_dir):
+			if os.path.exists(backup_dir):
+				shutil.rmtree(backup_dir)
 			os.rename(checkpoint_dir, backup_dir)
 		
 		os.rename(temp_dir, checkpoint_dir)
@@ -257,6 +367,66 @@ def save_checkpoint(
 	)
 
 
+def resolve_checkpoint_directory(
+	checkpoint_dir: str,
+	*,
+	expected_profile: ArchitectureProfile | None = None,
+	expected_compatibility: CompatibilityLevel | None = None,
+	expected_architecture: ArchitectureSummary | None = None,
+	expected_artifact_kind: CheckpointArtifactKind | None = None,
+	expected_topology: ModelTopology | None = None,
+	expected_tokenizer_sha256: str | None = None,
+	legacy_config: object | None = None,
+) -> str:
+	"""Resolve the first complete, identity-compatible checkpoint generation."""
+	backup_dir = checkpoint_dir + ".backup"
+	candidates = [checkpoint_dir]
+	if os.path.exists(backup_dir):
+		primary_sidecar = os.path.isfile(
+			os.path.join(checkpoint_dir, "architecture.json")
+		)
+		backup_sidecar = os.path.isfile(
+			os.path.join(backup_dir, "architecture.json")
+		)
+		if backup_sidecar and not primary_sidecar:
+			candidates = [backup_dir, checkpoint_dir]
+		else:
+			candidates.append(backup_dir)
+	last_error: BaseException | None = None
+	for candidate in candidates:
+		try:
+			if not os.path.isdir(candidate):
+				raise FileNotFoundError(candidate)
+			load_checkpoint_metadata(
+				candidate,
+				expected_profile=expected_profile,
+				expected_compatibility=expected_compatibility,
+				expected_architecture=expected_architecture,
+				expected_artifact_kind=expected_artifact_kind,
+				expected_topology=expected_topology,
+				expected_tokenizer_sha256=expected_tokenizer_sha256,
+				legacy_config=legacy_config,
+			)
+			return candidate
+		except (
+			ValueError,
+			TypeError,
+			FileNotFoundError,
+			OSError,
+		) as exc:
+			last_error = exc
+			if candidate == candidates[0] and len(candidates) > 1:
+				warnings.warn(
+					f"[checkpoint] Failed to load from {candidate}: {exc}\n"
+					f"Trying backup candidate: {candidates[1]}"
+				)
+				continue
+			raise
+	raise RuntimeError(
+		f"Failed to resolve checkpoint {checkpoint_dir}: {last_error}"
+	) from last_error
+
+
 def load_checkpoint(
 	checkpoint_dir: str,
 	model: torch.nn.Module,
@@ -268,6 +438,8 @@ def load_checkpoint(
 	expected_profile: ArchitectureProfile | None = None,
 	expected_compatibility: CompatibilityLevel | None = None,
 	expected_architecture: ArchitectureSummary | None = None,
+	expected_artifact_kind: CheckpointArtifactKind | None = None,
+	expected_topology: ModelTopology | None = None,
 	expected_tokenizer_sha256: str | None = None,
 	legacy_config: object | None = None,
 ) -> Tuple[int, int, float]:
@@ -292,11 +464,13 @@ def load_checkpoint(
 				expected_profile=expected_profile,
 				expected_compatibility=expected_compatibility,
 				expected_architecture=expected_architecture,
+				expected_artifact_kind=expected_artifact_kind,
+				expected_topology=expected_topology,
 				expected_tokenizer_sha256=expected_tokenizer_sha256,
 				legacy_config=legacy_config,
 			)
 			return _load_checkpoint_impl(try_dir, model, optimizer, scheduler, scaler, map_location)
-		except ValueError as e:
+		except (ValueError, TypeError) as e:
 			if try_dir != checkpoint_dir or not os.path.exists(backup_dir):
 				raise
 			last_error = e
@@ -305,7 +479,13 @@ def load_checkpoint(
 				f"Trying backup: {backup_dir}"
 			)
 			continue
-		except (RuntimeError, FileNotFoundError) as e:
+		except (
+			RuntimeError,
+			FileNotFoundError,
+			EOFError,
+			pickle.UnpicklingError,
+			OSError,
+		) as e:
 			last_error = e
 			if try_dir == checkpoint_dir and os.path.exists(backup_dir):
 				warnings.warn(
@@ -333,10 +513,10 @@ def _load_checkpoint_impl(
 	model_index = os.path.join(checkpoint_dir, "pytorch_model.bin.index.json")
 	if os.path.exists(model_path_bin):
 		state_dict = torch.load(model_path_bin, map_location=map_location)
-		_unwrap_model(model).load_state_dict(state_dict, strict=False)
+		_unwrap_model(model).load_state_dict(state_dict, strict=True)
 	elif os.path.exists(model_index):
 		# HF sharded checkpoint
-		load_sharded_checkpoint(_unwrap_model(model), checkpoint_dir, strict=False)
+		load_sharded_checkpoint(_unwrap_model(model), checkpoint_dir, strict=True)
 	else:
 		raise FileNotFoundError(f"No pytorch_model.bin or shard index under {checkpoint_dir}")
 
@@ -345,28 +525,13 @@ def _load_checkpoint_impl(
 		trainer_state = torch.load(trainer_state_path, map_location=map_location)
 
 		if optimizer is not None and trainer_state.get("optimizer") is not None:
-			try:
-				optimizer.load_state_dict(trainer_state["optimizer"])
-			except (ValueError, RuntimeError) as e:
-				warnings.warn(
-					f"[checkpoint] optimizer state mismatch, skip loading optimizer: {e}"
-				)
+			optimizer.load_state_dict(trainer_state["optimizer"])
 
 		if scheduler is not None and trainer_state.get("scheduler") is not None:
-			try:
-				scheduler.load_state_dict(trainer_state["scheduler"])
-			except (ValueError, RuntimeError) as e:
-				warnings.warn(
-					f"[checkpoint] scheduler state mismatch, skip loading scheduler: {e}"
-				)
+			scheduler.load_state_dict(trainer_state["scheduler"])
 
 		if scaler is not None and trainer_state.get("scaler") is not None:
-			try:
-				scaler.load_state_dict(trainer_state["scaler"])
-			except (ValueError, RuntimeError) as e:
-				warnings.warn(
-					f"[checkpoint] scaler state mismatch, skip loading scaler: {e}"
-				)
+			scaler.load_state_dict(trainer_state["scaler"])
 
 		start_epoch = int(trainer_state.get("epoch", 0))
 		global_step = int(trainer_state.get("global_step", 0))
@@ -391,119 +556,36 @@ def save_checkpoint_accelerator(
 	*,
 	metadata: CheckpointMetadata,
 ) -> str:
-	"""
-	使用 Accelerator 保存检查点（原子写入）
-	
-	Accelerator.save_state() 会自动保存:
-	- 模型权重 (支持 DDP/DeepSpeed/FSDP)
-	- 优化器状态
-	- 学习率调度器状态
-	- GradScaler 状态 (如果使用混合精度)
-	- 随机数状态
-	
-	使用临时目录 + rename 实现原子写入，防止保存中断导致文件损坏。
-	
-	Args:
-		accelerator: Accelerator 实例
-		checkpoint_dir: 检查点保存目录
-		epoch: 当前 epoch
-		global_step: 全局步数
-		best_val_loss: 最佳验证损失
-		tokenizer: tokenizer（可选）
-	
-	Returns:
-		保存路径
-	"""
-	# 等待所有进程
-	accelerator.wait_for_everyone()
-	
-	temp_dir = checkpoint_dir + ".tmp"
-	backup_dir = checkpoint_dir + ".backup"
-	
-	cleanup_error: BaseException | None = None
-	if accelerator.is_main_process:
-		try:
-			if os.path.exists(temp_dir):
-				shutil.rmtree(temp_dir)
-		except BaseException as exc:
-			cleanup_error = exc
-	_raise_if_accelerator_checkpoint_failed(
-		accelerator,
-		cleanup_error,
-		"cleanup",
-	)
-	
-	accelerator.wait_for_everyone()
+	"""Save Accelerator state through the shared generation transaction."""
 
-	payload_error: BaseException | None = None
-	try:
-		os.makedirs(temp_dir, exist_ok=True)
+	def write_payload(temp_dir: str) -> None:
 		accelerator.save_state(temp_dir)
 		if accelerator.is_main_process:
-			state = {
-				"epoch": epoch,
-				"global_step": global_step,
-				"best_val_loss": best_val_loss,
-			}
 			torch.save(
-				state,
+				{
+					"epoch": epoch,
+					"global_step": global_step,
+					"best_val_loss": best_val_loss,
+				},
 				os.path.join(temp_dir, "trainer_state.pt"),
 			)
 			if tokenizer is not None:
 				tokenizer.save_pretrained(temp_dir)
-	except BaseException as exc:
-		payload_error = exc
 
-	try:
-		_raise_if_accelerator_checkpoint_failed(
-			accelerator,
-			payload_error,
-			"payload",
+	def verify_payload(temp_dir: str) -> None:
+		torch.load(
+			os.path.join(temp_dir, "trainer_state.pt"),
+			map_location="cpu",
 		)
-	except BaseException:
-		if accelerator.is_main_process and os.path.exists(temp_dir):
-			shutil.rmtree(temp_dir)
-		raise
 
-	# The readiness sidecar is written only after every rank finishes payload.
-	accelerator.wait_for_everyone()
-
-	publication_error: BaseException | None = None
-	if accelerator.is_main_process:
-		try:
-			write_checkpoint_metadata(temp_dir, metadata)
-			torch.load(
-				os.path.join(temp_dir, "trainer_state.pt"),
-				map_location="cpu",
-			)
-			if os.path.exists(backup_dir):
-				shutil.rmtree(backup_dir)
-			if os.path.exists(checkpoint_dir):
-				os.rename(checkpoint_dir, backup_dir)
-			os.rename(temp_dir, checkpoint_dir)
-		except BaseException as exc:
-			publication_error = exc
-			try:
-				if os.path.exists(temp_dir):
-					shutil.rmtree(temp_dir)
-				if (
-					os.path.exists(backup_dir)
-					and not os.path.exists(checkpoint_dir)
-				):
-					os.rename(backup_dir, checkpoint_dir)
-			except BaseException as rollback_exc:
-				publication_error = RuntimeError(
-					f"{exc}; rollback also failed: {rollback_exc}"
-				)
-
-	_raise_if_accelerator_checkpoint_failed(
+	return _publish_accelerator_checkpoint_transaction(
 		accelerator,
-		publication_error,
-		"publication",
+		checkpoint_dir,
+		metadata,
+		write_payload,
+		rank_zero_finalizer=verify_payload,
+		metadata_writer=write_checkpoint_metadata,
 	)
-	
-	accelerator.wait_for_everyone()
-	return checkpoint_dir
 
 
 def load_checkpoint_accelerator(
@@ -513,6 +595,8 @@ def load_checkpoint_accelerator(
 	expected_profile: ArchitectureProfile | None = None,
 	expected_compatibility: CompatibilityLevel | None = None,
 	expected_architecture: ArchitectureSummary | None = None,
+	expected_artifact_kind: CheckpointArtifactKind | None = None,
+	expected_topology: ModelTopology | None = None,
 	expected_tokenizer_sha256: str | None = None,
 	legacy_config: object | None = None,
 ) -> Tuple[int, int, float]:
@@ -535,56 +619,23 @@ def load_checkpoint_accelerator(
 	Returns:
 		(start_epoch, global_step, best_val_loss)
 	"""
-	backup_dir = checkpoint_dir + ".backup"
-	dirs_to_try = [checkpoint_dir]
-	if os.path.exists(backup_dir):
-		dirs_to_try.append(backup_dir)
-	
-	last_error = None
-	for try_dir in dirs_to_try:
-		try:
-			load_checkpoint_metadata(
-				try_dir,
-					expected_profile=expected_profile,
-					expected_compatibility=expected_compatibility,
-					expected_architecture=expected_architecture,
-					expected_tokenizer_sha256=expected_tokenizer_sha256,
-					legacy_config=legacy_config,
-			)
-			# 加载 accelerator 状态
-			accelerator.load_state(try_dir)
-			
-			# 加载额外的训练状态
-			trainer_state_path = os.path.join(try_dir, "trainer_state.pt")
-			if os.path.exists(trainer_state_path):
-				state = torch.load(trainer_state_path, map_location="cpu")
-				start_epoch = int(state.get("epoch", 0))
-				global_step = int(state.get("global_step", 0))
-				best_val_loss = float(state.get("best_val_loss", float("inf")))
-				return start_epoch, global_step, best_val_loss
-			
-			return 0, 0, float("inf")
-		except ValueError as e:
-			if try_dir != checkpoint_dir or not os.path.exists(backup_dir):
-				raise
-			last_error = e
-			warnings.warn(
-				f"[checkpoint] Failed to load from {try_dir}: {e}\n"
-				f"Trying backup: {backup_dir}"
-			)
-			continue
-		except (RuntimeError, FileNotFoundError) as e:
-			last_error = e
-			if try_dir == checkpoint_dir and os.path.exists(backup_dir):
-				warnings.warn(
-					f"[checkpoint] Failed to load from {try_dir}: {e}\n"
-					f"Trying backup: {backup_dir}"
-				)
-			continue
-	
-	raise RuntimeError(
-		f"Failed to load checkpoint from {checkpoint_dir} (and backup if exists): {last_error}"
-	) from last_error
+	# Keep this compatibility entry point on the same all-rank candidate
+	# protocol as the production Accelerator loader.
+	from qwen3_omni_pretrain.training.accelerator_utils import (
+		load_accelerator_checkpoint,
+	)
+
+	return load_accelerator_checkpoint(
+		accelerator,
+		checkpoint_dir,
+		expected_profile=expected_profile,
+		expected_compatibility=expected_compatibility,
+		expected_architecture=expected_architecture,
+		expected_artifact_kind=expected_artifact_kind,
+		expected_topology=expected_topology,
+		expected_tokenizer_sha256=expected_tokenizer_sha256,
+		legacy_config=legacy_config,
+	)
 
 
 def save_model_only_accelerator(
@@ -607,8 +658,6 @@ def save_model_only_accelerator(
 	Returns:
 		保存路径
 	"""
-	accelerator.wait_for_everyone()
-
 	rank = dist.get_rank() if dist.is_initialized() else 0
 	state_error: BaseException | None = None
 	try:
@@ -630,49 +679,30 @@ def save_model_only_accelerator(
 		"state collection",
 	)
 
-	accelerator.wait_for_everyone()
-
-	payload_error: BaseException | None = None
-	if accelerator.is_main_process:
-		try:
-			os.makedirs(save_dir, exist_ok=True)
+	def write_payload(temp_dir: str) -> None:
+		if accelerator.is_main_process:
 			print(
 				"[rank0] >>> save_only_model: before save_pretrained",
 				flush=True,
 			)
 			unwrapped_model.save_pretrained(
-				save_dir,
+				temp_dir,
 				state_dict=state_dict,
 				safe_serialization=safe_serialization,
 				max_shard_size="2GB",
 			)
-		except BaseException as exc:
-			payload_error = exc
-	_raise_if_accelerator_checkpoint_failed(
+
+	result = _publish_accelerator_checkpoint_transaction(
 		accelerator,
-		payload_error,
-		"payload",
+		save_dir,
+		metadata,
+		write_payload,
+		metadata_writer=write_checkpoint_metadata,
 	)
-
-	# All model artifacts must be complete before publishing the sidecar.
-	accelerator.wait_for_everyone()
-
-	publication_error: BaseException | None = None
 	if accelerator.is_main_process:
-		try:
-			write_checkpoint_metadata(save_dir, metadata)
-			print(
-				"[rank0] >>> save_only_model: after save_pretrained",
-				flush=True,
-			)
-		except BaseException as exc:
-			publication_error = exc
-	_raise_if_accelerator_checkpoint_failed(
-		accelerator,
-		publication_error,
-		"publication",
+		print(
+			"[rank0] >>> save_only_model: after save_pretrained",
+			flush=True,
 		)
-
-	accelerator.wait_for_everyone()
 	print(f"[rank{rank}] >>> save_only_model: done", flush=True)
-	return save_dir
+	return result

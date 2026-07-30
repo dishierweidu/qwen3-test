@@ -19,6 +19,13 @@ from qwen3_omni_pretrain.multimodal.tokenization.special_tokens import (
     reconcile_multimodal_token_ids,
 )
 from qwen3_omni_pretrain.data.collators import Stage2MediaLoader
+from qwen3_omni_pretrain.architecture.checkpoint_metadata import (
+    CheckpointArtifactKind,
+    describe_model_topology,
+    load_checkpoint_metadata,
+    tokenizer_identity_sha256,
+)
+from qwen3_omni_pretrain.architecture.summary import summarize_model
 
 
 def parse_args() -> argparse.Namespace:
@@ -161,20 +168,151 @@ def _ensure_tokenizer(tokenizer_name_or_path: Optional[str], checkpoint: str):
     return tokenizer
 
 
+def _inference_bootstrap_checkpoint(checkpoint: str) -> str:
+    """Choose a directory that can supply config/tokenizer before weight I/O."""
+    backup = checkpoint + ".backup"
+    if not os.path.isdir(checkpoint) and os.path.isdir(backup):
+        return backup
+    if (
+        os.path.isdir(backup)
+        and not os.path.isfile(os.path.join(checkpoint, "config.json"))
+        and os.path.isfile(os.path.join(backup, "config.json"))
+    ):
+        return backup
+    return checkpoint
+
+
+def _preflight_inference_identity(
+    *,
+    checkpoint: str,
+    model_config: Qwen3OmniMoeConfig,
+    tokenizer: object,
+    artifact_kind: CheckpointArtifactKind,
+    model_class,
+) -> tuple[str, ...]:
+    with torch.device("meta"):
+        graph = model_class(model_config)
+    thinker = graph.thinker if hasattr(graph, "thinker") else graph
+    manifest = thinker.config.profile_manifest
+    backup = checkpoint + ".backup"
+    expected_tokenizer_sha256 = None
+    if any(
+        os.path.isfile(os.path.join(candidate, "architecture.json"))
+        for candidate in (checkpoint, backup)
+    ):
+        expected_tokenizer_sha256 = tokenizer_identity_sha256(tokenizer)
+    expected = {
+        "expected_profile": manifest.architecture_profile,
+        "expected_compatibility": manifest.compatibility_level,
+        "expected_architecture": summarize_model(
+            thinker,
+            manifest,
+            tokenizer_vocab_size=len(tokenizer),  # type: ignore[arg-type]
+        ),
+        "expected_artifact_kind": artifact_kind,
+        "expected_topology": describe_model_topology(graph),
+        "expected_tokenizer_sha256": expected_tokenizer_sha256,
+        "legacy_config": model_config.to_dict(),
+    }
+    candidates = [checkpoint]
+    if os.path.isdir(backup):
+        primary_sidecar = os.path.isfile(
+            os.path.join(checkpoint, "architecture.json")
+        )
+        backup_sidecar = os.path.isfile(
+            os.path.join(backup, "architecture.json")
+        )
+        if backup_sidecar and not primary_sidecar:
+            candidates = [backup, checkpoint]
+        else:
+            candidates.append(backup)
+    compatible: list[str] = []
+    last_error: BaseException | None = None
+    for candidate in candidates:
+        try:
+            if not os.path.isdir(candidate) and any(
+                os.path.isdir(path) for path in candidates
+            ):
+                continue
+            load_checkpoint_metadata(candidate, **expected)
+            compatible.append(candidate)
+        except (ValueError, TypeError, OSError) as exc:
+            last_error = exc
+    if compatible:
+        return tuple(compatible)
+    raise ValueError(
+        f"no compatible inference checkpoint: {last_error}"
+    ) from last_error
+
+
+def _strict_from_pretrained_with_backup(
+    model_class,
+    candidates: tuple[str, ...],
+    *,
+    config: Qwen3OmniMoeConfig,
+    load_kwargs: Mapping[str, Any],
+):
+    last_error: BaseException | None = None
+    for candidate in candidates:
+        try:
+            loaded = model_class.from_pretrained(
+                candidate,
+                config=config,
+                output_loading_info=True,
+                **dict(load_kwargs),
+            )
+            if not isinstance(loaded, tuple) or len(loaded) != 2:
+                return loaded
+            model, loading_info = loaded
+            if any(
+                loading_info.get(key)
+                for key in (
+                    "missing_keys",
+                    "unexpected_keys",
+                    "mismatched_keys",
+                    "error_msgs",
+                )
+            ):
+                raise RuntimeError(
+                    "checkpoint failed strict inference loading: "
+                    f"{loading_info}"
+                )
+            return model
+        # Tensor readers use backend-specific exception types (for example,
+        # safetensors.SafetensorError).  This is the candidate recovery
+        # boundary, so retry every ordinary load failure while still allowing
+        # BaseException subclasses such as KeyboardInterrupt to propagate.
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(
+        "no identity-compatible inference checkpoint has a complete "
+        "tensor payload"
+    ) from last_error
+
+
 def _load_reconciled_stage2_model(
     checkpoint: str,
     tokenizer: Any,
     *,
     load_kwargs: Optional[Mapping[str, Any]] = None,
 ) -> Qwen3OmniMoeThinkerVisionAudioModel:
+    bootstrap = _inference_bootstrap_checkpoint(checkpoint)
     model_config = Qwen3OmniMoeConfig.from_legacy_pretrained_config(
-        checkpoint
+        bootstrap
     )
     reconcile_multimodal_token_ids(model_config, tokenizer)
-    return Qwen3OmniMoeThinkerVisionAudioModel.from_pretrained(
-        checkpoint,
+    candidates = _preflight_inference_identity(
+        checkpoint=checkpoint,
+        model_config=model_config,
+        tokenizer=tokenizer,
+        artifact_kind=CheckpointArtifactKind.STAGE2_TRAINING,
+        model_class=Qwen3OmniMoeThinkerVisionAudioModel,
+    )
+    return _strict_from_pretrained_with_backup(
+        Qwen3OmniMoeThinkerVisionAudioModel,
+        candidates or (checkpoint,),
         config=model_config,
-        **dict(load_kwargs or {}),
+        load_kwargs=dict(load_kwargs or {}),
     )
 
 
@@ -347,19 +485,31 @@ def _print_stats(prefix: str, stats: Dict[str, Any]):
 def run_stage1(args: argparse.Namespace):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = _get_dtype(args.dtype)
-    tokenizer = _ensure_tokenizer(args.tokenizer_name_or_path, args.checkpoint)
+    bootstrap = _inference_bootstrap_checkpoint(args.checkpoint)
+    tokenizer = _ensure_tokenizer(
+        args.tokenizer_name_or_path,
+        bootstrap,
+    )
 
     load_kwargs: Dict[str, Any] = {}
     if dtype is not None:
         load_kwargs["torch_dtype"] = dtype
     try:
         model_config = Qwen3OmniMoeConfig.from_legacy_pretrained_config(
-            args.checkpoint
+            bootstrap
         )
-        model = Qwen3OmniMoeThinkerTextModel.from_pretrained(
-            args.checkpoint,
+        candidates = _preflight_inference_identity(
+            checkpoint=args.checkpoint,
+            model_config=model_config,
+            tokenizer=tokenizer,
+            artifact_kind=CheckpointArtifactKind.STAGE1_TRAINING,
+            model_class=Qwen3OmniMoeThinkerTextModel,
+        )
+        model = _strict_from_pretrained_with_backup(
+            Qwen3OmniMoeThinkerTextModel,
+            candidates or (args.checkpoint,),
             config=model_config,
-            **load_kwargs,
+            load_kwargs=load_kwargs,
         )
     except ValueError as exc:
         msg = str(exc)

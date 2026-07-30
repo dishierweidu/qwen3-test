@@ -316,6 +316,8 @@ def _describe_layer(
 def summarize_model(
     model: torch.nn.Module,
     manifest: ProfileManifest,
+    *,
+    tokenizer_vocab_size: int | None = None,
 ) -> ArchitectureSummary:
     if not isinstance(manifest, ProfileManifest):
         raise TypeError("manifest must be a ProfileManifest")
@@ -332,16 +334,21 @@ def summarize_model(
     )
     if type(embedding_vocab_size) is not int:
         raise TypeError("model embedding vocabulary size is unavailable")
-    tokenizer_vocab_size = getattr(
-        config,
-        "_tokenizer_vocab_size",
-        config.vocab_size,
-    )
+    if tokenizer_vocab_size is None:
+        tokenizer_vocab_size = getattr(
+            config,
+            "_tokenizer_vocab_size",
+            config.vocab_size,
+        )
+    if type(tokenizer_vocab_size) is not int or tokenizer_vocab_size < 0:
+        raise ValueError(
+            "tokenizer_vocab_size must be a non-negative integer"
+        )
     return ArchitectureSummary(
         profile=manifest.architecture_profile.value,
         compatibility_level=manifest.compatibility_level.value,
         model_type=config.model_type,
-        tokenizer_vocab_size=int(tokenizer_vocab_size),
+        tokenizer_vocab_size=tokenizer_vocab_size,
         embedding_vocab_size=embedding_vocab_size,
         total_parameters=stats.total_parameters,
         active_parameters_per_token=(

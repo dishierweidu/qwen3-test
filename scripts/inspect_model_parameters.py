@@ -36,12 +36,32 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print deterministic machine-readable JSON",
     )
+    parser.add_argument(
+        "--tokenizer",
+        type=Path,
+        help="Optional tokenizer path used to reconcile special token IDs",
+    )
+    parser.add_argument(
+        "--allow-network",
+        action="store_true",
+        help="Allow tokenizer downloads; inspection is offline by default",
+    )
+    parser.add_argument(
+        "--allow-remote-code",
+        action="store_true",
+        help="Allow tokenizer repository code independently of networking",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    summary = inspect_architecture(args.model_config)
+    summary = inspect_architecture(
+        args.model_config,
+        tokenizer_path=args.tokenizer,
+        allow_network=args.allow_network,
+        allow_remote_code=args.allow_remote_code,
+    )
     fields = {
         key: summary.to_dict()[key]
         for key in PARAMETER_FIELDS

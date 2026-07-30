@@ -564,6 +564,7 @@ class ThinkerDecoderLayer(nn.Module):
 
 class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
     config_class = Qwen3OmniMoeConfig
+    _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config: Qwen3OmniMoeConfig):
         super().__init__(config)

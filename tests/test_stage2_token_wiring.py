@@ -140,6 +140,11 @@ def test_inference_loads_config_then_reconciles_before_weights(monkeypatch):
     monkeypatch.setattr(
         cli, "Qwen3OmniMoeThinkerVisionAudioModel", SpyModel
     )
+    monkeypatch.setattr(
+        cli,
+        "_preflight_inference_identity",
+        lambda **kwargs: events.append("identity-gate"),
+    )
 
     model = cli._load_reconciled_stage2_model(
         "checkpoint-x",
@@ -147,7 +152,12 @@ def test_inference_loads_config_then_reconciles_before_weights(monkeypatch):
         load_kwargs={"torch_dtype": torch.float32},
     )
     assert isinstance(model, SpyModel)
-    assert events == ["legacy-adapt", "reconcile", "weight-load"]
+    assert events == [
+        "legacy-adapt",
+        "reconcile",
+        "identity-gate",
+        "weight-load",
+    ]
     assert captured["torch_dtype"] is torch.float32
 
 
@@ -177,6 +187,19 @@ def test_inference_stage1_adapts_config_before_weights(monkeypatch):
 
     monkeypatch.setattr(cli, "Qwen3OmniMoeConfig", SpyConfig)
     monkeypatch.setattr(cli, "Qwen3OmniMoeThinkerTextModel", SpyModel)
+    monkeypatch.setattr(
+        cli,
+        "_preflight_inference_identity",
+        lambda **kwargs: events.append("identity-gate"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_strict_from_pretrained_with_backup",
+        lambda model_class, candidates, config, load_kwargs: (
+            events.append("weight-load")
+            or (_ for _ in ()).throw(WiringReached())
+        ),
+    )
     args = Namespace(
         checkpoint="checkpoint",
         tokenizer_name_or_path=None,
@@ -186,7 +209,7 @@ def test_inference_stage1_adapts_config_before_weights(monkeypatch):
     with pytest.raises(WiringReached):
         cli.run_stage1(args)
 
-    assert events == ["legacy-adapt", "weight-load"]
+    assert events == ["legacy-adapt", "identity-gate", "weight-load"]
 
 
 def test_training_stage1_initialization_adapts_config_before_weights(
@@ -194,6 +217,8 @@ def test_training_stage1_initialization_adapts_config_before_weights(
 ):
     events = []
     expected_architecture = object()
+    expected_artifact_kind = object()
+    expected_topology = object()
     expected_tokenizer_sha256 = "a" * 64
     manifest = SimpleNamespace(
         architecture_profile="legacy-profile",
@@ -231,6 +256,8 @@ def test_training_stage1_initialization_adapts_config_before_weights(
             "expected_profile": "legacy-profile",
             "expected_compatibility": "legacy-compatibility",
             "expected_architecture": expected_architecture,
+            "expected_artifact_kind": expected_artifact_kind,
+            "expected_topology": expected_topology,
             "expected_tokenizer_sha256": expected_tokenizer_sha256,
             "legacy_config": config.to_dict(),
         }
@@ -250,11 +277,90 @@ def test_training_stage1_initialization_adapts_config_before_weights(
         expected_profile=manifest.architecture_profile,
         expected_compatibility=manifest.compatibility_level,
         expected_architecture=expected_architecture,
+        expected_artifact_kind=expected_artifact_kind,
+        expected_topology=expected_topology,
         expected_tokenizer_sha256=expected_tokenizer_sha256,
     )
 
     assert isinstance(model, SpyModel)
     assert events == ["legacy-adapt", "metadata-gate", "weight-load"]
+
+
+def test_training_stage1_initialization_retries_strict_valid_backup(
+    monkeypatch,
+    tmp_path,
+):
+    checkpoint = tmp_path / "checkpoint"
+    backup = tmp_path / "checkpoint.backup"
+    checkpoint.mkdir()
+    backup.mkdir()
+    calls: list[tuple[str, str]] = []
+    manifest = SimpleNamespace(
+        architecture_profile="legacy-profile",
+        compatibility_level="legacy-compatibility",
+    )
+
+    class AdaptedConfig:
+        profile_manifest = manifest
+
+        def to_dict(self):
+            return {"model_type": "qwen3_omni_prototype"}
+
+    class SpyConfig:
+        @classmethod
+        def from_legacy_pretrained_config(cls, candidate):
+            calls.append(("config", candidate))
+            return AdaptedConfig()
+
+    class SpyModel:
+        @classmethod
+        def from_pretrained(cls, candidate, **kwargs):
+            calls.append(("weights", candidate))
+            if candidate == str(checkpoint):
+                raise OSError("primary tensor payload is truncated")
+            return (
+                cls(),
+                {
+                    "missing_keys": [],
+                    "unexpected_keys": [],
+                    "mismatched_keys": [],
+                    "error_msgs": [],
+                },
+            )
+
+    monkeypatch.setattr(trainer_thinker, "Qwen3OmniMoeConfig", SpyConfig)
+    monkeypatch.setattr(
+        trainer_thinker,
+        "Qwen3OmniMoeThinkerTextModel",
+        SpyModel,
+    )
+    monkeypatch.setattr(
+        trainer_thinker,
+        "load_checkpoint_metadata",
+        lambda candidate, **kwargs: calls.append(
+            ("metadata", candidate)
+        ),
+    )
+
+    restored = trainer_thinker._load_legacy_stage1_model(
+        str(checkpoint),
+        expected_profile=manifest.architecture_profile,
+        expected_compatibility=manifest.compatibility_level,
+        expected_architecture=object(),
+        expected_artifact_kind=object(),
+        expected_topology=object(),
+        expected_tokenizer_sha256="a" * 64,
+    )
+
+    assert isinstance(restored, SpyModel)
+    assert calls == [
+        ("config", str(checkpoint)),
+        ("metadata", str(checkpoint)),
+        ("weights", str(checkpoint)),
+        ("config", str(backup)),
+        ("metadata", str(backup)),
+        ("weights", str(backup)),
+    ]
 
 
 def test_inference_entry_calls_reconciled_loader(monkeypatch):

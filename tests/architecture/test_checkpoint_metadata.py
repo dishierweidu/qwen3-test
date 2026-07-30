@@ -8,7 +8,9 @@ import pytest
 import torch
 
 from qwen3_omni_pretrain.architecture.checkpoint_metadata import (
+    CheckpointArtifactKind,
     CheckpointMetadata,
+    ModelTopology,
     load_checkpoint_metadata,
     write_checkpoint_metadata,
 )
@@ -64,6 +66,12 @@ def checkpoint_metadata() -> CheckpointMetadata:
     return CheckpointMetadata(
         manifest=legacy_manifest(),
         architecture=toy_architecture_summary(),
+        artifact_kind=CheckpointArtifactKind.STAGE1_TRAINING,
+        topology=ModelTopology(
+            model_class="tests.FakeModel",
+            component_types={"": "tests.FakeModel"},
+            state_schema_sha256="b" * 64,
+        ),
         tokenizer_sha256="a" * 64,
         implementation_commit="dc71e7ca1d03666798ecdbee5143e132e49210f7",
     )
@@ -111,6 +119,9 @@ class EvidenceTokenizer:
     def get_added_vocab(self):
         return {"<eos>": 1}
 
+    def __len__(self) -> int:
+        return 2
+
 
 def test_checkpoint_metadata_round_trip_is_atomic(tmp_path):
     metadata = checkpoint_metadata()
@@ -125,7 +136,7 @@ def test_checkpoint_metadata_round_trip_is_atomic(tmp_path):
     ("mutation", "exception", "message"),
     [
         (
-            lambda raw: raw.update({"schema_version": 2}),
+            lambda raw: raw.update({"schema_version": 3}),
             ValueError,
             "schema_version",
         ),
@@ -602,7 +613,7 @@ def test_accelerator_utils_tp_writer_persists_metadata(
     monkeypatch.setattr(
         accelerator_utils,
         "get_tensor_model_parallel_world_size",
-        lambda: 2,
+        lambda: 1,
     )
     monkeypatch.setattr(
         accelerator_utils,
@@ -611,8 +622,8 @@ def test_accelerator_utils_tp_writer_persists_metadata(
     )
     accelerator_utils.save_tp_sharded_checkpoint(
         FakeAccelerator(),
-        FakeModel(),
-        optimizer=None,
+        (model := FakeModel()),
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
         scheduler=None,
         checkpoint_dir=str(tmp_path),
         epoch=1,
@@ -655,8 +666,8 @@ def test_accelerator_utils_tp_non_main_rank_never_publishes_metadata(
 
     accelerator_utils.save_tp_sharded_checkpoint(
         accelerator,
-        FakeModel(),
-        optimizer=None,
+        (model := FakeModel()),
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
         scheduler=None,
         checkpoint_dir=str(tmp_path / "checkpoint"),
         epoch=1,
@@ -1022,6 +1033,7 @@ def test_trainer_builds_metadata_from_live_graph_and_tokenizer_evidence():
     metadata = trainer_thinker._build_checkpoint_metadata(
         Qwen3OmniMoeThinkerTextModel(config),
         EvidenceTokenizer(),
+        artifact_kind=CheckpointArtifactKind.STAGE1_TRAINING,
         implementation_commit="d" * 40,
     )
 
@@ -1137,6 +1149,7 @@ def test_metadata_counts_zero3_placeholder_parameters_with_ds_numel():
     expected = trainer_thinker._build_checkpoint_metadata(
         model,
         EvidenceTokenizer(),
+        artifact_kind=CheckpointArtifactKind.STAGE1_TRAINING,
         implementation_commit="d" * 40,
     ).architecture
     for parameter in model.parameters():
@@ -1150,6 +1163,7 @@ def test_metadata_counts_zero3_placeholder_parameters_with_ds_numel():
     actual = trainer_thinker._build_checkpoint_metadata(
         model,
         EvidenceTokenizer(),
+        artifact_kind=CheckpointArtifactKind.STAGE1_TRAINING,
         implementation_commit="d" * 40,
     ).architecture
 

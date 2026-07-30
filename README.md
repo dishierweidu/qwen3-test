@@ -199,15 +199,52 @@ The training loop raises `NonFiniteTrainingError` if checked losses, logits, or
 gradients contain NaN/Inf. Distributed ranks synchronize the failure flag so
 all ranks stop at the same batch. Non-finite batches are not silently skipped.
 
+## Checkpoint identity and recovery
+
+New checkpoints publish `architecture.json` schema version 2 only after every
+payload writer has finished. The sidecar records the training artifact
+(`stage1-training` or `stage2-training`), the Thinker architecture summary, the
+complete wrapper topology and state schema, the actual tokenizer length and
+tokenizer serialization hash, and the implementation commit. Resume validates
+this allocation-free identity before constructing a full model or reading
+weights. Same-stage restores are strict; Stage-1-to-Stage-2 initialization is
+an explicit Thinker-only transfer.
+
+Accelerator, model-only, and tensor-parallel saves publish through a temporary
+generation and atomically swap the destination, retaining the previous
+generation as `.backup`. Resume tries a valid backup when the primary
+generation is incomplete; explicit Stage-1-to-Stage-2 initialization applies
+the same identity and strict-payload checks to its backup candidates.
+Tensor-parallel checkpoints contain one immutable
+`tp-shard-rank-XXXXX.pt` file per global rank plus `tp_shards.json`; restore
+requires the complete shard set and matching world size, TP degree/rank, file
+hash, and parameter schema.
+
+In multi-rank training, SIGINT/SIGTERM is converted into an all-rank polling
+decision before a coordinated emergency checkpoint. A unilateral raw Python
+`KeyboardInterrupt` fails closed without starting a new collective because
+peers may already be blocked inside another collective; single-process
+`KeyboardInterrupt` still writes an emergency checkpoint.
+
 ## Parameter inspection
 
 ```bash
-python scripts/inspect_model_parameters.py \
+scripts/inspect_model_parameters.py \
   configs/model/qwen3_omni_1_3b_moe.yaml
 ```
 
 Use `--json` for machine-readable output. The active-parameter value is an MoE
-routing estimate, not measured FLOPs or activation memory.
+routing estimate, not measured FLOPs or activation memory. Tokenizer inspection
+is offline and rejects repository code by default:
+
+```bash
+scripts/inspect_architecture.py \
+  configs/model/qwen3_omni_1_3b_moe.yaml \
+  --tokenizer /path/to/local/tokenizer --json
+```
+
+`--allow-network` permits tokenizer downloads and `--allow-remote-code` permits
+repository code; these are independent opt-ins.
 
 ## Next architecture milestones
 
