@@ -516,6 +516,15 @@ Rules:
   `seconds_per_grid` only when at least two decoded frame times have one
   finite positive uniform cadence within `rtol=1e-6, atol=1e-6`; otherwise the
   field is `None`. Image/audio set it to `None`;
+- decoded values form a strict encoder boundary:
+  - image tensors are floating `[3,H,W]` with positive `H,W`, `length == 1`,
+    no timestamps, and positive integer `original_height`/`original_width`
+    metadata;
+  - audio tensors are floating `[1,N]` with positive `N`, `length == N`, no
+    timestamps, and a positive integer output `sample_rate` in metadata;
+  - video tensors are floating `[F,3,H,W]` with positive `F,H,W`,
+    `length == F`, timestamps shaped `[F]`, and positive integer decoded
+    width/height metadata;
 - `ffprobe` discovers dimensions/time base and `ffmpeg` decodes raw RGB frames;
 - subprocess arguments are a list with `shell=False`;
 - missing binaries, non-zero status, empty output and timestamp/frame mismatch
@@ -643,6 +652,65 @@ git commit -m "feat: load variable-length multimodal items"
   `TemporalVideoEncoder.forward(items, patch_encoder=...) -> MediaSequence`,
   and `AudioWindowEncoder.forward(items) -> MediaSequence`.
 
+Every public `forward()` accepts a non-empty homogeneous
+`Sequence[DecodedMedia]`; Task 7 owns modality grouping. Wrong modality, shape,
+non-floating dtype, zero length, `length`/shape disagreement, or video
+timestamp/frame disagreement fails before projection. Sources remain in input
+order and copy `(sample_index,item_index,source_id)` exactly. Public helpers
+use these signatures:
+
+```python
+class PatchVisionEncoder(nn.Module):
+    def forward(
+        self,
+        items: Sequence[DecodedMedia],
+    ) -> MediaSequence: ...
+
+    def from_tensor_batch(
+        self,
+        pixels: torch.Tensor,
+        *,
+        sources: tuple[MediaSource, ...],
+    ) -> MediaSequence: ...
+
+
+class TemporalVideoEncoder(nn.Module):
+    def __init__(self, *, hidden_size: int) -> None: ...
+
+    def forward(
+        self,
+        items: Sequence[DecodedMedia],
+        *,
+        patch_encoder: PatchVisionEncoder,
+    ) -> MediaSequence: ...
+
+
+class AudioWindowEncoder(nn.Module):
+    def forward(
+        self,
+        items: Sequence[DecodedMedia],
+    ) -> MediaSequence: ...
+
+    def from_waveforms(
+        self,
+        waveforms: Sequence[torch.Tensor],
+        *,
+        sources: tuple[MediaSource, ...],
+        timeline_offsets_seconds: Sequence[float] | None = None,
+    ) -> MediaSequence: ...
+```
+
+All helpers require non-empty inputs and exact source counts.
+`from_tensor_batch` accepts only floating `[B,C,H,W]`.
+`from_waveforms` accepts only non-empty floating 1-D tensors;
+`timeline_offsets_seconds=None` means one zero offset per waveform, while an
+explicit sequence must match the waveform count and contain only finite,
+non-negative values. Constructors reject booleans/non-integers and
+non-positive dimensions; audio additionally requires
+`hop_size <= window_size`. Inputs are converted to the owning module
+parameter's device/dtype, while timestamps stay FP32 on that device. Every
+public result is validated with `MediaSequence.validate()` before return.
+
 - [ ] **Step 1: Write failing sequence-order tests**
 
 ```python
@@ -723,19 +791,30 @@ class PatchVisionEncoder(nn.Module):
 
 Pad images only to the next patch multiple and preserve row-major patch order.
 Use a ceil grid: every boundary patch containing at least one real pixel is a
-valid token; only padding added to align different batch rows is masked.
-`TemporalVideoEncoder` is a
-separate `nn.Module` that owns only video-specific temporal projection/norm
-parameters; its `forward()` receives the shared `PatchVisionEncoder` explicitly
-and must not store the same patch encoder as a child-module alias. It applies
-that encoder frame-by-frame, flattens temporal-major then row-major order, and
-expands each global frame timestamp
+valid token. Bottom/right-pad and encode each image independently, flatten
+only that source's valid ceil-grid tokens into a contiguous prefix, and only
+then right-pad token rows to the batch maximum with zero embeddings and a
+boolean prefix mask. Do not spatially pad all sources to a common batch size
+before flattening.
+
+`TemporalVideoEncoder` is a separate `nn.Module` with exactly
+`temporal_proj = nn.Linear(hidden_size, hidden_size, bias=False)` and
+`temporal_norm = nn.LayerNorm(hidden_size)`. Its `forward()` receives the
+shared `PatchVisionEncoder` explicitly, never stores it as an attribute, and
+requires matching hidden sizes. It applies the patch encoder frame-by-frame,
+then exactly
+`temporal_norm(temporal_proj(features))`, independently per source. It
+flattens temporal-major then row-major order, right-pads only flattened token
+rows, and expands each global frame timestamp
 (`request.timeline_offset_seconds + local_frame_seconds`) across its spatial
 patches and copies decoded `seconds_per_grid` into the corresponding
 `MediaSequence` row. Image/video public helpers construct `MediaSource` from
-each `DecodedMedia.request` without changing any field. Consequently one
-registered patch encoder and every video-specific parameter appear exactly once
-in `state_dict()` and `named_parameters()`.
+each `DecodedMedia.request` by copying its three shared fields. Consequently
+one registered patch encoder and every video-specific parameter appear exactly
+once in `state_dict()` and `named_parameters()`. Images use exact grid tuples,
+`timestamps=None`, and `seconds_per_grid=None`; videos use exact grid tuples,
+FP32 timestamps with zero-filled masked slots, and copy the per-item
+`seconds_per_grid` tuple including `None`.
 
 - [ ] **Step 4: Implement audio windows**
 
@@ -757,17 +836,43 @@ class AudioWindowEncoder(nn.Module):
         self.norm = nn.LayerNorm(hidden_size)
 
     def encode_waveform(self, waveform: torch.Tensor) -> torch.Tensor:
+        window_count = max(
+            1,
+            1
+            + (
+                max(waveform.numel() - self.window_size, 0)
+                + self.hop_size
+                - 1
+            )
+            // self.hop_size,
+        )
+        required_length = (
+            (window_count - 1) * self.hop_size + self.window_size
+        )
+        waveform = F.pad(
+            waveform,
+            (0, required_length - waveform.numel()),
+        )
         windows = waveform.unfold(0, self.window_size, self.hop_size)
         return self.norm(self.proj(windows))
 ```
 
 Right-pad only the final partial window. A partial window containing any real
-sample is one valid token; only batch-alignment slots after the ceil window
-count are masked. Timestamp each token at
+sample is one valid token; starts stop at the earliest window that covers the
+tail, using
+`max(1, 1 + ceil(max(N-window_size, 0) / hop_size))`. This yields starts
+`(0)`, `(0)`, `(0,2)`, `(0,2,4)`, and `(0,2,4,6)` respectively for
+`(N,window,hop)` values `(2,4,2)`, `(4,4,2)`, `(5,4,2)`, `(10,6,2)`,
+and `(11,6,2)`. Only batch-alignment slots after that count are masked.
+Timestamp each token at
 `request.timeline_offset_seconds + window_start / sample_rate`. Empty waveform
 is an error; omitted media never calls the encoder. Public batch helpers require
 one `MediaSource` per waveform and copy those sources unchanged into the
-returned `MediaSequence`.
+returned `MediaSequence`. `forward(items)` requires the positive integer
+`item.metadata["sample_rate"]` to equal the encoder sample rate; it never
+infers rate from path or tensor length. Audio uses `grid=None`,
+`seconds_per_grid=None`, a boolean prefix mask, and FP32 timestamps with
+zero-filled masked slots.
 
 - [ ] **Step 5: Add gradient and ordering tests**
 
@@ -776,16 +881,47 @@ Assert:
 - image quadrant swaps change the corresponding patch tokens;
 - video frame swaps change temporal order;
 - audio tone-order swaps change token order;
+- deterministic weights prove exact image row-major, video frame-block, and
+  audio-window permutations rather than only unequal random outputs;
 - non-divisible image sizes/audio lengths use ceil token counts, boundary
   patches/windows are valid, and only batch-alignment padding is masked;
+- height-only and width-only patch remainders both produce valid boundary
+  tokens, and changing a real boundary pixel changes its boundary-patch token;
+- two differently sized images and two differently sized videos are encoded
+  independently and only token rows are right-padded; valid masks contain no
+  holes;
+- audio window counts match the literal `(N,window,hop)` cases above, and a
+  sample-rate mismatch fails explicitly;
+- two unequal audio lengths have exact boolean prefix masks and zero timestamps
+  in masked slots; changing the final real tail sample changes the final
+  partial-window token;
 - image, video and audio paths preserve the full `MediaSource`; audio/video
   fixtures with non-zero timeline offsets produce global timestamps;
+- multiple items from one sample and items from multiple text rows preserve
+  source identity exactly;
+- a two-frame `2x2`-patch video with local timestamps `(0.0,0.25)` and offset
+  `1.5` produces the exact valid timestamps
+  `[1.5,1.5,1.5,1.5,1.75,1.75,1.75,1.75]`; audio starts `(0,4,8)` at 16 Hz
+  and offset 2.0 produce `[2.0,2.25,2.5]`;
 - uniform video fixtures preserve exact `seconds_per_grid`; non-uniform
-  timestamps leave it absent for experimental positions and are rejected by
-  the Qwen3 disjoint builder;
+  timestamps leave it absent; Task 6 owns the Qwen3-disjoint rejection test;
 - outputs and gradients remain finite in FP32/BF16;
+- ordinary FP32 decoded tensors work after each module is moved to BF16, with
+  finite parameter gradients;
+- empty input, wrong modality/channel/shape/dtype, source-count mismatch,
+  duplicate sources, length disagreement, and timestamp/frame disagreement
+  fail at the encoder boundary;
+- missing video timestamps and 2-D/stereo `from_waveforms` inputs fail
+  explicitly;
+- a holder registering one patch encoder and one video encoder contains patch
+  parameters exactly once; video loss reaches both shared patch and
+  video-specific parameters without a registered patch alias;
 - no encoder collapses valid input to one token unless the input genuinely
   contains one patch/window.
+
+For every variable-length timestamp assertion, select valid slots through the
+attention mask; padded slots are required to be zero but are not part of the
+monotonicity assertion.
 
 - [ ] **Step 6: Run focused tests and commit**
 
