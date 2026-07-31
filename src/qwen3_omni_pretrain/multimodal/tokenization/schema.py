@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from typing import Any
 
@@ -77,6 +78,8 @@ class ResolvedMultimodalTokens:
     audio_end: int | None
 
     def sentinel_for(self, modality: MediaModality) -> int:
+        if not isinstance(modality, MediaModality):
+            raise TypeError("modality must be MediaModality")
         return {
             MediaModality.IMAGE: self.image_pad,
             MediaModality.VIDEO: self.video_pad,
@@ -105,7 +108,15 @@ def resolve_token_schema(
     schema: MultimodalTokenSchema,
     vocab_size: int,
 ) -> ResolvedMultimodalTokens:
+    if not isinstance(schema, MultimodalTokenSchema):
+        raise TypeError("schema must be MultimodalTokenSchema")
+    if type(vocab_size) is not int:
+        raise TypeError("vocab_size must be an integer")
+    if vocab_size <= 0:
+        raise ValueError("vocab_size must be positive")
     vocab = tokenizer.get_vocab()
+    if not isinstance(vocab, Mapping):
+        raise TypeError("tokenizer.get_vocab() must return a mapping")
     schema_values = {
         field.name: getattr(schema, field.name)
         for field in fields(MultimodalTokenSchema)
@@ -124,14 +135,17 @@ def resolve_token_schema(
             + ", ".join(missing)
         )
 
-    resolved: dict[str, int | None] = {
-        name: (
-            None
-            if token is None
-            else int(vocab[token])
-        )
-        for name, token in schema_values.items()
-    }
+    resolved: dict[str, int | None] = {}
+    for name, token in schema_values.items():
+        if token is None:
+            resolved[name] = None
+            continue
+        token_id = vocab[token]
+        if type(token_id) is not int:
+            raise TypeError(
+                f"tokenizer ID for {name} must be an integer"
+            )
+        resolved[name] = token_id
     present_ids = [
         token_id
         for token_id in resolved.values()
@@ -142,18 +156,17 @@ def resolve_token_schema(
             "multimodal special tokens must resolve to distinct IDs"
         )
 
-    model_vocab_size = int(vocab_size)
     invalid = {
         name: token_id
         for name, token_id in resolved.items()
         if token_id is not None
-        and not 0 <= token_id < model_vocab_size
+        and not 0 <= token_id < vocab_size
     }
     if invalid:
         name, token_id = next(iter(invalid.items()))
         raise ValueError(
             f"{name}={token_id} is outside "
-            f"model vocab_size={model_vocab_size}"
+            f"model vocab_size={vocab_size}"
         )
 
     return ResolvedMultimodalTokens(**resolved)

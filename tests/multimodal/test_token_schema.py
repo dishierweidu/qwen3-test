@@ -115,6 +115,8 @@ def test_resolution_returns_immutable_ids_and_modality_sentinels():
     assert resolved.sentinel_for(MediaModality.IMAGE) == 1
     assert resolved.sentinel_for(MediaModality.VIDEO) == 2
     assert resolved.sentinel_for(MediaModality.AUDIO) == 3
+    with pytest.raises(TypeError, match="MediaModality"):
+        resolved.sentinel_for("image")
     with pytest.raises(FrozenInstanceError):
         resolved.image_pad = 9
 
@@ -164,6 +166,48 @@ def test_resolution_rejects_ids_outside_model_vocab(bad_id):
     with pytest.raises(ValueError, match="outside model vocab_size"):
         resolve_token_schema(
             FakeTokenizer(vocab),
+            MultimodalTokenSchema.qwen3(),
+            vocab_size=8,
+        )
+
+
+@pytest.mark.parametrize("bad_id", [True, 7.0, "7"])
+def test_resolution_rejects_coercible_non_integer_token_ids(bad_id):
+    vocab = dict(QWEN_VOCAB)
+    vocab["<|audio_end|>"] = bad_id
+
+    with pytest.raises(TypeError, match="must be an integer"):
+        resolve_token_schema(
+            FakeTokenizer(vocab),
+            MultimodalTokenSchema.qwen3(),
+            vocab_size=8,
+        )
+
+
+@pytest.mark.parametrize("bad_size", [True, 8.0, "8", 0, -1])
+def test_resolution_rejects_invalid_vocab_size_without_coercion(bad_size):
+    with pytest.raises((TypeError, ValueError)):
+        resolve_token_schema(
+            FakeTokenizer(QWEN_VOCAB),
+            MultimodalTokenSchema.qwen3(),
+            vocab_size=bad_size,
+        )
+
+
+def test_resolution_requires_schema_and_mapping_boundaries():
+    class NonMappingTokenizer:
+        def get_vocab(self):
+            return [("<|image_pad|>", 1)]
+
+    with pytest.raises(TypeError, match="schema"):
+        resolve_token_schema(
+            FakeTokenizer(QWEN_VOCAB),
+            object(),
+            vocab_size=8,
+        )
+    with pytest.raises(TypeError, match="mapping"):
+        resolve_token_schema(
+            NonMappingTokenizer(),
             MultimodalTokenSchema.qwen3(),
             vocab_size=8,
         )
