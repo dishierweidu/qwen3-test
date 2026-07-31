@@ -21,6 +21,12 @@ architecture-faithful reproduction of the official Qwen3-Omni model**:
 The P0 correctness work in this branch stabilizes the existing baseline before
 those modules are replaced.
 
+The architecture review and implementation roadmaps are checked in as:
+
+- [Qwen3-Omni architecture gap](docs/research/2026-07-29-qwen3-omni-architecture-gap.md)
+- [Qwen3.5-Omni reproduction plan](docs/research/2026-07-29-qwen3.5-omni-reproduction.md)
+- [MiMo-V2.5 architecture lessons](docs/research/2026-07-29-mimo-v2.5-architecture-lessons.md)
+
 ## Architecture profiles
 
 The profile registry exposes only implementations that can currently be built
@@ -244,6 +250,62 @@ the cached official processor is an additional integration oracle. Passing the
 common prefill tests demonstrates sequence semantics only—it does not imply
 Qwen3, Qwen3.5, or MiMo checkpoint compatibility.
 
+## Legacy incremental decode state
+
+The legacy full-attention Thinker now implements typed `prefill()`/`decode()`
+with request-owned, clone-detached KV snapshots. The cache stores RoPE-applied,
+unrepeated K/V, uses one model-level rectangular `[B,1,Q,P+Q]` causal bias,
+and keeps valid-token counts separate from storage-position cursors. The
+legacy Stage-2 wrapper encodes present image/audio inputs exactly once during
+prefill and records its fixed two-slot processed prefix; decode cannot receive
+raw media.
+
+The supported scope is intentionally narrow:
+
+- standard all-MHA legacy Thinker and validated two-rank TP local KV shards;
+- batch-one greedy generation with a pending-token checkpoint;
+- no public streaming iterator, beam search, speculative rejection, or generic
+  state truncation;
+- legacy DeltaNet cache remains unsupported because its recurrent state has
+  not been validated.
+
+The generation engine creates a shared owner nonce for every TP group.
+Programmatic TP callers that invoke `prefill()` directly must use
+`model.create_state_owner(display_request_id)` on every rank; independently
+calling `StateOwner.fresh()` per rank is rejected before embedding compute.
+
+Inference selects the cache from the constructed layer topology. A hybrid
+DeltaNet model fails before tokenizer/media/model compute unless the caller
+explicitly opts into the old full-history loop:
+
+```bash
+.venv-prototype/bin/python -m qwen3_omni_pretrain.cli_infer_thinker \
+  --stage stage1 --checkpoint /path/to/checkpoint \
+  --prompt "你好" --num-beams 1
+
+# Explicit compatibility path for an unsupported hybrid checkpoint:
+.venv-prototype/bin/python -m qwen3_omni_pretrain.cli_infer_thinker \
+  --stage stage1 --checkpoint /path/to/hybrid-checkpoint \
+  --prompt "你好" --allow-uncached-fallback
+```
+
+The fallback emits one structured JSON warning per request and never changes
+the declared capability to supported.
+
+Run the correctness-gated tiny benchmark with:
+
+```bash
+.venv-prototype/bin/python scripts/benchmark_decode_cache.py \
+  --config configs/model/legacy_full_attention_tiny.yaml \
+  --prompt-length 8 --output-length 3 --warmup 1 --repetitions 2
+```
+
+Before recording any timing, the benchmark requires direct FP32 cached versus
+uncached logit error `<= 1e-5` and exact greedy-token equality. Its JSON output
+includes the architecture manifest, implementation commit, raw latency
+samples, synchronization method, cache bytes by partition, peak memory and
+fallback status.
+
 ## Numerical correctness
 
 The training loop raises `NonFiniteTrainingError` if checked losses, logits, or
@@ -300,8 +362,8 @@ repository code; these are independent opt-ins.
 ## Next architecture milestones
 
 1. Integrate the sequence-preserving prefill layer with explicit experimental
-   profile runtimes and decoder/cache contracts.
+   profile runtimes using the typed decoder/cache contracts.
 2. Establish an official-structure-compatible Thinker baseline.
-3. Implement Talker, codec MTP, Code2Wav, and streaming caches.
+3. Implement Talker, codec MTP, Code2Wav, and their typed state partitions.
 4. Evaluate Qwen3.5-style Hybrid Attention/ARIA and MiMo-style SWA/GA as
    separate experimental branches.

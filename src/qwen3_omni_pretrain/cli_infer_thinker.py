@@ -26,6 +26,18 @@ from qwen3_omni_pretrain.architecture.checkpoint_metadata import (
     tokenizer_identity_sha256,
 )
 from qwen3_omni_pretrain.architecture.summary import summarize_model
+from qwen3_omni_pretrain.multimodal.types import PositionBatch
+from qwen3_omni_pretrain.runtime import (
+    CacheCapableModel,
+    CacheCapabilityError,
+    CacheErrorCode,
+    GenerationRequest,
+    LegacyGreedyPrefillDecodeEngine,
+    LegacyMediaPrefillInputs,
+    ModelPrefillInputs,
+    require_incremental_decode_support,
+    validate_generation_operations,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -69,6 +81,20 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=64,
         help="Max tokens to autoregressively generate.",
+    )
+    parser.add_argument(
+        "--num-beams",
+        type=int,
+        default=1,
+        help="Beam count; the cache runtime currently supports exactly 1.",
+    )
+    parser.add_argument(
+        "--allow-uncached-fallback",
+        action="store_true",
+        help=(
+            "Allow the legacy full-history loop when the concrete model "
+            "does not support incremental decode state."
+        ),
     )
     parser.add_argument(
         "--dtype",
@@ -329,13 +355,98 @@ def _emit_stage2_media_errors(
         print(json.dumps({"media_error": error}, ensure_ascii=False))
 
 
+def _select_incremental_runtime(
+    model: object,
+) -> CacheCapabilityError | None:
+    if not isinstance(model, CacheCapableModel):
+        return CacheCapabilityError(
+            CacheErrorCode.PROFILE_RUNTIME_UNSUPPORTED,
+            "the concrete model does not implement the cache protocol",
+        )
+    thinker = getattr(model, "thinker", model)
+    layers = getattr(thinker, "layers", None)
+    if layers is None:
+        return CacheCapabilityError(
+            CacheErrorCode.PROFILE_RUNTIME_UNSUPPORTED,
+            "the concrete model does not expose decoder layers",
+        )
+    try:
+        require_incremental_decode_support(
+            layers,
+            protocol_implemented=True,
+            tp_local_shard_validated=bool(
+                getattr(
+                    thinker,
+                    "_tp_local_shard_cache_validated",
+                    False,
+                )
+            ),
+        )
+    except CacheCapabilityError as error:
+        return error
+    return None
+
+
+def _emit_uncached_fallback_warning(
+    *,
+    model: object,
+    display_request_id: str,
+    error: CacheCapabilityError,
+) -> None:
+    config = getattr(model, "config", None)
+    profile = getattr(config, "architecture_profile", "unknown")
+    print(
+        json.dumps(
+            {
+                "cache_warning": {
+                    "code": error.code.value,
+                    "profile": profile,
+                    "display_request_id": display_request_id,
+                    "reason": error.reason,
+                    "semantic_change": False,
+                }
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
+def _legacy_text_positions(
+    attention_mask: torch.Tensor,
+) -> PositionBatch:
+    mask = attention_mask.to(dtype=torch.bool)
+    position_ids = (mask.to(torch.long).cumsum(dim=1) - 1).clamp_min(0)
+    position_ids = position_ids.masked_fill(~mask, 0)
+    return PositionBatch(
+        position_ids=position_ids.unsqueeze(0),
+        rope_deltas=torch.zeros(
+            (mask.shape[0], 1),
+            dtype=torch.long,
+            device=mask.device,
+        ),
+        axis_names=("sequence",),
+    )
+
+
 def greedy_decode_stage1(
     model: Qwen3OmniMoeThinkerTextModel,
     tokenizer: AutoTokenizer,
     device: torch.device,
     prompt: str,
     max_new_tokens: int,
+    num_beams: int = 1,
+    allow_uncached_fallback: bool = False,
 ) -> Dict[str, Any]:
+    validate_generation_operations(num_beams=num_beams)
+    fallback_error = _select_incremental_runtime(model)
+    if fallback_error is not None:
+        if not allow_uncached_fallback:
+            raise fallback_error
+        _emit_uncached_fallback_warning(
+            model=model,
+            display_request_id=prompt,
+            error=fallback_error,
+        )
     model.eval()
     encoded = tokenizer(
         prompt,
@@ -346,28 +457,49 @@ def greedy_decode_stage1(
     input_ids = encoded["input_ids"].to(device)
     attention_mask = encoded.get("attention_mask", torch.ones_like(input_ids)).to(device)
 
-    generated = input_ids
-    input_len = generated.size(1)
+    input_len = input_ids.size(1)
     eos_id = tokenizer.eos_token_id
 
     import time
     t_start = time.perf_counter()
-    with torch.no_grad():
-        for _ in range(max_new_tokens):
-            out = model(
-                input_ids=generated,
-                attention_mask=attention_mask,
-                labels=None,
+    if fallback_error is None:
+        mask = attention_mask.to(dtype=torch.bool)
+        result = LegacyGreedyPrefillDecodeEngine(model).generate(
+            GenerationRequest(
+                display_request_id=prompt or "stage1-request",
+                prefill_inputs=ModelPrefillInputs(
+                    input_ids=input_ids,
+                    inputs_embeds=None,
+                    key_valid_mask=mask,
+                    position_batch=_legacy_text_positions(mask),
+                ),
+                max_new_tokens=max_new_tokens,
+                eos_token_id=eos_id,
+                num_beams=num_beams,
             )
-            logits = out["logits"]
-            next_token = torch.argmax(logits[:, -1, :], dim=-1)
-            generated = torch.cat([generated, next_token.unsqueeze(-1)], dim=-1)
-            attention_mask = torch.ones_like(generated, device=device)
-            if eos_id is not None and next_token.item() == eos_id:
-                break
+        )
+        new_tokens = result.generated_ids[0]
+    else:
+        generated = input_ids
+        with torch.inference_mode():
+            for _ in range(max_new_tokens):
+                out = model(
+                    input_ids=generated,
+                    attention_mask=attention_mask,
+                    labels=None,
+                )
+                logits = out["logits"]
+                next_token = torch.argmax(logits[:, -1, :], dim=-1)
+                generated = torch.cat(
+                    [generated, next_token.unsqueeze(-1)],
+                    dim=-1,
+                )
+                attention_mask = torch.ones_like(generated, device=device)
+                if eos_id is not None and next_token.item() == eos_id:
+                    break
+        new_tokens = generated[0, input_len:]
 
     elapsed = time.perf_counter() - t_start
-    new_tokens = generated[0, input_len:]
     completion = tokenizer.decode(new_tokens, skip_special_tokens=True)
     stats = {
         "input_tokens": input_len,
@@ -390,7 +522,20 @@ def greedy_decode_stage2(
     image_root: str,
     audio_root: str,
     max_seq_length: int,
+    num_beams: int = 1,
+    allow_uncached_fallback: bool = False,
 ) -> Dict[str, Any]:
+    validate_generation_operations(num_beams=num_beams)
+    sample_id = str(sample.get("id", "inference-sample"))
+    fallback_error = _select_incremental_runtime(model)
+    if fallback_error is not None:
+        if not allow_uncached_fallback:
+            raise fallback_error
+        _emit_uncached_fallback_warning(
+            model=model,
+            display_request_id=sample_id,
+            error=fallback_error,
+        )
     model.eval()
     prompt_text = sample.get("input_text") or sample.get("text") or ""
 
@@ -404,7 +549,6 @@ def greedy_decode_stage2(
     input_ids = encoded["input_ids"].to(device)
     attention_mask = encoded.get("attention_mask", torch.ones_like(input_ids)).to(device)
 
-    sample_id = str(sample.get("id", "inference-sample"))
     image_result = media_loader.load_optional(
         modality="image",
         path=_resolve_path(sample.get("image"), image_root),
@@ -430,34 +574,71 @@ def greedy_decode_stage2(
         [audio_result.present], dtype=torch.long, device=device
     )
 
-    generated = input_ids
-    input_len = generated.size(1)
+    input_len = input_ids.size(1)
     eos_id = tokenizer.eos_token_id
 
     import time
     t_start = time.perf_counter()
-    with torch.no_grad():
-        for _ in range(max_new_tokens):
-            out = model(
-                input_ids=generated,
-                attention_mask=attention_mask,
-                labels=None,
-                pixel_values=pixel_values,
-                audio_values=audio_values,
-                has_image=has_image,
-                has_audio=has_audio,
+    if fallback_error is None:
+        model_dtype = model.thinker.embed_tokens.weight.dtype
+        mask = attention_mask.to(dtype=torch.bool)
+        media = LegacyMediaPrefillInputs(
+            pixel_values=(
+                pixel_values.to(dtype=model_dtype)
+                if image_result.present
+                else None
+            ),
+            audio_values=(
+                audio_values.to(dtype=model_dtype)
+                if audio_result.present
+                else None
+            ),
+            has_image=has_image.to(dtype=torch.bool),
+            has_audio=has_audio.to(dtype=torch.bool),
+        )
+        result = LegacyGreedyPrefillDecodeEngine(model).generate(
+            GenerationRequest(
+                display_request_id=sample_id,
+                prefill_inputs=ModelPrefillInputs(
+                    input_ids=input_ids,
+                    inputs_embeds=None,
+                    key_valid_mask=mask,
+                    position_batch=_legacy_text_positions(mask),
+                    media=media,
+                ),
+                max_new_tokens=max_new_tokens,
+                eos_token_id=eos_id,
+                num_beams=num_beams,
             )
-            logits = out["logits"]
-            next_token = torch.argmax(
-                logits[:, -1, :], dim=-1
-            ).to(generated.device)
-            generated = torch.cat([generated, next_token.unsqueeze(-1)], dim=-1)
-            attention_mask = torch.ones_like(generated, device=device)
-            if eos_id is not None and next_token.item() == eos_id:
-                break
+        )
+        new_tokens = result.generated_ids[0]
+    else:
+        generated = input_ids
+        with torch.inference_mode():
+            for _ in range(max_new_tokens):
+                out = model(
+                    input_ids=generated,
+                    attention_mask=attention_mask,
+                    labels=None,
+                    pixel_values=pixel_values,
+                    audio_values=audio_values,
+                    has_image=has_image,
+                    has_audio=has_audio,
+                )
+                logits = out["logits"]
+                next_token = torch.argmax(
+                    logits[:, -1, :], dim=-1
+                ).to(generated.device)
+                generated = torch.cat(
+                    [generated, next_token.unsqueeze(-1)],
+                    dim=-1,
+                )
+                attention_mask = torch.ones_like(generated, device=device)
+                if eos_id is not None and next_token.item() == eos_id:
+                    break
+        new_tokens = generated[0, input_len:]
 
     elapsed = time.perf_counter() - t_start
-    new_tokens = generated[0, input_len:]
     completion = tokenizer.decode(new_tokens, skip_special_tokens=True)
     stats = {
         "input_tokens": input_len,
@@ -483,6 +664,9 @@ def _print_stats(prefix: str, stats: Dict[str, Any]):
 
 
 def run_stage1(args: argparse.Namespace):
+    validate_generation_operations(
+        num_beams=getattr(args, "num_beams", 1)
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = _get_dtype(args.dtype)
     bootstrap = _inference_bootstrap_checkpoint(args.checkpoint)
@@ -528,6 +712,8 @@ def run_stage1(args: argparse.Namespace):
             device=device,
             prompt=prompt,
             max_new_tokens=args.max_new_tokens,
+            num_beams=args.num_beams,
+            allow_uncached_fallback=args.allow_uncached_fallback,
         )
         print("=" * 40)
         print(f"[Stage1 Sample {idx}] Prompt: {prompt}")
@@ -563,6 +749,9 @@ def run_stage1(args: argparse.Namespace):
 
 
 def run_stage2(args: argparse.Namespace):
+    validate_generation_operations(
+        num_beams=getattr(args, "num_beams", 1)
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = _get_dtype(args.dtype)
     tokenizer = _ensure_tokenizer(args.tokenizer_name_or_path, args.checkpoint)
@@ -598,6 +787,8 @@ def run_stage2(args: argparse.Namespace):
             image_root=args.image_root,
             audio_root=args.audio_root,
             max_seq_length=args.max_seq_length,
+            num_beams=args.num_beams,
+            allow_uncached_fallback=args.allow_uncached_fallback,
         )
         _emit_stage2_media_errors(result["media_errors"])
         target = sample.get("target_text") or ""

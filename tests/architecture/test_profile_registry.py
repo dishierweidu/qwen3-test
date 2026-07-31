@@ -109,7 +109,10 @@ def test_legacy_factory_validates_and_builds_a_real_local_model(tmp_path):
         profile=ArchitectureProfile.LEGACY_PROTOTYPE,
         config_or_checkpoint=str(config_path),
         device="cpu",
-        requested_capabilities=("streaming_generation",),
+        requested_capabilities=(
+            "incremental_decode_state",
+            "streaming_generation",
+        ),
     )
     factory = get_profile_factory(request.profile)
 
@@ -140,6 +143,9 @@ def test_legacy_factory_validates_and_builds_a_real_local_model(tmp_path):
     assert result.architecture_summary.unsupported_capabilities == (
         "streaming_generation",
     )
+    assert result.architecture_summary.capabilities[
+        "incremental_decode_state"
+    ] is True
 
 
 @pytest.mark.parametrize(

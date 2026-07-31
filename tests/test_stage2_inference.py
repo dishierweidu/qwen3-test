@@ -108,6 +108,7 @@ def test_stage2_inference_omitted_media_generates_without_errors():
         image_root="",
         audio_root="",
         max_seq_length=8,
+        allow_uncached_fallback=True,
     )
     assert result["text"] == "x"
     assert result["media_errors"] == []
@@ -131,6 +132,7 @@ def test_stage2_inference_is_strict_for_referenced_invalid_media(
             image_root="",
             audio_root="",
             max_seq_length=8,
+            allow_uncached_fallback=True,
         )
 
 
@@ -157,6 +159,7 @@ def test_stage2_inference_skip_reports_each_invalid_media_and_generates(
         image_root="",
         audio_root="",
         max_seq_length=8,
+        allow_uncached_fallback=True,
     )
     assert result["text"] == "x"
     assert result["stats"]["output_tokens"] == 1
@@ -231,6 +234,8 @@ def test_run_stage2_uses_skip_flag_and_emits_json_error(
         prompt=None,
         jsonl="samples.jsonl",
         num_samples=1,
+        num_beams=1,
+        allow_uncached_fallback=True,
     )
 
     cli.run_stage2(args)

@@ -20,6 +20,12 @@ model protocol。legacy standard/TP full-attention 实现该 protocol；现有�
 **Tech stack:** Python 3.10、PyTorch 2.10、frozen dataclass、runtime-checkable
 Protocol、CPU Gloo、pytest、JSON benchmark。
 
+**完成记录（2026-07-30）：** Task 0–6 的技术项和完成门禁均已通过。最终门禁为
+`986 passed, 11 skipped`，独立两 rank Gloo 测试为 `10 passed`；tiny benchmark
+得到 FP32 `max_abs=2.9802322387695312e-08` 且 greedy token 完全一致；compileall
+与 `git diff --check` 通过。按用户指示，下面原始模板中的逐任务 commit 命令由一次
+最终汇总 commit 取代，未执行中间提交。
+
 ---
 
 ## Support matrix and non-goals
@@ -114,7 +120,7 @@ Protocol、CPU Gloo、pytest、JSON benchmark。
 **Produces:** `CacheErrorCode`, `CacheCapabilityError`, `CacheSupport`, and a
 strict actual-layer scanner. This task publishes no true cache capability yet.
 
-- [ ] **Step 1: Write failing capability tests**
+- [x] **Step 1: Write failing capability tests**
 
 Test exact enum/string values, structured `code`/`reason`, and the support
 matrix default:
@@ -132,7 +138,7 @@ Reject bool-as-int/zero/negative `num_beams`, `num_beams != 1`, truncate and
 speculative requests with stable codes. These helpers must be callable before
 tokenizer/model/media work.
 
-- [ ] **Step 2: Implement strict error and capability values**
+- [x] **Step 2: Implement strict error and capability values**
 
 `CacheCapabilityError` is a typed runtime error with public `code` and `reason`;
 its string is diagnostic only. Add strict helpers for beam/truncate/speculative
@@ -144,13 +150,13 @@ DeltaNet indices and the current implicit 3:1 default by inspecting every
 constructed layer's block implementation/type. Until Tasks 2–3 implement the
 protocol, it reports `incremental_decode_state=False` even for all-MHA models.
 
-- [ ] **Step 3: Prove fail-before-compute**
+- [x] **Step 3: Prove fail-before-compute**
 
 Use call-count fakes to show beam/truncate/speculative rejection occurs before
 tokenizer, embedding, attention, DeltaNet and media calls. Add fixtures for
 explicit DeltaNet and `use_deltanet=true` with empty indices (implicit 3:1).
 
-- [ ] **Step 4: Run and commit**
+- [x] **Step 4: Run; consolidate commit at the final gate**
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 .venv-prototype/bin/python \
@@ -175,7 +181,7 @@ git commit -m "feat: define incremental decode capabilities"
 `DecoderPositionState`, `LegacyProcessedPrefix`, `DecoderState`, model input
 types, `CausalLMOutput`, and `CacheCapableModel`.
 
-- [ ] **Step 1: Write failing owner and snapshot-isolation tests**
+- [x] **Step 1: Write failing owner and snapshot-isolation tests**
 
 Cover two concurrent sessions with display ID `"r1"`, a later new `"r1"`
 session, nonce mismatch, and exact owner preservation in derived snapshots.
@@ -183,7 +189,7 @@ Mutate every caller tensor after construction and prove state tensor values are
 unchanged and storage pointers do not alias. Candidate append must not alter the
 old snapshot, including on injected exception.
 
-- [ ] **Step 2: Implement owner and position state**
+- [x] **Step 2: Implement owner and position state**
 
 ```python
 @dataclass(frozen=True)
@@ -228,7 +234,7 @@ Rules:
   retains axis/delta metadata. This plan supports only previously approved
   non-joint contiguous semantics; split/interleaved/joint AV fails fast.
 
-- [ ] **Step 3: Implement strict KV snapshots**
+- [x] **Step 3: Implement strict KV snapshots**
 
 ```python
 @dataclass(frozen=True)
@@ -249,7 +255,7 @@ gathers K/V/all position axes with the same indices, keeps the last
 `window_size` valid entries, then right-pads a rectangle. An irregular two-row
 oracle must prove padded storage slots neither evict nor advance valid tokens.
 
-- [ ] **Step 4: Implement typed state partitions**
+- [x] **Step 4: Implement typed state partitions**
 
 ```python
 @runtime_checkable
@@ -297,7 +303,7 @@ Byte metrics are separate:
 - `unique_allocated_bytes(partition=None)` is explicitly best-effort, dedupes
   underlying storage and reports request-shared media separately.
 
-- [ ] **Step 5: Define strict model inputs and protocol**
+- [x] **Step 5: Define strict model inputs and protocol**
 
 ```python
 @dataclass(frozen=True)
@@ -365,7 +371,7 @@ Legacy position adapter accepts only `axis_names == ("sequence",)`,
 `max_position_embeddings`; it then converts to `[B,Q] long`. Fractional,
 three-axis or overflow positions fail before QKV.
 
-- [ ] **Step 6: Add exhaustive state tests**
+- [x] **Step 6: Add exhaustive state tests**
 
 Cover:
 
@@ -377,7 +383,7 @@ Cover:
 - `Dk != Dv`, mixed dtype/device, missing/extra layer and divergent mask;
 - typed partition rejection and logical/allocated byte accounting.
 
-- [ ] **Step 7: Run and commit**
+- [x] **Step 7: Run; consolidate commit at the final gate**
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 .venv-prototype/bin/python \
@@ -402,13 +408,13 @@ git commit -m "feat: define request-owned decoder state"
 **Produces:** standard/TP MHA `(hidden, present_kv)` contract while preserving
 DeltaNet's existing no-cache tensor contract.
 
-- [ ] **Step 1: Write failing attention parity and allocation tests**
+- [x] **Step 1: Write failing attention parity and allocation tests**
 
 For standard and TP fixtures compare full sequence with `Q=5` prefill followed
 by `Q=1` and `Q=3` decode. Compute `max_abs` directly and require `<=1e-5`, then
 compare greedy tokens. Add GQA, `Dk != Dv`, BF16 dtype and two-row padded cases.
 
-- [ ] **Step 2: Migrate MHA and callers atomically**
+- [x] **Step 2: Migrate MHA and callers atomically**
 
 Standard/TP MHA accepts current hidden, already validated current position,
 `AttentionKV | None`, current bool mask, one final additive bias, and
@@ -422,7 +428,7 @@ caller branches on the actual block implementation/type; it must never blindly
 unpack a DeltaNet tensor. Commit MHA signature and all callers together so the
 default implicit 3:1 hybrid no-cache logits/output keys remain unchanged.
 
-- [ ] **Step 3: Move causal bias ownership to model boundary**
+- [x] **Step 3: Move causal bias ownership to model boundary**
 
 Replace current standard/TP square-mask construction with one helper per model
 call. Given past mask `[B,P]` and current mask `[B,Q]`, create exactly one
@@ -434,7 +440,7 @@ mask and do not advance valid count.
 Attention consumes that final bias and never layers a second causal mask. Eager
 and SDPA paths use identical semantics and query-compatible dtype/device.
 
-- [ ] **Step 4: Prove allocation and failure order**
+- [x] **Step 4: Prove allocation and failure order**
 
 Spies must show:
 
@@ -444,7 +450,7 @@ Spies must show:
   DeltaNet or collective calls;
 - no-cache mixed DeltaNet results remain exact regressions.
 
-- [ ] **Step 5: Add real TP local-shard parity**
+- [x] **Step 5: Add real TP local-shard parity**
 
 Keep world-size-one smoke and add mandatory 2-rank CPU Gloo. Each rank stores
 `Hkv/world_size` unrepeated local KV; owner/mask/position/seen are identical
@@ -452,7 +458,7 @@ across ranks. Compare gathered FP32 logits and greedy token to a standard model
 with the same weights (`max_abs <=1e-5`). Synchronize any validation failure
 before collectives so one-rank failure cannot hang peers.
 
-- [ ] **Step 6: Run and commit**
+- [x] **Step 6: Run; consolidate commit at the final gate**
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 .venv-prototype/bin/python \
@@ -481,13 +487,13 @@ git commit -m "feat: cache full-attention key values"
 **Produces:** typed standard/TP `.prefill()` and `.decode()` adapters plus
 atomic `DecoderState` candidates.
 
-- [ ] **Step 1: Write failing model-level cached/uncached parity tests**
+- [x] **Step 1: Write failing model-level cached/uncached parity tests**
 
 Use tiny all-MHA standard/TP models. Cover one- and three-token chunks,
 different per-row valid counts, explicit position gaps, maximum boundary and
 padded batch. Check all affected logits, direct `max_abs <=1e-5`, then tokens.
 
-- [ ] **Step 2: Add a single pre-compute validation phase**
+- [x] **Step 2: Add a single pre-compute validation phase**
 
 Before embedding or any layer:
 
@@ -503,7 +509,7 @@ Before embedding or any layer:
 Missing layers are never interpreted as empty past; extra layers are never
 ignored.
 
-- [ ] **Step 3: Implement typed prefill/decode adapters**
+- [x] **Step 3: Implement typed prefill/decode adapters**
 
 Training-compatible `forward()` may retain legacy two-dimensional
 `position_ids`, but engine-facing methods accept only `ModelPrefillInputs` and
@@ -522,26 +528,26 @@ Write every full-attention layer candidate first. Only after all layers
 succeed, atomically create the new `DecoderPositionState` and advance seen
 counts. A layer exception returns no partial state.
 
-- [ ] **Step 4: Enforce detached inference output**
+- [x] **Step 4: Enforce detached inference output**
 
 Engine calls model only inside `torch.inference_mode()`. Adapters clone-detach
 candidate state before returning `CausalLMOutput`; all state tensors have no
 grad, and no old/caller/candidate storage aliases.
 
-- [ ] **Step 5: Add state and bounds tests**
+- [x] **Step 5: Add state and bounds tests**
 
 Cover exact layer set, owner mismatch before attention, `Q=1/Q=3`, per-row
 padding, context boundary success and overflow failure, candidate exception,
 old-state fingerprint/pointer stability, cache-disabled legacy output keys,
 mixed-DeltaNet no-cache regression and TP parity.
 
-- [ ] **Step 6: Enable capability only after protocol works**
+- [x] **Step 6: Enable capability only after protocol works**
 
 The actual-layer scanner may report `incremental_decode_state=True` only when
 the concrete model implements the typed protocol and every layer is validated
 full MHA. All public streaming/beam/truncate/speculation values remain false.
 
-- [ ] **Step 7: Run and commit**
+- [x] **Step 7: Run; consolidate commit at the final gate**
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 .venv-prototype/bin/python \
@@ -571,14 +577,14 @@ git commit -m "feat: propagate decoder cache through Thinker"
 **Produces:** strict `LegacyMediaPrefillInputs`, fixed two-slot processed prefix,
 and raw-media-free decode.
 
-- [ ] **Step 1: Write failing encoder call-count and phase tests**
+- [x] **Step 1: Write failing encoder call-count and phase tests**
 
 Cover absent/image/audio/both plus a mixed two-row batch. Present encoder count
 is exactly one per request; absent encoder count is zero. Supplied state, raw
 decode media, partial state or union contradiction all fail with both encoder
 counts still zero.
 
-- [ ] **Step 2: Validate the raw media union before encoder work**
+- [x] **Step 2: Validate the raw media union before encoder work**
 
 Only `decoder_state is None` is prefill. Any supplied state is decode.
 
@@ -591,14 +597,14 @@ scatter results back into the fixed storage slot.
 Direct legacy `forward()` may normalize the old 0/1 long flags and dummy absent
 tensors for backward compatibility; the typed protocol never accepts them.
 
-- [ ] **Step 3: Separate prefill and decode**
+- [x] **Step 3: Separate prefill and decode**
 
 Prefill writes concrete `LegacyProcessedPrefix` with exactly two storage slots.
 Its key-valid mask follows media presence, while `LegacyPositionCursor` advances
 over both storage slots even if masked. Decode requires a complete prefix marker
 and accepts only new text input; it cannot receive or re-encode raw media.
 
-- [ ] **Step 4: Add parity and rejection tests**
+- [x] **Step 4: Add parity and rejection tests**
 
 For every modality combination compare uncached full input with cached prefill
 plus decode (`max_abs <=1e-5`, token exact). Test wrong flag dtype/value,
@@ -606,7 +612,7 @@ tensor/flag contradiction, wrong batch/device/dtype, raw decode media,
 empty/partial state, fixed slot positions and padding. All rejections precede
 vision/audio/text encoder calls.
 
-- [ ] **Step 5: Run and commit**
+- [x] **Step 5: Run; consolidate commit at the final gate**
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 .venv-prototype/bin/python \
@@ -641,7 +647,7 @@ git commit -m "feat: cache legacy multimodal prefill state"
 `GenerationStep`, `GenerationResult`, `CancellationToken`, and
 `LegacyGreedyPrefillDecodeEngine`.
 
-- [ ] **Step 1: Write failing pending-token and resume tests**
+- [x] **Step 1: Write failing pending-token and resume tests**
 
 The single invariant is:
 
@@ -658,7 +664,7 @@ Generate at least three tokens and assert exactly one prefill plus
 token. Test pause after every step, resume from the prior `GenerationResult`,
 and exact parity with uninterrupted generation.
 
-- [ ] **Step 2: Implement strict request/checkpoint values**
+- [x] **Step 2: Implement strict request/checkpoint values**
 
 ```python
 @dataclass(frozen=True)
@@ -705,7 +711,7 @@ Every fresh generation creates `StateOwner.fresh(display_request_id)`. Explicit
 resume accepts a prior `GenerationResult`, reuses that exact owner and validates
 the pending invariant; a fresh same-name session gets a different nonce.
 
-- [ ] **Step 3: Implement candidate/commit ordering**
+- [x] **Step 3: Implement candidate/commit ordering**
 
 Prefill caches the prompt, samples the first emitted token and stores it as
 pending without decoding it. Each later call consumes exactly the old pending
@@ -728,7 +734,7 @@ owned empty checkpoint. In-flight cancel or exception exposes the latest
 committed checkpoint, never a partial candidate. This plan has no iterator;
 `GenerationStep` is an internal test value and `streaming_generation=false`.
 
-- [ ] **Step 4: Wire both CLI paths by actual protocol/capability**
+- [x] **Step 4: Wire both CLI paths by actual protocol/capability**
 
 Update current Stage1 and Stage2 loops, not only a shared-looking helper. Add
 `--num-beams` and `--allow-uncached-fallback`, and update every handwritten
@@ -747,7 +753,7 @@ uses summary `cache_type` text:
 Stage2 media is passed only during prefill. A protocol fake must fail if decode
 receives raw media, full token history or wrong owner.
 
-- [ ] **Step 5: Publish truthful profile capability**
+- [x] **Step 5: Publish truthful profile capability**
 
 `incremental_decode_state` is true only when the built concrete model exposes
 the protocol and the all-layer scan succeeds. `streaming_generation`,
@@ -757,7 +763,7 @@ Fix legacy requested-capability handling: append to `unsupported` only when
 `capabilities.get(name) is not True`, rather than unconditionally. Do not claim
 Qwen3/Qwen3.5/MiMo native runtime support.
 
-- [ ] **Step 6: Add engine, cancellation and CLI proof**
+- [x] **Step 6: Add engine, cancellation and CLI proof**
 
 Cover prefill-EOS, `max_new_tokens=1`, EOS/length precedence, every-step resume,
 same display/fresh nonce, pre-set/prefill-in-flight/decode-in-flight/post-call
@@ -765,7 +771,7 @@ cancellation, prefill/decode exception, snapshot fingerprints, context boundary,
 Stage1/Stage2 cache invocation, media once, fallback flag on/off, exact-one
 warning and implicit DeltaNet.
 
-- [ ] **Step 7: Run and commit**
+- [x] **Step 7: Run; consolidate commit at the final gate**
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 .venv-prototype/bin/python \
@@ -793,12 +799,12 @@ git commit -m "feat: decode legacy requests with owned cache"
 - Create: `tests/runtime/test_benchmark_decode_cache.py`
 - Modify: `README.md`
 
-- [ ] **Step 1: Write a failing deterministic benchmark smoke test**
+- [x] **Step 1: Write a failing deterministic benchmark smoke test**
 
 Run prompt length 8, output length 3, warmup 1 and repetitions 2. Validate the
 complete JSON schema and require parity failure to happen before any timing.
 
-- [ ] **Step 2: Implement benchmark truthfully**
+- [x] **Step 2: Implement benchmark truthfully**
 
 Before timing, calculate:
 
@@ -823,7 +829,7 @@ Use a checked-in valid all-MHA tiny config. Do not silently rewrite a hybrid
 config. Longer 128/512/2048/4096 runs are optional performance jobs; the tiny
 smoke is mandatory CI.
 
-- [ ] **Step 3: Run focused, distributed and full gates**
+- [x] **Step 3: Run focused, distributed and full gates**
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 .venv-prototype/bin/python \
@@ -849,7 +855,7 @@ git status --short
 The 2-rank CPU Gloo gate is mandatory whenever `torch.distributed` is present;
 it cannot silently degrade to world size one.
 
-- [ ] **Step 4: Completion checklist**
+- [x] **Step 4: Completion checklist**
 
 The plan is technically complete only when all are proven:
 
@@ -867,7 +873,7 @@ The plan is technically complete only when all are proven:
 - direct FP32 `max_abs <=1e-5` plus exact greedy token;
 - benchmark JSON smoke, full tests, compileall and diff checks pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Create the user-directed consolidated commit**
 
 ```bash
 git add scripts/benchmark_decode_cache.py \

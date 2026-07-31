@@ -344,6 +344,13 @@ def summarize_model(
         raise ValueError(
             "tokenizer_vocab_size must be a non-negative integer"
         )
+    cache_support = getattr(model, "cache_support", None)
+    capabilities = (
+        cache_support.as_dict()
+        if cache_support is not None
+        and callable(getattr(cache_support, "as_dict", None))
+        else {}
+    )
     return ArchitectureSummary(
         profile=manifest.architecture_profile.value,
         compatibility_level=manifest.compatibility_level.value,
@@ -357,7 +364,7 @@ def summarize_model(
         routed_parameters=stats.routed_parameters,
         shared_parameters=stats.shared_parameters,
         dense_parameters=stats.dense_parameters,
-        capabilities={},
+        capabilities=capabilities,
         layers=tuple(
             _describe_layer(index, layer)
             for index, layer in enumerate(model.layers)

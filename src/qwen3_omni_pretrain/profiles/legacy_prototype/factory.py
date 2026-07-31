@@ -148,7 +148,11 @@ class LegacyPrototypeFactory:
             unsupported = tuple(
                 dict.fromkeys(
                     summary.unsupported_capabilities
-                    + request.requested_capabilities
+                    + tuple(
+                        capability
+                        for capability in request.requested_capabilities
+                        if summary.capabilities.get(capability) is not True
+                    )
                 )
             )
             summary = replace(

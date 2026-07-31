@@ -4,6 +4,13 @@
 本地基线：`391d0186cb225f41f8e47aa600c36da0bc6b21e4`
 结论状态：研究与修复方案，不宣称当前项目兼容官方 checkpoint
 
+实现状态更新（2026-07-30）：在上述基线之后，项目已增加独立的
+`qwen3_omni_prototype` 模型身份、序列保真的实验性多模态 prefill 层、
+Qwen3-disjoint/实验性 TM-RoPE position builder，以及 legacy 全注意力 Thinker
+的 typed prefill/decode KV 状态、会话隔离和正确性/性能基准。这些能力仍未把
+实验性媒体序列接入默认 Thinker，也不包含官方 GDN、Talker、MTP 或 codec
+流式状态，因此不改变“尚不兼容官方 checkpoint”的结论。
+
 ## 1. 结论摘要
 
 官方 Qwen3-Omni 已开放 Instruct、Thinking 和 Captioner 权重，也已在
@@ -24,11 +31,13 @@ MoE/TP 实验和 Stage-2 训练基础设施的研究原型。两者的差异不�
 
 这些修复使当前原型成为稳定的后续改造基线，但没有改变以下核心事实：
 
-- 图像和音频仍各自压缩为一个 token；
-- 没有视频输入、音视频时间交错或 TM-RoPE；
+- 默认 legacy wrapper 仍把图像和音频各自压缩为一个 token；
+- 实验层已有视频/音频序列契约、时间组装和 TM-RoPE builder，但尚未接入默认
+  Thinker，也不等于官方 encoder/processor；
 - 自定义 Thinker 结构和官方 30B-A3B 不一致；
 - Talker、MTP 和 Code2Wav 仍未实现；
-- 没有生成缓存或真正的流式推理；
+- legacy 全注意力文本路径已有 KV cache，但没有官方 GDN、Talker/codec 状态或
+  完整流式服务；
 - 官方训练所需的数据、完整 recipe 和 codec encoder 也未全部公开。
 
 因此建议先建立官方 Qwen3-Omni golden oracle，再分阶段替换当前占位模块。
@@ -309,11 +318,17 @@ continued pretraining、DPO 和 speaker fine-tuning。
 它与官方 hidden 2048、32Q/4KV、128 experts/top-8 的 30B-A3B 不兼容。
 文件名中的“30b”也没有由测试证明等于真实总参数。
 
-### 6.4 Talker 与流式推理缺失
+### 6.4 Talker 与完整流式链路仍缺失
 
 Talker 和 Code2Wav 目前只有 config dataclass；训练器和专用 loss 仍为空。
-文本 greedy decode 每步重新计算完整增长序列，也会重复执行媒体 encoder。
-没有 `past_key_values`、GDN state、Talker state 或 codec streaming cache。
+legacy 全注意力 Thinker 已提供 typed `prefill()`/`decode()`，缓存 RoPE 后的本地
+K/V；多模态 legacy wrapper 仅在 prefill 编码媒体一次，并记录固定两槽的已处理
+前缀。标准实现与两 rank Gloo TP 已通过 cached/uncached parity 和 owner 隔离测试。
+
+这个缓存只覆盖 legacy all-MHA greedy 路径。DeltaNet/GDN recurrent state、官方
+Qwen3-Omni cache schema、Talker state、MTP verification、codec streaming cache、
+背压和公开会话 API 仍缺失；显式选择不支持缓存的 hybrid 层时只能使用带警告的
+uncached fallback。
 
 ### 6.5 分布式缺口
 
@@ -325,25 +340,25 @@ DeepSpeed 和 TP 入口。这是安全的 fail-fast 行为，但尚未满足大�
 
 | 子系统 | 官方 Qwen3-Omni | 当前项目 | 影响 |
 |---|---|---|---|
-| 模型身份 | 官方 `qwen3_omni_moe` schema | 自定义 schema 使用相同 model type | AutoConfig 和 checkpoint 误识别风险 |
+| 模型身份 | 官方 `qwen3_omni_moe` schema | 独立 `qwen3_omni_prototype`；旧标识仅迁移读取 | 已隔离 AutoConfig 身份，state dict 仍不兼容 |
 | Tokenizer | 152,064 embedding vocab | 已对齐 vocab，并由 tokenizer 解析媒体 ID | ID 基础已修复，processor 仍缺 |
 | Vision | 27L ViT、patch sequence、DeepStack | 整图单 token | 丢失空间结构与视频能力 |
 | Audio | AuT、12.5 Hz sequence | 两秒 waveform 单 token | 丢失时间结构和长音频 |
-| Fusion | placeholder replacement、AV interleave | 固定两 token 前缀 | 不支持多段媒体或同步 |
-| Position | TM-RoPE T/H/W | 1D partial RoPE | 无时间和空间建模 |
+| Fusion | placeholder replacement、AV interleave | 默认固定两 token；另有未接默认 Thinker 的 sequence assembler | 默认路径仍不支持多段媒体或同步 |
+| Position | TM-RoPE T/H/W | 默认 1D partial RoPE；另有 Qwen3-disjoint/实验 TM-RoPE builder | 契约可测，尚无端到端官方数值对齐 |
 | Thinker | 48L、2048、128/top-8 MoE | 自定义尺寸、DeltaNet 和 gate | state dict 与数值不兼容 |
 | Talker | 20L MoE | 仅配置 | 无语音生成 |
 | MTP/codec | 16 code groups + Code2Wav | 仅配置 | 无 codec token 或 waveform |
-| Cache | chunk prefill、生成状态 | 每步全量重算 | 无实时性，复杂度高 |
+| Cache | chunk prefill、Thinker/Talker/codec 多状态 | legacy all-MHA typed KV；媒体仅 prefill；无 GDN/Talker/codec 状态 | 文本基线已补齐，完整实时链路仍缺失 |
 | 训练阶段 | alignment/general/long-context | text Stage-1 + 简单 Stage-2 | freeze 和数据语义不一致 |
 | 后训练 | distillation/GSPO/DPO | 无 | 无对话、推理和语音对齐 |
-| 评测 | 分模态与流式评测 | evaluation 包为空 | 无质量和延迟基线 |
+| 评测 | 分模态与流式评测 | 已有 cache parity/隔离测试和 decode benchmark；无系统质量套件 | 推理正确性可回归，质量覆盖仍缺 |
 
 ## 8. 修复与完善方案
 
 ### A0：模型身份与官方 oracle
 
-1. 为本地原型使用独立 `model_type`，避免与官方 schema 冲突。
+1. **已完成**：为本地原型使用独立 `model_type`，避免与官方 schema 冲突。
 2. 固定官方 checkpoint、Transformers 和 tokenizer revision。
 3. 建立只读 golden oracle：
    - processor 输出；
@@ -450,8 +465,8 @@ DeepSpeed 和 TP 入口。这是安全的 fail-fast 行为，但尚未满足大�
 
 1. 保留 legacy prototype 作为回归基线；
 2. 建立官方 golden oracle；
-3. 先解决媒体序列、融合和位置；
-4. 再解决官方 Thinker 和生成缓存；
+3. 将现有实验性媒体序列、融合和位置层接入独立 runtime profile；
+4. 在 legacy cache 基线上实现并对齐官方 Thinker/GDN 状态；
 5. 最后接入 Talker/codec 和阶段式训练。
 
 这条路线能够利用开放 checkpoint 做结构与数值验证，也能明确隔离官方没有开放
