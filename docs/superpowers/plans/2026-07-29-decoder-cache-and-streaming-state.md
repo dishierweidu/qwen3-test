@@ -1,275 +1,330 @@
-# Decoder Cache and Streaming State Implementation Plan
+# Decoder Cache and Incremental Decode State Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+**Goal:** 为 legacy full-attention Thinker 建立请求隔离、可恢复且不别名的
+prefill/decode KV state，使 cached 与 uncached greedy 输出一致，并保证 legacy
+媒体 encoder 每个请求最多执行一次。
 
-**Goal:** 为 full-attention 模型建立请求隔离、copy-on-write 的 prefill/decode cache，使 cached 与 uncached 输出一致，并确保媒体 encoder 每个请求只执行一次。
+尽管文件名保留了 `streaming-state`，本计划中的 “streaming” 仅指模型内部增量
+decode state。本计划不提供公开 iterator/session streaming API，不实现 beam、
+speculative rejection 或通用 state truncate。
 
-**Architecture:** 公共 `runtime.state` 定义所有 profile 可消费的 state partitions；当前计划只写入经过验证的 full-attention KV 和 processed-media partitions。legacy 标准/TP attention 增加可选 cache，但默认 forward 行为保持不变。当前简化 DeltaNet 没有正确 conv/recurrent cache，因此 cache 请求必须显式失败或由 CLI 记录后使用全量重算。
+**Architecture:** 公共 `runtime` 包定义 typed position、KV、owner、checkpoint 和
+model protocol。legacy standard/TP full-attention 实现该 protocol；现有训练
+`forward()` 保持兼容。model boundary 是 rectangular causal bias 的唯一 owner。
+当前 DeltaNet 没有经过验证的 recurrent cache，因此 cache 请求必须在任何 compute
+前失败；只有 CLI 显式允许时才回到有结构化告警的既有 uncached loop。
 
-**Tech Stack:** Python 3.10, dataclasses, immutable mappings, PyTorch 2.10.0 SDPA, pytest, torch.profiler-compatible timing.
+**Dependencies:** profile/oracle 与 media-sequence/TM-RoPE 计划已经完成。公共位置
+合同必须直接复用 `multimodal.types.PositionBatch`，不得复制较弱版本。
 
-## Global Constraints
+**Tech stack:** Python 3.10、PyTorch 2.10、frozen dataclass、runtime-checkable
+Protocol、CPU Gloo、pytest、JSON benchmark。
 
-- 本计划依赖 profile/oracle 和 media-sequence 两个计划完成。
-- `DecoderState` 属于单个 `request_id`；跨 session 复用必须失败。
-- state 更新采用 copy-on-write；forward 不得原地修改传入 state。
-- full-attention cache 保存未 repeat 的 KV，形状固定为 `[B,Hkv,S,D]`。
-- K/V 只要求 batch、KV-head 和 token 轴一致，最后一维可分别为
-  `Dk`/`Dv`，以支持 MiMo 的 QK/V 非对称 head。
-- 每个 KV partition 保存 `[B,S]` key-valid mask；`seen_tokens` 是
-  `[B]` 的有效 token 计数，不是把 padded batch 压成一个标量。
-- cache position IDs 支持 `[B,S]` 一轴或 `[A,B,S]` 多轴；batch/token
-  轴必须与 KV 一致。一轴位置必须在有效 token 上单调；多轴 TM-RoPE
-  可合法重置空间轴或复用跨模态时间 ID，cache 只保存并验证 shape/dtype，
-  语义由 `PositionBuilder` 测试。
-- FP32 cached/uncached logits 的初始最大误差阈值为 `1e-5`，greedy token 必须完全一致。
-- media encoder 只在 prefill 执行一次；decode 不得重新接收或编码原始媒体。
-- SWA、Qwen3.5 GDN、Talker、MTP 和 codec state 只预留 partition；本计划不伪造其更新语义。
-- 当前 legacy DeltaNet cache 不受支持；调用者要么 fail-fast，要么显式选择有记录的 uncached fallback。
-- session 取消、异常和 speculative rejection 不能污染其他请求状态。
-- 性能 benchmark 必须同时报告正确性、上下文、输出长度、dtype、device 和峰值内存。
-- Snippet 中的 `...` 只表示 Protocol/签名节选；任务提交不得保留未实现
-  stub，必须由该任务列出的行为测试证明可用。
-- 每个行为变更使用 red-green-refactor，并形成独立提交。
+---
+
+## Support matrix and non-goals
+
+后续任务和测试不得在没有新设计审查的情况下扩大下表范围。
+
+| Capability | 本计划结果 |
+| --- | --- |
+| legacy standard、全 MHA、prefill/decode KV | 支持 |
+| legacy TP、全 MHA、local-shard KV | 仅在 2-rank CPU Gloo parity 后支持 |
+| legacy explicit/implicit DeltaNet hybrid cache | 不支持；compute 前失败 |
+| legacy DeltaNet uncached fallback | 仅显式 CLI flag，输出结构化 warning |
+| Qwen3 official reference weight runtime | 不支持；仍是 oracle/facade |
+| Qwen3Disjoint position/state round-trip | common typed contract 支持；不宣称 reference runtime |
+| Qwen3.5/MiMo native cache | 只保留 typed adapter 边界，由下游计划实现 |
+| engine batch | 仅 batch size 1 |
+| beam | `beam_search=false`；`num_beams != 1` prefill 前失败 |
+| generic state truncate | `state_truncate=false`；无 `truncate()` API |
+| speculative decode | `speculative_decode=false`；不实现 rejection engine |
+| public iterator/session streaming | `streaming_generation=false` |
+| internal cached greedy decode | capability 名为 `incremental_decode_state` |
+
+稳定的 unsupported/error code 至少包含：
+
+- `DELTA_NET_UNSUPPORTED`
+- `BEAM_UNSUPPORTED`
+- `TRUNCATE_UNSUPPORTED`
+- `SPECULATIVE_UNSUPPORTED`
+- `PROFILE_RUNTIME_UNSUPPORTED`
+- `CONTEXT_OVERFLOW`
+- `STATE_OWNER_MISMATCH`
+
+---
+
+## Global correctness contracts
+
+- 每个 model call 接收一个 committed snapshot，并产生独立 candidate snapshot。
+  异常或取消时丢弃 candidate；旧 snapshot 的内容、fingerprint 和 storage pointer
+  不变。该能力可供未来 snapshot/replay speculation 使用，但本计划不实现
+  speculation 或 rollback。
+- state 的授权身份是至少 128-bit 随机 owner nonce。display request ID 只用于日志，
+  同名 session 不能互相使用 state。
+- state 是 **structurally immutable, clone-detached, non-aliasing snapshot**。
+  frozen dataclass 本身不等价于 tensor value immutable。
+- full-attention KV 保存 RoPE 后、尚未 repeat 的 local K/V，形状
+  `[B,Hkv,S,Dk]` 与 `[B,Hkv,S,Dv]`；允许 `Dk != Dv`。
+- `seen_tokens` 是 `[B] long` 有效 token 计数；storage position 由独立 typed
+  cursor 管理。padding、legacy 两个固定 prefix slot 与显式 position gap 不能由
+  `seen_tokens` 反推。
+- `DecoderPositionState` 是 full-attention history position 的唯一真源；每层 KV
+  不重复保存 position/delta/axis metadata。
+- `PositionBatch.validate(key_valid_mask)` 是公共位置验证的唯一基础合同。legacy
+  RoPE adapter 只接受一轴、有效值为整数且未越界的位置。
+- model boundary 每次调用只构造一份 `[B,1,Q,P+Q]` rectangular additive bias；
+  attention 层不得再次生成 causal mask。
+- `use_cache=True` 时，owner、batch、dtype/device、position、context、training mode、
+  DeltaNet capability 和 exact layer set 全部在 embedding/QKV/media compute 前验证。
+- cache model call 全部运行在 `torch.inference_mode()`；返回 state 的 tensor
+  `requires_grad=False` 且 `grad_fn is None`。
+- FP32 cached/uncached logits 的 `max_abs` 必须直接计算并满足 `<=1e-5`；随后再
+  检查 greedy token exact。
+- raw legacy media 只允许出现在 `decoder_state is None` 的 prefill。任何 supplied
+  state 都表示 decode，即使它是 empty/partial state。
+- snippet 中的 `...` 只表示签名节选。任务提交不得保留 stub，并且每项行为必须按
+  red-green-refactor 实现后独立提交。
 
 ---
 
 ## File responsibility map
 
-- `src/qwen3_omni_pretrain/runtime/state.py`: immutable KV/state dataclasses、ownership 和字节统计。
-- `src/qwen3_omni_pretrain/runtime/protocols.py`: cache-capable model 和 generation output protocols。
-- `src/qwen3_omni_pretrain/runtime/generation.py`: framework-independent greedy prefill/decode engine。
-- `modeling_thinker_text.py`: legacy standard full-attention cache 计算。
-- `modeling_thinker_text_tp.py`: TP local-shard cache 计算和相同输出 contract。
-- `modeling_thinker_vision_audio.py`: legacy media prefill 与 decode 分离。
-- `cli_infer_thinker.py`: 薄 CLI；选择 cached engine 或记录明确 fallback。
-- `scripts/benchmark_decode_cache.py`: correctness-gated latency/memory benchmark。
+- `runtime/capabilities.py`: stable capability/error values 和实际 layer scan。
+- `runtime/state.py`: owner、position cursor、KV/state snapshot、字节统计。
+- `runtime/protocols.py`: typed prefill/decode input 与 cache-capable model protocol。
+- `runtime/generation.py`: legacy-only greedy pending-token checkpoint engine。
+- `modeling_thinker_text.py`: standard MHA cache、mask、model adapter。
+- `modeling_thinker_text_tp.py`: TP local-shard cache 与相同 contract。
+- `modeling_thinker_vision_audio.py`: legacy media prefill-only typed union。
+- `architecture/summary.py` 与 legacy factory: capability publication。
+- `cli_infer_thinker.py`: Stage1/Stage2 cache selection 和 explicit fallback。
+- `benchmark_decode_cache.py`: correctness-gated JSON latency/memory benchmark。
 
 ---
 
-### Task 1: Define immutable decoder state partitions
+### Task 0: Freeze capability, error and operation scope
 
 **Files:**
+
 - Create: `src/qwen3_omni_pretrain/runtime/__init__.py`
-- Create: `src/qwen3_omni_pretrain/runtime/state.py`
-- Create: `src/qwen3_omni_pretrain/runtime/protocols.py`
-- Create: `tests/runtime/test_decoder_state.py`
+- Create: `src/qwen3_omni_pretrain/runtime/capabilities.py`
+- Create: `tests/runtime/test_cache_capabilities.py`
 
-**Interfaces:**
-- Consumes: `MediaSequence`.
-- Produces: `AttentionKV`, `SlidingWindowKV`, `DecoderState`,
-  `CacheCapabilityError`, `LegacyMediaPrefillInputs`, `ModelPrefillInputs`,
-  `CacheCapableModel` protocol, and `CausalLMOutput`.
+**Produces:** `CacheErrorCode`, `CacheCapabilityError`, `CacheSupport`, and a
+strict actual-layer scanner. This task publishes no true cache capability yet.
 
-- [ ] **Step 1: Write failing ownership and copy-on-write tests**
+- [ ] **Step 1: Write failing capability tests**
+
+Test exact enum/string values, structured `code`/`reason`, and the support
+matrix default:
 
 ```python
-def test_state_update_does_not_mutate_previous_state():
-    empty = DecoderState.empty(request_id="r1")
-    cache = AttentionKV(
-        key=torch.zeros(1, 2, 3, 4),
-        value=torch.ones(1, 2, 3, 4),
-        position_ids=torch.arange(3).view(1, 3),
-        key_valid_mask=torch.ones(1, 3, dtype=torch.bool),
-    )
-    updated = empty.with_full_attention(layer_idx=0, cache=cache)
-    assert dict(empty.full_attention_kv) == {}
-    assert updated.full_attention_kv[0] is cache
-    assert updated.request_id == "r1"
-
-
-def test_state_rejects_cross_request_owner():
-    state = DecoderState.empty(request_id="r1")
-    with pytest.raises(ValueError, match="request_id"):
-        state.assert_owner("r2")
+support = CacheSupport.unimplemented()
+assert support.incremental_decode_state is False
+assert support.streaming_generation is False
+assert support.beam_search is False
+assert support.state_truncate is False
+assert support.speculative_decode is False
 ```
 
-- [ ] **Step 2: Run and verify the runtime package is missing**
+Reject bool-as-int/zero/negative `num_beams`, `num_beams != 1`, truncate and
+speculative requests with stable codes. These helpers must be callable before
+tokenizer/model/media work.
 
-Run:
+- [ ] **Step 2: Implement strict error and capability values**
+
+`CacheCapabilityError` is a typed runtime error with public `code` and `reason`;
+its string is diagnostic only. Add strict helpers for beam/truncate/speculative
+operation gates. Do not add `DecoderState.truncate()` or batch reorder APIs.
+
+Define actual-layer inspection around constructed decoder layers, not
+`ArchitectureSummary.cache_type`. The scanner must identify both explicit
+DeltaNet indices and the current implicit 3:1 default by inspecting every
+constructed layer's block implementation/type. Until Tasks 2–3 implement the
+protocol, it reports `incremental_decode_state=False` even for all-MHA models.
+
+- [ ] **Step 3: Prove fail-before-compute**
+
+Use call-count fakes to show beam/truncate/speculative rejection occurs before
+tokenizer, embedding, attention, DeltaNet and media calls. Add fixtures for
+explicit DeltaNet and `use_deltanet=true` with empty indices (implicit 3:1).
+
+- [ ] **Step 4: Run and commit**
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 .venv-prototype/bin/python \
-  -m pytest -p no:cacheprovider tests/runtime/test_decoder_state.py -q
+  -m pytest -p no:cacheprovider tests/runtime/test_cache_capabilities.py -q
+
+git add src/qwen3_omni_pretrain/runtime tests/runtime/test_cache_capabilities.py
+git commit -m "feat: define incremental decode capabilities"
 ```
 
-Expected: FAIL at import.
+---
 
-- [ ] **Step 3: Implement validated full and sliding KV types**
+### Task 1: Define typed non-aliasing decoder state and protocols
+
+**Files:**
+
+- Create: `src/qwen3_omni_pretrain/runtime/state.py`
+- Create: `src/qwen3_omni_pretrain/runtime/protocols.py`
+- Create: `tests/runtime/test_decoder_state.py`
+- Modify: `src/qwen3_omni_pretrain/runtime/__init__.py`
+
+**Produces:** `StateOwner`, `AttentionKV`, `SlidingWindowKV`, position cursors,
+`DecoderPositionState`, `LegacyProcessedPrefix`, `DecoderState`, model input
+types, `CausalLMOutput`, and `CacheCapableModel`.
+
+- [ ] **Step 1: Write failing owner and snapshot-isolation tests**
+
+Cover two concurrent sessions with display ID `"r1"`, a later new `"r1"`
+session, nonce mismatch, and exact owner preservation in derived snapshots.
+Mutate every caller tensor after construction and prove state tensor values are
+unchanged and storage pointers do not alias. Candidate append must not alter the
+old snapshot, including on injected exception.
+
+- [ ] **Step 2: Implement owner and position state**
+
+```python
+@dataclass(frozen=True)
+class StateOwner:
+    display_request_id: str
+    nonce: bytes
+
+    @classmethod
+    def fresh(cls, display_request_id: str) -> StateOwner:
+        ...  # secrets.token_bytes(16) or stronger
+
+
+@dataclass(frozen=True)
+class LegacyPositionCursor:
+    next_storage_position: torch.LongTensor  # [B]
+
+
+@dataclass(frozen=True)
+class Qwen3DisjointPositionCursor:
+    next_text_position: torch.Tensor  # [B], profile dtype/device
+    rope_deltas: torch.Tensor          # [B,1]
+    axis_names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DecoderPositionState:
+    cached: PositionBatch
+    key_valid_mask: torch.BoolTensor
+    continuation: LegacyPositionCursor | Qwen3DisjointPositionCursor
+```
+
+Rules:
+
+- `display_request_id` is a nonblank exact string; nonce is exact bytes with at
+  least 16 bytes. Authorization compares nonce, never display text.
+- every public ingress clone+detaches tensors before storing;
+- position construction and append call
+  `PositionBatch.validate(key_valid_mask)` and validate cursor batch/device/type;
+- legacy cursor cannot be reconstructed from valid count. It preserves explicit
+  offsets/gaps, padding and the wrapper's two storage prefix slots;
+- Qwen3 cursor is created/advanced only by the Qwen3-disjoint adapter/builder and
+  retains axis/delta metadata. This plan supports only previously approved
+  non-joint contiguous semantics; split/interleaved/joint AV fails fast.
+
+- [ ] **Step 3: Implement strict KV snapshots**
 
 ```python
 @dataclass(frozen=True)
 class AttentionKV:
     key: torch.Tensor
     value: torch.Tensor
-    position_ids: torch.LongTensor
     key_valid_mask: torch.BoolTensor
-
-    def __post_init__(self) -> None:
-        if self.key.ndim != 4:
-            raise ValueError("key must have shape [B, Hkv, S, Dk]")
-        if self.value.ndim != 4:
-            raise ValueError("value must have shape [B, Hkv, S, Dv]")
-        if self.value.shape[:3] != self.key.shape[:3]:
-            raise ValueError("key/value B, Hkv, and S axes must match")
-        valid_position_shape = (
-            self.position_ids.ndim == 2
-            and self.position_ids.shape
-            == (self.key.shape[0], self.key.shape[2])
-        ) or (
-            self.position_ids.ndim == 3
-            and self.position_ids.shape[1:]
-            == (self.key.shape[0], self.key.shape[2])
-        )
-        if not valid_position_shape:
-            raise ValueError("position_ids must have shape [B,S] or [A,B,S]")
-        if self.key_valid_mask.shape != (
-            self.key.shape[0],
-            self.key.shape[2],
-        ):
-            raise ValueError("key_valid_mask must have shape [B, S]")
-        if self.key_valid_mask.dtype is not torch.bool:
-            raise TypeError("key_valid_mask must be boolean")
-        if self.position_ids.dtype != torch.long:
-            raise TypeError("position_ids must be torch.long")
-        valid_positions = (
-            self.position_ids
-            if self.position_ids.ndim == 2
-            else self.position_ids.flatten(0, 1)
-        )
-        expanded_valid_mask = (
-            self.key_valid_mask
-            if self.position_ids.ndim == 2
-            else self.key_valid_mask.repeat(self.position_ids.shape[0], 1)
-        )
-        if torch.any(valid_positions[expanded_valid_mask] < 0):
-            raise ValueError("valid cached position IDs must be non-negative")
-        valid_pairs = (
-            self.key_valid_mask[:, 1:] & self.key_valid_mask[:, :-1]
-        )
-        if self.position_ids.ndim == 2 and torch.any(
-            (
-                self.position_ids[..., 1:]
-                < self.position_ids[..., :-1]
-            )
-            & valid_pairs
-        ):
-            raise ValueError("valid cached position IDs must be monotonic")
-
-    def append(
-        self,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        position_ids: torch.LongTensor,
-        key_valid_mask: torch.BoolTensor,
-    ) -> "AttentionKV":
-        if position_ids.ndim != self.position_ids.ndim:
-            raise ValueError("position axis count cannot change while appending")
-        return AttentionKV(
-            key=torch.cat((self.key, key), dim=2),
-            value=torch.cat((self.value, value), dim=2),
-            position_ids=torch.cat(
-                (self.position_ids, position_ids), dim=-1
-            ),
-            key_valid_mask=torch.cat(
-                (self.key_valid_mask, key_valid_mask), dim=1
-            ),
-        )
-
-    def storage_bytes(self) -> int:
-        tensors = (
-            self.key,
-            self.value,
-            self.position_ids,
-            self.key_valid_mask,
-        )
-        return sum(t.numel() * t.element_size() for t in tensors)
 ```
 
-For the one-axis case, the production validation compares consecutive valid
-positions after compacting each row, so a padding gap cannot hide a decrease.
-For `[A,B,S]`, validate only dtype, shape and non-negativity; do not impose
-per-axis monotonicity because image width IDs reset and temporal IDs may be
-reused by later spans.
+Validate rank-4 K/V with common B/Hkv/S/device/dtype, independent Dk/Dv, and
+same-device bool `[B,S]` mask. `append()` validates the complete current chunk
+before allocating and returns clone-detached non-aliasing storage. It never
+uses `copy_`, in-place masking or mutable capacity buffers.
 
-Define `SlidingWindowKV` now with the same fields plus `window_size`. Its
-`append()` compacts **each batch row independently by `key_valid_mask`**, keeps
-that row's last `window_size` valid key/value/position entries, and then
-right-pads the rectangular result back to
-`[B, H_kv, max_kept, D]`/`[B, max_kept]`. Padding slots have a false mask and
-cannot advance another row's window or evict valid KV. For multi-axis
-positions, compaction applies the same row/token gather to every axis. This
-type is tested here but first consumed by the MiMo experimental plan.
+`SlidingWindowKV` uses the same K/V fields plus `window_size` and a validated
+`PositionBatch` window. Append compacts each row independently by valid mask,
+gathers K/V/all position axes with the same indices, keeps the last
+`window_size` valid entries, then right-pads a rectangle. An irregular two-row
+oracle must prove padded storage slots neither evict nor advance valid tokens.
 
-Add an irregular two-row test in which the short row contains right padding
-in every one of several appended chunks. Compare the compacted valid
-key/value/position sequence against a per-row Python oracle after every append
-and prove the short row retains its last `window_size` **valid** tokens rather
-than the last rectangular storage slots.
+- [ ] **Step 4: Implement typed state partitions**
 
-- [ ] **Step 4: Implement the common state**
+```python
+@runtime_checkable
+class StatePartition(Protocol):
+    @property
+    def batch_size(self) -> int: ...
+    def clone_detached(self) -> StatePartition: ...
+    def logical_tensor_bytes(self) -> int: ...
+
+
+@dataclass(frozen=True)
+class LegacyProcessedPrefix:
+    has_image: tuple[bool, ...]
+    has_audio: tuple[bool, ...]
+    prefix_storage_length: int  # exactly 2
+
+
+@dataclass(frozen=True)
+class DecoderState:
+    owner: StateOwner
+    seen_tokens: torch.LongTensor
+    position: DecoderPositionState | None
+    full_attention_kv: Mapping[int, AttentionKV]
+    swa_kv: Mapping[int, SlidingWindowKV]
+    processed_media: LegacyProcessedPrefix | None
+    gdn_state: StatePartition | None
+    talker_state: StatePartition | None
+    mtp_state: StatePartition | None
+    codec_state: StatePartition | None
+```
+
+No `Mapping[str, object]` or `object | None` is permitted. Unimplemented
+partitions remain `None`. Validate `[B] long` non-negative `seen_tokens`, exact
+batch/device agreement across position/cache/per-batch partitions, integer
+non-negative layer keys, immutable copied mappings, and consistent KV lengths,
+masks, dtype/device.
+
+`advance_seen_tokens(valid_count_delta)` requires exact `[B] long`, non-negative,
+same-device input and returns a new state. It rejects bool and does not store
+caller storage. There is no reorder/truncate method.
+
+Byte metrics are separate:
+
+- `logical_tensor_bytes(partition=None)` counts logical tensor payload;
+- `unique_allocated_bytes(partition=None)` is explicitly best-effort, dedupes
+  underlying storage and reports request-shared media separately.
+
+- [ ] **Step 5: Define strict model inputs and protocol**
 
 ```python
 @dataclass(frozen=True)
-class DecoderState:
-    request_id: str
-    seen_tokens: torch.LongTensor
-    full_attention_kv: Mapping[int, AttentionKV]
-    swa_kv: Mapping[int, SlidingWindowKV]
-    gdn_convolution_state: Mapping[int, torch.Tensor]
-    gdn_recurrent_matrix_state: Mapping[int, torch.Tensor]
-    talker_state: object | None
-    mtp_state: object | None
-    codec_state: object | None
-    processed_media_cache: Mapping[str, object]
+class LegacyMediaPrefillInputs:
+    pixel_values: torch.Tensor | None
+    audio_values: torch.Tensor | None
+    has_image: torch.BoolTensor
+    has_audio: torch.BoolTensor
 
-    @classmethod
-    def empty(
-        cls,
-        request_id: str,
-        *,
-        batch_size: int = 1,
-        device: torch.device | None = None,
-    ) -> "DecoderState":
-        if not request_id.strip():
-            raise ValueError("request_id must be non-empty")
-        if batch_size <= 0:
-            raise ValueError("batch_size must be positive")
-        return cls(
-            request_id=request_id,
-            seen_tokens=torch.zeros(
-                batch_size, dtype=torch.long, device=device
-            ),
-            full_attention_kv=MappingProxyType({}),
-            swa_kv=MappingProxyType({}),
-            gdn_convolution_state=MappingProxyType({}),
-            gdn_recurrent_matrix_state=MappingProxyType({}),
-            talker_state=None,
-            mtp_state=None,
-            codec_state=None,
-            processed_media_cache=MappingProxyType({}),
-        )
-```
 
-Add `assert_owner()`, `with_full_attention()`, `with_processed_media(key,
-value: object)`, `with_seen_tokens()`, and `storage_bytes(partition=None)`.
-Each method creates a new mapping and wraps it in `MappingProxyType`; it never
-mutates tensors or input mappings. The object-valued partition is deliberate:
-common profile prefill stores `MediaSequence`, while the legacy adapter stores
-a frozen processed-prefix marker. Profile code must validate its own value
-type when reading a key.
+@dataclass(frozen=True)
+class ModelPrefillInputs:
+    input_ids: torch.LongTensor | None
+    inputs_embeds: torch.Tensor | None
+    key_valid_mask: torch.BoolTensor
+    position_batch: PositionBatch | None
+    media: LegacyMediaPrefillInputs | None = None
 
-`DecoderState.__post_init__()` requires non-negative rank-1 long
-`seen_tokens`, and every cache batch size must match it.
-`with_seen_tokens(current_valid_counts)` validates an identically shaped
-non-negative long tensor and returns a state whose counter is
-`self.seen_tokens + current_valid_counts`; it never stores the caller's tensor
-without cloning. Add a two-row `[3,1] -> [4,2]` test so padded batches cannot
-regress to scalar accounting.
 
-- [ ] **Step 5: Define output and model protocols**
+@dataclass(frozen=True)
+class ModelDecodeInputs:
+    token_ids: torch.LongTensor
+    current_key_valid_mask: torch.BoolTensor
+    position_batch: PositionBatch
+    decoder_state: DecoderState
 
-```python
+
 @dataclass(frozen=True)
 class CausalLMOutput:
     logits: torch.Tensor
@@ -280,353 +335,213 @@ class CausalLMOutput:
     hidden_states: tuple[torch.Tensor, ...] | None
 
 
-@dataclass(frozen=True)
-class LegacyMediaPrefillInputs:
-    pixel_values: torch.Tensor | None
-    audio_values: torch.Tensor | None
-    has_image: torch.Tensor | None
-    has_audio: torch.Tensor | None
-
-
-@dataclass(frozen=True)
-class ModelPrefillInputs:
-    input_ids: torch.LongTensor | None
-    inputs_embeds: torch.Tensor | None
-    attention_mask: torch.Tensor
-    position_ids: torch.LongTensor | None
-    media: LegacyMediaPrefillInputs | None = None
-
-
 class CacheCapableModel(Protocol):
     def prefill(
         self,
         *,
         inputs: ModelPrefillInputs,
-        request_id: str,
+        owner: StateOwner,
         use_cache: bool,
-    ) -> CausalLMOutput:
-        ...
+    ) -> CausalLMOutput: ...
 
     def decode(
         self,
         *,
-        token_ids: torch.LongTensor,
-        current_attention_mask: torch.BoolTensor,
-        decoder_state: DecoderState,
-        request_id: str,
-    ) -> CausalLMOutput:
-        ...
+        inputs: ModelDecodeInputs,
+        owner: StateOwner,
+    ) -> CausalLMOutput: ...
 ```
 
-`ModelPrefillInputs` requires exactly one of `input_ids`/`inputs_embeds`, a
-rank-2 key-valid mask and matching batch/token axes. It contains the only raw
-legacy media union supported by this plan; common sequence-based profiles pass
-already assembled embeddings and positions. `decode()` has no raw-media
-parameter by construction. Concrete legacy models may keep `forward()` for
-backward compatibility, but expose these two thin typed methods for the engine
-instead of accepting arbitrary `**model_kwargs`.
+`ModelPrefillInputs` requires exactly one of IDs/embeddings, nonempty `[B,Q]`
+shape, same-device bool mask and validates supplied position via
+`position_batch.validate(key_valid_mask)`. `ModelDecodeInputs` performs the
+same coupled checks and exact owner/batch match. Decode has no raw-media field.
+`CausalLMOutput` validates floating rank-3 logits, coupled batch/token axes,
+optional scalar losses, tuple hidden states and detached owned state when cache
+is enabled; malformed adapters fail at this boundary rather than later sampling.
 
-- [ ] **Step 6: Run tests and commit**
+Legacy position adapter accepts only `axis_names == ("sequence",)`,
+`[1,B,Q]`, finite integral valid values, masked zeros, and valid max below
+`max_position_embeddings`; it then converts to `[B,Q] long`. Fractional,
+three-axis or overflow positions fail before QKV.
 
-Run:
+- [ ] **Step 6: Add exhaustive state tests**
+
+Cover:
+
+- float32 three-axis fractional/non-monotonic positions, negative deltas and
+  masked-zero round-trip without semantic weakening;
+- valid legacy integral adapter and pre-compute rejection of fractional,
+  three-axis and boundary overflow inputs;
+- absent/image/audio/both prefix, explicit gaps, padding, `Q=1` and `Q=3`;
+- `Dk != Dv`, mixed dtype/device, missing/extra layer and divergent mask;
+- typed partition rejection and logical/allocated byte accounting.
+
+- [ ] **Step 7: Run and commit**
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 .venv-prototype/bin/python \
   -m pytest -p no:cacheprovider tests/runtime/test_decoder_state.py -q
-```
 
-Expected: all tests pass.
-
-```bash
 git add src/qwen3_omni_pretrain/runtime tests/runtime/test_decoder_state.py
 git commit -m "feat: define request-owned decoder state"
 ```
 
 ---
 
-### Task 2: Add full-attention KV cache to standard and TP attention
+### Task 2: Add full-attention KV and one rectangular mask owner
 
 **Files:**
-- Modify: `src/qwen3_omni_pretrain/models/qwen3_omni_moe/modeling_thinker_text.py:148-289`
-- Modify: `src/qwen3_omni_pretrain/models/qwen3_omni_moe/modeling_thinker_text_tp.py:55-226`
+
+- Modify: `src/qwen3_omni_pretrain/models/qwen3_omni_moe/modeling_thinker_text.py`
+- Modify: `src/qwen3_omni_pretrain/models/qwen3_omni_moe/modeling_thinker_text_tp.py`
 - Create: `tests/runtime/test_attention_cache.py`
 - Modify: `tests/test_tp_moe.py`
+- Modify: `tests/test_multimodal_attention_mask.py`
 
-**Interfaces:**
-- Consumes: `AttentionKV`.
-- Produces: standard and TP attention signature returning `(hidden_states, present_kv)`.
+**Produces:** standard/TP MHA `(hidden, present_kv)` contract while preserving
+DeltaNet's existing no-cache tensor contract.
 
-- [ ] **Step 1: Write a failing prefill/decode parity test**
+- [ ] **Step 1: Write failing attention parity and allocation tests**
 
-```python
-def test_full_attention_cached_logits_match_full_sequence():
-    torch.manual_seed(7)
-    attention = tiny_attention()
-    hidden = torch.randn(1, 6, 8)
-    positions = torch.arange(6).view(1, 6)
-    full, _ = attention(
-        hidden,
-        position_ids=positions,
-        use_cache=False,
-    )
-    prefill, state = attention(
-        hidden[:, :5],
-        position_ids=positions[:, :5],
-        use_cache=True,
-    )
-    step, next_state = attention(
-        hidden[:, 5:],
-        position_ids=positions[:, 5:],
-        past_key_value=state,
-        use_cache=True,
-    )
-    torch.testing.assert_close(prefill, full[:, :5], atol=1e-5, rtol=1e-5)
-    torch.testing.assert_close(step, full[:, 5:], atol=1e-5, rtol=1e-5)
-    assert next_state.key.shape[2] == 6
-```
+For standard and TP fixtures compare full sequence with `Q=5` prefill followed
+by `Q=1` and `Q=3` decode. Compute `max_abs` directly and require `<=1e-5`, then
+compare greedy tokens. Add GQA, `Dk != Dv`, BF16 dtype and two-row padded cases.
 
-- [ ] **Step 2: Run and observe the unexpected keyword failure**
+- [ ] **Step 2: Migrate MHA and callers atomically**
 
-Run:
+Standard/TP MHA accepts current hidden, already validated current position,
+`AttentionKV | None`, current bool mask, one final additive bias, and
+`use_cache`; it returns `(hidden, present_kv)`.
 
-```bash
-PYTHONDONTWRITEBYTECODE=1 .venv-prototype/bin/python \
-  -m pytest -p no:cacheprovider tests/runtime/test_attention_cache.py -q
-```
+Apply RoPE to current Q/K, append persistent unrepeated local K/V, then repeat
+only for attention compute. When `use_cache=False`, return `present_kv=None`.
 
-Expected: FAIL because attention does not accept `past_key_value` or
-`use_cache`.
+DeltaNet remains a single tensor when cache is disabled. Decoder layer/model
+caller branches on the actual block implementation/type; it must never blindly
+unpack a DeltaNet tensor. Commit MHA signature and all callers together so the
+default implicit 3:1 hybrid no-cache logits/output keys remain unchanged.
 
-- [ ] **Step 3: Change the attention contract**
+- [ ] **Step 3: Move causal bias ownership to model boundary**
 
-Both standard and TP attention use:
+Replace current standard/TP square-mask construction with one helper per model
+call. Given past mask `[B,P]` and current mask `[B,Q]`, create exactly one
+`[B,1,Q,P+Q]` additive bias using the `P+q` causal rule. Invalid keys are
+masked. A valid query with no valid key fails before attention; invalid current
+queries are explicitly zeroed after output projection, remain false in cache
+mask and do not advance valid count.
 
-```python
-def forward(
-    self,
-    hidden_states: torch.Tensor,
-    attention_mask: torch.Tensor | None = None,
-    position_ids: torch.LongTensor | None = None,
-    rotary_emb: RotaryEmbedding | None = None,
-    past_key_value: AttentionKV | None = None,
-    current_key_valid_mask: torch.BoolTensor | None = None,
-    use_cache: bool = False,
-) -> tuple[torch.Tensor, AttentionKV | None]:
-    ...
-```
+Attention consumes that final bias and never layers a second causal mask. Eager
+and SDPA paths use identical semantics and query-compatible dtype/device.
 
-Compute Q/K/V for current tokens. Apply RoPE to current Q/K. Build or append
-the cache before `_repeat_kv`; persistent keys and values remain at KV-head
-count. `current_key_valid_mask` defaults to all true for an unpadded current
-chunk, is appended to `AttentionKV.key_valid_mask`, and masks invalid cached
-and current keys. Use all valid cached K/V for attention and return a new
-cache only when `use_cache=True`.
+- [ ] **Step 4: Prove allocation and failure order**
 
-In this same task, update standard/TP decoder-layer and model internal call
-sites to unpack `(attention_output, present_kv)`. With cache disabled they
-discard `present_kv` and preserve the exact existing outer model output. Do
-not commit the tuple-returning attention before its callers are migrated;
-Task 3 only adds request-owned state propagation.
+Spies must show:
 
-The decoder-layer contract established here is:
+- one rectangular bias allocation per entire multi-layer model call;
+- no `[P+1,P+1]` allocation during `Q=1` decode;
+- explicit and implicit DeltaNet cache requests fail before embedding, QKV,
+  DeltaNet or collective calls;
+- no-cache mixed DeltaNet results remain exact regressions.
 
-```python
-def forward(
-    self,
-    hidden_states: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    position_ids: torch.LongTensor,
-    current_key_valid_mask: torch.BoolTensor,
-    past_key_value: AttentionKV | None = None,
-    use_cache: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor | None, AttentionKV | None]:
-    ...
-```
+- [ ] **Step 5: Add real TP local-shard parity**
 
-- [ ] **Step 4: Build the correct rectangular causal mask**
+Keep world-size-one smoke and add mandatory 2-rank CPU Gloo. Each rank stores
+`Hkv/world_size` unrepeated local KV; owner/mask/position/seen are identical
+across ranks. Compare gathered FP32 logits and greedy token to a standard model
+with the same weights (`max_abs <=1e-5`). Synchronize any validation failure
+before collectives so one-rank failure cannot hang peers.
 
-For `query_length=Q`, `past_length=P`, `key_length=P+Q`, a current query at
-local index `q` may attend through key index `P+q`. Build `[1,1,Q,P+Q]`:
-
-```python
-query_positions = torch.arange(Q, device=device) + P
-key_positions = torch.arange(P + Q, device=device)
-blocked = key_positions[None, :] > query_positions[:, None]
-causal = torch.zeros(Q, P + Q, device=device, dtype=dtype)
-causal.masked_fill_(blocked, torch.finfo(dtype).min)
-```
-
-Combine with `past_key_value.key_valid_mask` plus the current key-valid mask.
-Never materialize `[total,total]` during single-token decode. A valid query
-with zero valid keys is an error; an invalid/padded query returns a zeroed
-attention output and does not contribute to state token counts.
-
-- [ ] **Step 5: Verify standard/TP world-size-one parity**
-
-Add tests for:
-
-- prefill `Q=5,P=0`;
-- one-token decode `Q=1,P=5`;
-- multi-token chunk decode `Q=3,P=5`;
-- GQA cache keeps KV-head count;
-- padded two-row batch, including cached key-mask preservation and different
-  valid-token counts;
-- BF16 dtype preservation;
-- TP world size one matches standard output and state shapes.
-
-The parity fixture checks every causal prefill token, not only the final token,
-and a spy asserts that prefill/decode each construct exactly one rectangular
-`[1,1,Q,P+Q]` mask. No outer model path may also add a causal mask.
-
-Run:
+- [ ] **Step 6: Run and commit**
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 .venv-prototype/bin/python \
   -m pytest -p no:cacheprovider \
   tests/runtime/test_attention_cache.py tests/test_tp_moe.py \
   tests/test_multimodal_attention_mask.py -q
-```
 
-Expected: all selected tests pass with FP32 `max_abs <= 1e-5`.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add src/qwen3_omni_pretrain/models/qwen3_omni_moe/modeling_thinker_text.py \
+git add \
+  src/qwen3_omni_pretrain/models/qwen3_omni_moe/modeling_thinker_text.py \
   src/qwen3_omni_pretrain/models/qwen3_omni_moe/modeling_thinker_text_tp.py \
-  tests/runtime/test_attention_cache.py tests/test_tp_moe.py
+  tests/runtime/test_attention_cache.py tests/test_tp_moe.py \
+  tests/test_multimodal_attention_mask.py
 git commit -m "feat: cache full-attention key values"
 ```
 
 ---
 
-### Task 3: Thread cache through decoder layers and the text model
+### Task 3: Propagate atomic cache state through Thinker
 
 **Files:**
-- Modify: `src/qwen3_omni_pretrain/models/qwen3_omni_moe/modeling_thinker_text.py:460-812`
-- Modify: `src/qwen3_omni_pretrain/models/qwen3_omni_moe/modeling_thinker_text_tp.py:404-802`
+
+- Modify: `modeling_thinker_text.py`
+- Modify: `modeling_thinker_text_tp.py`
 - Create: `tests/runtime/test_thinker_cache.py`
 
-**Interfaces:**
-- Consumes: `DecoderState` and cached attention contract.
-- Produces: optional `decoder_state` in the existing output mapping.
+**Produces:** typed standard/TP `.prefill()` and `.decode()` adapters plus
+atomic `DecoderState` candidates.
 
-- [ ] **Step 1: Write a failing model-level parity test**
+- [ ] **Step 1: Write failing model-level cached/uncached parity tests**
 
-```python
-def test_thinker_cached_decode_matches_uncached_logits():
-    torch.manual_seed(11)
-    model = tiny_full_attention_thinker().eval()
-    tokens = torch.tensor([[3, 4, 5, 6, 7, 8]])
-    full = model(input_ids=tokens, labels=None)["logits"]
-    prefill = model(
-        input_ids=tokens[:, :5],
-        labels=None,
-        request_id="r1",
-        use_cache=True,
-    )
-    step = model(
-        input_ids=tokens[:, 5:],
-        labels=None,
-        decoder_state=prefill["decoder_state"],
-        request_id="r1",
-        use_cache=True,
-    )
-    torch.testing.assert_close(
-        step["logits"][:, -1],
-        full[:, -1],
-        atol=1e-5,
-        rtol=1e-5,
-    )
-```
+Use tiny all-MHA standard/TP models. Cover one- and three-token chunks,
+different per-row valid counts, explicit position gaps, maximum boundary and
+padded batch. Check all affected logits, direct `max_abs <=1e-5`, then tokens.
 
-- [ ] **Step 2: Run and observe missing model arguments**
+- [ ] **Step 2: Add a single pre-compute validation phase**
 
-Run:
+Before embedding or any layer:
 
-```bash
-PYTHONDONTWRITEBYTECODE=1 .venv-prototype/bin/python \
-  -m pytest -p no:cacheprovider tests/runtime/test_thinker_cache.py -q
-```
+- validate owner nonce, batch, device/dtype and `model.training is False`;
+- reject every `use_cache=True and model.training` combination, regardless of
+  labels or gradient checkpointing;
+- scan every actual layer and reject DeltaNet (explicit or implicit default);
+- require state KV layer keys to equal the model's exact cacheable layer set;
+- require all KV lengths/masks/device/dtype and position history to agree;
+- validate legacy position adapter and true maximum RoPE position;
+- reject zero-valid rows and context/output-budget overflow before compute.
 
-Expected: FAIL with unexpected `request_id`.
+Missing layers are never interpreted as empty past; extra layers are never
+ignored.
 
-- [ ] **Step 3: Extend the model signature and propagate common state**
+- [ ] **Step 3: Implement typed prefill/decode adapters**
 
-The decoder-layer cache signature and no-cache caller migration were completed
-atomically in Task 2. Extend only the public model boundary here:
+Training-compatible `forward()` may retain legacy two-dimensional
+`position_ids`, but engine-facing methods accept only `ModelPrefillInputs` and
+`ModelDecodeInputs` with `PositionBatch`.
 
-```python
-def forward(
-    self,
-    input_ids: torch.LongTensor | None = None,
-    attention_mask: torch.Tensor | None = None,
-    position_ids: torch.LongTensor | None = None,
-    labels: torch.LongTensor | None = None,
-    output_hidden_states: bool = False,
-    inputs_embeds: torch.Tensor | None = None,
-    decoder_state: DecoderState | None = None,
-    request_id: str | None = None,
-    use_cache: bool = False,
-):
-    ...
-```
+Prefill creates empty per-layer candidates, one position history and an owner.
+Decode consumes only current token IDs/mask/position plus the owned state. It
+does not infer position from `seen_tokens + cumsum`.
 
-When cache is requested:
+Legacy cursor advances storage positions, including fixed masked/absent media
+slots and explicit gaps; `seen_tokens` advances only by current valid counts.
+Qwen3-disjoint position can round-trip through the common protocol but is not
+wired to this legacy-only model runtime.
 
-- require non-empty `request_id`;
-- create an empty state with the input batch size or assert existing ownership
-  and matching batch size;
-- require a rank-2 external attention mask; on cached calls it covers the
-  complete cached-plus-current key length, and its cached prefix must exactly
-  equal every layer cache's `key_valid_mask`;
-- slice the current `[B,Q]` valid mask and, when `position_ids` is absent,
-  infer each row's new positions from rank-1 `state.seen_tokens` plus its
-  current valid-token cumulative sum;
-- obtain each full-attention layer's cache by layer index;
-- write returned cache into a new state;
-- increment each row of `seen_tokens` by its current valid-token count;
-- return new state as `output["decoder_state"]`.
+Write every full-attention layer candidate first. Only after all layers
+succeed, atomically create the new `DecoderPositionState` and advance seen
+counts. A layer exception returns no partial state.
 
-Also implement the typed `CacheCapableModel.prefill()` and `.decode()` methods
-from Task 1 as thin calls into this boundary. `prefill()` expands
-`ModelPrefillInputs` once; `decode()` accepts only the new token/mask and owned
-state. `decode()` first asserts all populated attention layers agree on their
-cached `key_valid_mask`, appends `current_attention_mask`, and supplies that
-complete mask to legacy `forward()`; callers never know media-prefix/cache
-lengths. Both normalize the existing mapping into `CausalLMOutput`. The
-legacy public `forward()` remains available for training and old callers, but
-the generation engine never passes arbitrary keyword mappings to it.
+- [ ] **Step 4: Enforce detached inference output**
 
-- [ ] **Step 4: Fail before compute on unsupported recurrent layers**
+Engine calls model only inside `torch.inference_mode()`. Adapters clone-detach
+candidate state before returning `CausalLMOutput`; all state tensors have no
+grad, and no old/caller/candidate storage aliases.
 
-If any layer is `deltanet` and `use_cache=True`, raise:
+- [ ] **Step 5: Add state and bounds tests**
 
-```text
-CacheCapabilityError: legacy DeltaNet has no validated recurrent cache;
-select a full-attention profile or use the explicit uncached fallback
-```
+Cover exact layer set, owner mismatch before attention, `Q=1/Q=3`, per-row
+padding, context boundary success and overflow failure, candidate exception,
+old-state fingerprint/pointer stability, cache-disabled legacy output keys,
+mixed-DeltaNet no-cache regression and TP parity.
 
-Do not reuse the vector output as a recurrent matrix state. Gradient
-checkpointing plus cache is invalid during training and must also fail early.
+- [ ] **Step 6: Enable capability only after protocol works**
 
-- [ ] **Step 5: Add state, mask, and training tests**
+The actual-layer scanner may report `incremental_decode_state=True` only when
+the concrete model implements the typed protocol and every layer is validated
+full MHA. All public streaming/beam/truncate/speculation values remain false.
 
-Cover:
-
-- cached/uncached logits and greedy parity;
-- chunks of size 1 and 3;
-- `attention_mask` includes past and new tokens;
-- wrong request ID fails before attention;
-- input state remains byte-for-byte unchanged;
-- cache disabled returns no state and preserves old output keys;
-- cache with labels during training raises a clear error;
-- unsupported DeltaNet cache raises exact capability error;
-- TP world size one produces the same next token.
-
-- [ ] **Step 6: Run tests and commit**
-
-Run:
+- [ ] **Step 7: Run and commit**
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 .venv-prototype/bin/python \
@@ -634,13 +549,11 @@ PYTHONDONTWRITEBYTECODE=1 .venv-prototype/bin/python \
   tests/runtime/test_thinker_cache.py \
   tests/runtime/test_attention_cache.py \
   tests/test_multimodal_attention_mask.py -q
-```
 
-Expected: all tests pass.
-
-```bash
-git add src/qwen3_omni_pretrain/models/qwen3_omni_moe/modeling_thinker_text.py \
+git add \
+  src/qwen3_omni_pretrain/models/qwen3_omni_moe/modeling_thinker_text.py \
   src/qwen3_omni_pretrain/models/qwen3_omni_moe/modeling_thinker_text_tp.py \
+  src/qwen3_omni_pretrain/runtime \
   tests/runtime/test_thinker_cache.py
 git commit -m "feat: propagate decoder cache through Thinker"
 ```
@@ -650,190 +563,125 @@ git commit -m "feat: propagate decoder cache through Thinker"
 ### Task 4: Encode legacy media only during prefill
 
 **Files:**
-- Modify: `src/qwen3_omni_pretrain/models/qwen3_omni_moe/modeling_thinker_vision_audio.py:68-123`
+
+- Modify: `src/qwen3_omni_pretrain/models/qwen3_omni_moe/modeling_thinker_vision_audio.py`
 - Create: `tests/runtime/test_multimodal_cache.py`
 - Modify: `tests/test_multimodal_attention_mask.py`
 
-**Interfaces:**
-- Consumes: `DecoderState.processed_media_cache` and cached Thinker.
-- Produces: prefill-only legacy media prefix and token-only decode.
+**Produces:** strict `LegacyMediaPrefillInputs`, fixed two-slot processed prefix,
+and raw-media-free decode.
 
-- [ ] **Step 1: Write a failing encoder-call-count test**
+- [ ] **Step 1: Write failing encoder call-count and phase tests**
 
-```python
-def test_media_encoders_run_once_across_prefill_and_decode(monkeypatch):
-    model = tiny_full_attention_multimodal_model().eval()
-    vision_calls = count_forward_calls(monkeypatch, model.vision_encoder)
-    audio_calls = count_forward_calls(monkeypatch, model.audio_encoder)
-    prefill = model(
-        input_ids=torch.tensor([[3, 4, 5]]),
-        attention_mask=torch.ones(1, 3, dtype=torch.long),
-        labels=None,
-        pixel_values=torch.zeros(1, 3, 224, 224),
-        audio_values=torch.zeros(1, 32_000),
-        has_image=torch.tensor([1]),
-        has_audio=torch.tensor([1]),
-        request_id="r1",
-        use_cache=True,
-    )
-    model(
-        input_ids=torch.tensor([[6]]),
-        attention_mask=torch.ones(1, 6, dtype=torch.long),
-        labels=None,
-        pixel_values=None,
-        audio_values=None,
-        has_image=None,
-        has_audio=None,
-        decoder_state=prefill["decoder_state"],
-        request_id="r1",
-        use_cache=True,
-    )
-    assert vision_calls.value == 1
-    assert audio_calls.value == 1
-```
+Cover absent/image/audio/both plus a mixed two-row batch. Present encoder count
+is exactly one per request; absent encoder count is zero. Supplied state, raw
+decode media, partial state or union contradiction all fail with both encoder
+counts still zero.
 
-- [ ] **Step 2: Run and observe required-media argument failure**
+- [ ] **Step 2: Validate the raw media union before encoder work**
 
-Run:
+Only `decoder_state is None` is prefill. Any supplied state is decode.
 
-```bash
-PYTHONDONTWRITEBYTECODE=1 .venv-prototype/bin/python \
-  -m pytest -p no:cacheprovider tests/runtime/test_multimodal_cache.py -q
-```
+`has_image`/`has_audio` must be same-device bool `[B]`. When any flag is true,
+the corresponding raw floating tensor is required with matching B/device and
+valid rank/dtype. When all flags are false, the corresponding tensor must be
+`None`. Mixed rows index-select only present items, call the encoder once and
+scatter results back into the fixed storage slot.
 
-Expected: FAIL because decode still requires media tensors.
+Direct legacy `forward()` may normalize the old 0/1 long flags and dummy absent
+tensors for backward compatibility; the typed protocol never accepts them.
 
-- [ ] **Step 3: Separate prefill and decode branches**
+- [ ] **Step 3: Separate prefill and decode**
 
-Add optional arguments:
+Prefill writes concrete `LegacyProcessedPrefix` with exactly two storage slots.
+Its key-valid mask follows media presence, while `LegacyPositionCursor` advances
+over both storage slots even if masked. Decode requires a complete prefix marker
+and accepts only new text input; it cannot receive or re-encode raw media.
 
-```python
-pixel_values: torch.Tensor | None = None
-audio_values: torch.Tensor | None = None
-has_image: torch.Tensor | None = None
-has_audio: torch.Tensor | None = None
-decoder_state: DecoderState | None = None
-request_id: str | None = None
-use_cache: bool = False
-```
+- [ ] **Step 4: Add parity and rejection tests**
 
-Rules:
+For every modality combination compare uncached full input with cached prefill
+plus decode (`max_abs <=1e-5`, token exact). Test wrong flag dtype/value,
+tensor/flag contradiction, wrong batch/device/dtype, raw decode media,
+empty/partial state, fixed slot positions and padding. All rejections precede
+vision/audio/text encoder calls.
 
-- empty/no state is prefill and may encode media;
-- non-empty state is decode and rejects newly supplied media;
-- prefill writes a small immutable marker under
-  `processed_media_cache["legacy-prefix"]`;
-- decode passes only new text embedding to Thinker;
-- key-side mask covers cached prefix plus all text tokens;
-- labels are allowed only in uncached training.
-
-The new typed `prefill()` reads raw tensors only from
-`ModelPrefillInputs.media: LegacyMediaPrefillInputs`; `decode()` has no such
-field and therefore cannot accidentally re-encode media. Keep direct
-`forward()` coverage as a legacy regression, and add protocol-level tests used
-by `GreedyPrefillDecodeEngine`.
-
-- [ ] **Step 4: Test absent, image-only, audio-only, and both media**
-
-For each case compare the last-token logits of:
-
-- full uncached input;
-- cached prefill plus one-token decode.
-
-Assert FP32 max error `<=1e-5`, exact greedy token equality, one encoder call
-per present modality, zero calls for absent modality, and state ownership.
-
-- [ ] **Step 5: Run tests and commit**
-
-Run:
+- [ ] **Step 5: Run and commit**
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 .venv-prototype/bin/python \
   -m pytest -p no:cacheprovider \
   tests/runtime/test_multimodal_cache.py \
   tests/test_multimodal_attention_mask.py -q
-```
 
-Expected: all selected tests pass.
-
-```bash
 git add \
   src/qwen3_omni_pretrain/models/qwen3_omni_moe/modeling_thinker_vision_audio.py \
   tests/runtime/test_multimodal_cache.py \
   tests/test_multimodal_attention_mask.py
-git commit -m "feat: cache multimodal prefill state"
+git commit -m "feat: cache legacy multimodal prefill state"
 ```
 
 ---
 
-### Task 5: Use a correctness-gated prefill/decode engine in the CLI
+### Task 5: Add a legacy-only pending-token greedy engine and CLI wiring
 
 **Files:**
+
 - Create: `src/qwen3_omni_pretrain/runtime/generation.py`
-- Modify: `src/qwen3_omni_pretrain/cli_infer_thinker.py:192-336`
-- Create: `scripts/benchmark_decode_cache.py`
-- Create: `configs/model/legacy_full_attention_tiny.yaml`
+- Modify: `src/qwen3_omni_pretrain/runtime/__init__.py`
+- Modify: `src/qwen3_omni_pretrain/cli_infer_thinker.py`
+- Modify: `src/qwen3_omni_pretrain/architecture/summary.py`
+- Modify: legacy profile factory/capability tests
 - Create: `tests/runtime/test_generation_engine.py`
 - Modify: `tests/test_stage2_inference.py`
+- Modify: `tests/test_cli_profile.py`
 - Modify: `README.md`
 
-**Interfaces:**
-- Consumes: `CacheCapableModel`, tokenizer, typed `ModelPrefillInputs`, and
-  `DecoderState`.
-- Produces: `GenerationRequest`, `GenerationStep`, `GenerationResult`, and `GreedyPrefillDecodeEngine`.
+**Produces:** `GenerationRequest`, `GenerationCheckpoint`, internal
+`GenerationStep`, `GenerationResult`, `CancellationToken`, and
+`LegacyGreedyPrefillDecodeEngine`.
 
-- [ ] **Step 1: Write a failing engine parity test**
+- [ ] **Step 1: Write failing pending-token and resume tests**
 
-```python
-def test_engine_matches_uncached_greedy_tokens():
-    model = tiny_full_attention_thinker().eval()
-    tokenizer = TinyTokenizer()
-    request = GenerationRequest(
-        request_id="r1",
-        prefill_inputs=ModelPrefillInputs(
-            input_ids=torch.tensor([[3, 4, 5]]),
-            inputs_embeds=None,
-            attention_mask=torch.ones(1, 3, dtype=torch.long),
-            position_ids=None,
-        ),
-        max_new_tokens=4,
-        eos_token_id=2,
-    )
-    cached = GreedyPrefillDecodeEngine(model).generate(request)
-    uncached = uncached_greedy(model, request)
-    assert torch.equal(cached.generated_ids, uncached.generated_ids)
-    assert cached.prefill_calls == 1
-    assert cached.decode_calls <= 4
+The single invariant is:
+
+```text
+checkpoint.decoder_state caches prompt + generated_ids[:-1]
+if generated_ids is non-empty:
+    checkpoint.pending_token_id == generated_ids[-1:]
+else:
+    checkpoint.pending_token_id is None
 ```
 
-- [ ] **Step 2: Run and observe missing engine failure**
+Generate at least three tokens and assert exactly one prefill plus
+`generated_count - 1` decodes; each decode consumes only the previous pending
+token. Test pause after every step, resume from the prior `GenerationResult`,
+and exact parity with uninterrupted generation.
 
-Run:
-
-```bash
-PYTHONDONTWRITEBYTECODE=1 .venv-prototype/bin/python \
-  -m pytest -p no:cacheprovider tests/runtime/test_generation_engine.py -q
-```
-
-Expected: FAIL at import.
-
-- [ ] **Step 3: Implement prefill and token-only decode**
+- [ ] **Step 2: Implement strict request/checkpoint values**
 
 ```python
 @dataclass(frozen=True)
 class GenerationRequest:
-    request_id: str
+    display_request_id: str
     prefill_inputs: ModelPrefillInputs
     max_new_tokens: int
     eos_token_id: int | None
-    cancellation: "CancellationToken | None" = None
+    num_beams: int = 1
+    cancellation: CancellationToken | None = None
+
+
+@dataclass(frozen=True)
+class GenerationCheckpoint:
+    decoder_state: DecoderState
+    pending_token_id: torch.LongTensor | None
 
 
 @dataclass(frozen=True)
 class GenerationStep:
-    next_token_id: torch.LongTensor
-    next_token_logits: torch.Tensor
-    decoder_state: DecoderState
+    emitted_token_id: torch.LongTensor
+    emitted_index: int
+    checkpoint: GenerationCheckpoint
     finished: torch.BoolTensor
 
 
@@ -841,141 +689,152 @@ class GenerationStep:
 class GenerationResult:
     prompt_ids: torch.LongTensor
     generated_ids: torch.LongTensor
-    decoder_state: DecoderState
+    checkpoint: GenerationCheckpoint
     finish_reason: Literal["eos", "length", "cancelled"]
     prefill_calls: int
     decode_calls: int
-
-
-class CancellationToken:
-    def __init__(self) -> None:
-        self._event = threading.Event()
-
-    def cancel(self) -> None:
-        self._event.set()
-
-    @property
-    def cancelled(self) -> bool:
-        return self._event.is_set()
-
-
-class GreedyPrefillDecodeEngine:
-    def prefill(self, request: GenerationRequest) -> GenerationStep:
-        ...
-
-    def decode_step(
-        self,
-        *,
-        token_id: torch.LongTensor,
-        attention_mask: torch.Tensor,
-        state: DecoderState,
-    ) -> GenerationStep:
-        ...
-
-    def generate(self, request: GenerationRequest) -> GenerationResult:
-        ...
 ```
 
-Prefill sends the full prompt and media once. Every decode call sends only the
-previous token and the returned state. The engine owns no global state; the
-caller owns each returned immutable state.
+Strictly reject bool/non-integer/`<=0` length or beams and all
+`num_beams != 1` before tokenizer/model/media. The engine requires batch one,
+input IDs, at least one valid token and a valid final query slot; it rejects a
+right-padded prompt instead of sampling `logits[:, -1]` from padding. Tokenizer
+stays in the CLI adapter, not the engine.
 
-Validate all request/result shapes, non-empty unique request ID, positive
-length and ownership before model compute. This first greedy engine explicitly
-requires `prefill_inputs.input_ids` and batch size one; callers with batched
-prompts must submit independent requests. This makes the single
-`finish_reason` unambiguous while the underlying cache remains batch-aware.
-Check the request-local
-`CancellationToken` before prefill and between committed decode steps. On
-cancellation, return only committed tokens/state with
-`finish_reason="cancelled"`; never mutate the input state or another request.
-If cancellation is already set before prefill, return an empty
-`generated_ids`, `prefill_calls=decode_calls=0`, and
-`DecoderState.empty(request_id, batch_size=1, device=input_ids.device)`; a
-result never carries a null state.
-Add a two-request test that cancels one after its first decode while the other
-reaches EOS unchanged.
+Every fresh generation creates `StateOwner.fresh(display_request_id)`. Explicit
+resume accepts a prior `GenerationResult`, reuses that exact owner and validates
+the pending invariant; a fresh same-name session gets a different nonce.
 
-- [ ] **Step 4: Add an explicit uncached fallback**
+- [ ] **Step 3: Implement candidate/commit ordering**
 
-`CacheCapabilityError` is handled only when the CLI flag
-`--allow-uncached-fallback` is present. Emit one JSON warning containing:
+Prefill caches the prompt, samples the first emitted token and stores it as
+pending without decoding it. Each later call consumes exactly the old pending
+token, obtains a candidate state, samples the next pending token, then commits.
 
-```json
-{
-  "cache_fallback": {
-    "profile": "legacy_prototype",
-    "reason": "legacy DeltaNet has no validated recurrent cache",
-    "semantic_change": false
-  }
-}
-```
+After every model call, check in this order:
 
-Without the flag, fail before generation. The fallback calls the existing
-uncached loop and never claims cache performance.
+1. model exception/result contract;
+2. cancellation;
+3. owner;
+4. candidate commit and token emission.
 
-- [ ] **Step 5: Add the benchmark script**
+Post-call cancellation wins over commit/emit. Without cancellation, EOS wins
+over length; emitted EOS remains the pending last token. Attempt counters include
+post-call-cancelled calls, while checkpoint state remains the previous committed
+snapshot.
 
-Command:
+Pre-cancel performs zero model calls and returns empty generated IDs with an
+owned empty checkpoint. In-flight cancel or exception exposes the latest
+committed checkpoint, never a partial candidate. This plan has no iterator;
+`GenerationStep` is an internal test value and `streaming_generation=false`.
 
-```bash
-PYTHONPATH=src .venv-prototype/bin/python \
-  scripts/benchmark_decode_cache.py \
-  --model-config configs/model/legacy_full_attention_tiny.yaml \
-  --prompt-lengths 128 512 2048 4096 \
-  --output-lengths 32 128 \
-  --dtype float32 \
-  --device cpu \
-  --output results/cache-benchmark.json
-```
+- [ ] **Step 4: Wire both CLI paths by actual protocol/capability**
 
-Before timing, the script runs one cached/uncached parity case and aborts on
-error above `1e-5` or token mismatch. JSON records manifest, commit, device,
-dtype, lengths, prefill latency, decode tokens/s, peak memory, cache bytes, and
-fallback status.
+Update current Stage1 and Stage2 loops, not only a shared-looking helper. Add
+`--num-beams` and `--allow-uncached-fallback`, and update every handwritten
+`argparse.Namespace` fixture.
 
-The checked-in benchmark config is a small valid legacy config with
-`use_deltanet: false`, empty DeltaNet indices and full attention in every
-layer. Do not use comment-only `configs/model/thinker_text.yaml`, which parses
-to `None`, or silently override one of the existing hybrid configs.
+Selection uses concrete model protocol plus full actual-layer scan. It never
+uses summary `cache_type` text:
 
-- [ ] **Step 6: Run engine, CLI, and full tests**
+- standard all-MHA and validated TP use the cache engine;
+- explicit/implicit DeltaNet without fallback raises pre-compute
+  `DELTA_NET_UNSUPPORTED`;
+- with fallback, call the existing uncached loop and emit exactly one JSON
+  warning per request containing stable `code`, `profile`, display ID, `reason`
+  and `semantic_change: false`.
 
-Run:
+Stage2 media is passed only during prefill. A protocol fake must fail if decode
+receives raw media, full token history or wrong owner.
+
+- [ ] **Step 5: Publish truthful profile capability**
+
+`incremental_decode_state` is true only when the built concrete model exposes
+the protocol and the all-layer scan succeeds. `streaming_generation`,
+`beam_search`, `state_truncate`, and `speculative_decode` remain false.
+
+Fix legacy requested-capability handling: append to `unsupported` only when
+`capabilities.get(name) is not True`, rather than unconditionally. Do not claim
+Qwen3/Qwen3.5/MiMo native runtime support.
+
+- [ ] **Step 6: Add engine, cancellation and CLI proof**
+
+Cover prefill-EOS, `max_new_tokens=1`, EOS/length precedence, every-step resume,
+same display/fresh nonce, pre-set/prefill-in-flight/decode-in-flight/post-call
+cancellation, prefill/decode exception, snapshot fingerprints, context boundary,
+Stage1/Stage2 cache invocation, media once, fallback flag on/off, exact-one
+warning and implicit DeltaNet.
+
+- [ ] **Step 7: Run and commit**
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 .venv-prototype/bin/python \
   -m pytest -p no:cacheprovider \
   tests/runtime/test_generation_engine.py \
-  tests/test_stage2_inference.py -q
+  tests/test_stage2_inference.py tests/test_cli_profile.py -q
 
-PYTHONDONTWRITEBYTECODE=1 .venv-prototype/bin/python \
-  -m pytest -p no:cacheprovider -q
-```
-
-Expected: all tests pass.
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add src/qwen3_omni_pretrain/runtime/generation.py \
+git add \
+  src/qwen3_omni_pretrain/runtime \
   src/qwen3_omni_pretrain/cli_infer_thinker.py \
-  scripts/benchmark_decode_cache.py \
-  configs/model/legacy_full_attention_tiny.yaml \
+  src/qwen3_omni_pretrain/architecture/summary.py \
   tests/runtime/test_generation_engine.py \
-  tests/test_stage2_inference.py README.md
-git commit -m "feat: decode with request-owned cache"
+  tests/test_stage2_inference.py tests/test_cli_profile.py README.md
+git commit -m "feat: decode legacy requests with owned cache"
 ```
 
 ---
 
-## Plan completion gate
+### Task 6: Add correctness-gated cache benchmark and completion gates
 
-Run:
+**Files:**
+
+- Create: `scripts/benchmark_decode_cache.py`
+- Create: `configs/model/legacy_full_attention_tiny.yaml`
+- Create: `tests/runtime/test_benchmark_decode_cache.py`
+- Modify: `README.md`
+
+- [ ] **Step 1: Write a failing deterministic benchmark smoke test**
+
+Run prompt length 8, output length 3, warmup 1 and repetitions 2. Validate the
+complete JSON schema and require parity failure to happen before any timing.
+
+- [ ] **Step 2: Implement benchmark truthfully**
+
+Before timing, calculate:
+
+```python
+max_abs = (cached.float() - uncached.float()).abs().max().item()
+assert max_abs <= 1e-5
+assert torch.equal(cached_tokens, uncached_tokens)
+```
+
+JSON contains at least:
+
+- architecture manifest and implementation commit;
+- random seed and actual prompt/output lengths;
+- dtype/device and synchronization method;
+- warmup/repetition counts and raw latency samples;
+- aggregate latency and tokens/second;
+- peak memory;
+- logical cache bytes and best-effort unique allocated bytes by partition;
+- `max_abs`, token-exact flag, fallback status and stable fallback code.
+
+Use a checked-in valid all-MHA tiny config. Do not silently rewrite a hybrid
+config. Longer 128/512/2048/4096 runs are optional performance jobs; the tiny
+smoke is mandatory CI.
+
+- [ ] **Step 3: Run focused, distributed and full gates**
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 .venv-prototype/bin/python \
   -m pytest -p no:cacheprovider tests/runtime -q
+
+PYTHONDONTWRITEBYTECODE=1 .venv-prototype/bin/python \
+  -m pytest -p no:cacheprovider \
+  tests/test_stage2_inference.py \
+  tests/test_cli_profile.py \
+  tests/test_tp_moe.py \
+  tests/test_multimodal_attention_mask.py -q
 
 PYTHONDONTWRITEBYTECODE=1 .venv-prototype/bin/python \
   -m pytest -p no:cacheprovider -q
@@ -987,15 +846,32 @@ git diff --check
 git status --short
 ```
 
-The plan is complete only when:
+The 2-rank CPU Gloo gate is mandatory whenever `torch.distributed` is present;
+it cannot silently degrade to world size one.
 
-- FP32 cached/uncached logits differ by at most `1e-5`;
-- greedy tokens are identical;
-- input state remains unchanged after every forward;
-- request ownership and cancellation isolation are tested;
-- media encoders execute once per request;
-- single-token decode does not materialize a total-length square mask;
-- unsupported DeltaNet cache is explicit and never mislabeled;
-- benchmark output records cache bytes, correctness and fallback metadata;
-- full prototype tests and compileall pass;
-- all changes are intentional and committed.
+- [ ] **Step 4: Completion checklist**
+
+The plan is technically complete only when all are proven:
+
+- typed `PositionBatch` prefill/state/decode round-trip and strict legacy
+  position adapter;
+- explicit/implicit DeltaNet fails before compute;
+- nonce owner isolation across same display IDs;
+- clone-detached non-aliasing state and cancellation/exception isolation;
+- exact missing/extra cache-layer rejection;
+- one model-level rectangular bias and no decode square allocation;
+- pending-token checkpoint resume parity;
+- `num_beams != 1` and generic truncate/speculation rejection;
+- legacy media encoder once for present modalities and zero for absent ones;
+- 2-rank TP local-shard parity;
+- direct FP32 `max_abs <=1e-5` plus exact greedy token;
+- benchmark JSON smoke, full tests, compileall and diff checks pass.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add scripts/benchmark_decode_cache.py \
+  configs/model/legacy_full_attention_tiny.yaml \
+  tests/runtime/test_benchmark_decode_cache.py README.md
+git commit -m "perf: gate incremental decode cache benchmark"
+```
