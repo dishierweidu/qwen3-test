@@ -4,6 +4,11 @@
 
 **Goal:** 将公开 Qwen3.5 Hybrid-MoE backbone 与论文披露的 6.25 Hz AuT、显式 timestamp、TM-RoPE、ARIA 以及前代 codec proxy 组合成可测试的 `qwen35_omni_inspired` 原型。
 
+**Implementation status (2026-08-01):** Complete and regression-tested. Per
+the final delivery instruction, the task-level commit commands below are
+historical execution notes; all changes are delivered in one consolidated
+commit.
+
 **Architecture:** 文本 backbone 直接采用固定 Transformers 5.2.0 的公开 Qwen3.5 MoE 实现，公共 cache adapter 将其 full-attention KV、GDN convolution 和 rank-4 recurrent matrix state 转换为 `DecoderState`；由于公开 native cache 使用 batch-shared cache position，cached batch 只接受等长且无 padding 的行，异构长度在 adapter 外分桶或逐行执行。媒体和时间使用公共 `MediaSequence`/assembler/position contracts，AuT Transformer 明确是 offline-only。Talker 是独立 paper-inspired Hybrid-MoE 组件，ARIA 是无需预知未来长度、按固定整数速率目标与双 EOS 推进的在线状态机，MTP/Code2Wav 参数明确来自 Qwen3-Omni predecessor proxy。
 
 **Tech Stack:** Python 3.10, PyTorch 2.10.0, TorchAudio 2.10.0, Transformers 5.2.0 `qwen3_5_moe`, qwen-omni-utils 0.0.9 for predecessor processing, pytest, Hypothesis-free deterministic property tests.

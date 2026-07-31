@@ -4,22 +4,23 @@ Research implementation of a Qwen3-Omni-style pretraining pipeline.
 
 ## Project status
 
-The current repository contains a custom Thinker, MoE experiments, distributed
-training utilities, a legacy Stage-2 image/audio adapter, and an experimental
-sequence-preserving multimodal prefill layer. It is **not yet an
-architecture-faithful reproduction of the official Qwen3-Omni model**:
+The repository now contains the legacy custom Thinker, the structure-aligned
+Qwen3 reference path, a complete paper-inspired Qwen3.5-Omni runtime, and an
+isolated MiMo-style tiny mechanism runtime. It is **not an exact reproduction
+of any unavailable Qwen3.5-Omni checkpoint or an official MiMo checkpoint**:
 
 - the unchanged legacy Stage-2 path still maps each image/audio item to one
   token;
 - the reusable experimental path now has strict image, video, and audio
   sequence encoders, sequence assembly, Qwen3-disjoint positions, and an
   experimental TM-RoPE builder, but is not yet wired into the legacy Thinker;
-- Talker and Code2Wav are configuration placeholders;
+- the Qwen3.5-inspired Talker, ARIA and Code2Wav path is a trainable/procedural
+  prototype whose codec is explicitly a predecessor proxy;
 - the experimental DeltaNet block is not an official Qwen3.5-Omni
   implementation.
 
-The P0 correctness work in this branch stabilizes the existing baseline before
-those modules are replaced.
+The P0 correctness work in this branch remains the shared foundation beneath
+the isolated Qwen3.5-inspired and MiMo-style mechanism profiles.
 
 The architecture review and implementation roadmaps are checked in as:
 
@@ -37,14 +38,15 @@ checkpoint-compatible with an official model.
 | Profile | Status | Compatibility | Exact official checkpoint compatibility |
 | --- | --- | --- | --- |
 | `legacy_prototype` | Implemented local Thinker | `legacy-prototype` | No |
-| `qwen3_omni_reference` | Pinned oracle/config implemented; runtime pending | `structure-aligned` | No |
-| `qwen35_omni_inspired` | Planned | `paper-inspired` | No |
-| `mimo_v25_experimental` | Planned | `MiMo-style-experiment` | No |
+| `qwen3_omni_reference` | Pinned structure/runtime adapter | `structure-aligned` | No |
+| `qwen35_omni_inspired` | Public-backbone paper prototype | `paper-inspired` | No |
+| `mimo_v25_experimental` | Tiny SWA/MoE/MTP/EP experiment | `MiMo-style-experiment` | No |
 
-Qwen3.5-inspired work always remains non-exact unless a separate official
-profile is introduced. The MiMo-style experiment does not claim an official
-MiMo model type, repository identity, or checkpoint format. Planned profiles
-are deliberately absent from the registry until they have real factories.
+Qwen3.5-inspired work remains non-exact unless a separate official profile is
+introduced. The MiMo-style experiment does not claim an official MiMo model
+type, repository identity, or checkpoint format. Both profiles have real lazy
+factories and machine-readable manifests; their compatibility labels are a
+hard boundary, not a quality claim.
 
 New legacy saves use the non-colliding model type
 `qwen3_omni_prototype`. Old saves that used `qwen3_omni_moe` are accepted only
@@ -171,6 +173,51 @@ dependencies does not make this custom implementation checkpoint-compatible
 with official Qwen3-Omni models; the architectures and state dictionaries
 remain different.
 
+### Qwen3.5-inspired backbone profile
+
+The Qwen3.5-inspired runtime requires the exact Torch family and Transformers
+5.2.0 boundary recorded in `constraints/qwen35-backbone-py310.txt`. It can
+reuse an already verified Qwen reference environment with those exact
+distributions, or be installed in the separately ignored
+`.venv-qwen35-backbone` environment:
+
+```bash
+python3.10 -m venv .venv-qwen35-backbone
+.venv-qwen35-backbone/bin/python -m pip install \
+  -r requirements-qwen35-backbone.txt
+
+PYTHONDONTWRITEBYTECODE=1 .venv-qwen35-backbone/bin/python \
+  -m pytest -p no:cacheprovider tests/qwen35 \
+  tests/oracle/test_qwen35_public_config.py \
+  tests/oracle/test_qwen35_gdn_oracle.py -q
+```
+
+The factory consumes a serialized `Qwen35InspiredConfig`. It binds the public
+Qwen3.5-35B-A3B revision, keeps full KV plus GDN convolution/matrix state,
+uses the 6.25 Hz offline AuT prototype and 160 ms timestamp policy, and builds
+ARIA/Talker plus a mandatory predecessor-codec proxy. It deliberately reports
+`streaming_audio_encoder=false`.
+
+The checked-in tiny mechanism config can be validated in either environment
+without allocating a model, and inspected from the prototype environment even
+though that environment intentionally lacks Transformers 5.2.0:
+
+```bash
+.venv-prototype/bin/python -m qwen3_omni_pretrain.cli_profile validate \
+  --profile qwen35_omni_inspired \
+  --config-or-checkpoint configs/model/qwen35_omni_inspired_tiny.yaml
+
+.venv-prototype/bin/python -m qwen3_omni_pretrain.cli_profile inspect \
+  --profile qwen35_omni_inspired \
+  --config-or-checkpoint configs/model/qwen35_omni_inspired_tiny.yaml \
+  --json
+```
+
+Inspection returns an allocation-free config contract with zero parameter
+counts and `allocation_free_inspection=true`; its capability flags describe
+the buildable profile. Constructing the executable runtime still requires the
+pinned Qwen3.5 environment.
+
 ### ABI troubleshooting
 
 An error such as `undefined symbol` while loading `libtorchaudio.so` means the
@@ -187,6 +234,62 @@ sequence assembly and positions, multimodal prefill orchestration, MoE routing
 scale, numerical fail-fast behavior, and parameter statistics. Run the
 profile-specific commands above so test collection uses the intended
 dependency set.
+
+The MiMo-style mechanism suite and its two-rank EP smoke test run with the
+prototype environment:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 .venv-prototype/bin/python \
+  -m pytest -p no:cacheprovider tests/hybrid_swa_moe tests/evaluation \
+  tests/distributed/test_expert_parallel.py -q
+
+PYTHONDONTWRITEBYTECODE=1 .venv-prototype/bin/torchrun \
+  --standalone --nproc-per-node=2 \
+  tests/distributed/run_expert_parallel_smoke.py
+```
+
+## MiMo-style mechanism experiments
+
+`configs/model/hybrid_swa_moe_tiny.yaml` is a generic six-layer experiment:
+five SWA layers and one full-attention layer, layer-0 dense SwiGLU, five
+routed-only 8-expert/top-2 layers, a strict 128-token per-row SWA cache,
+attention sink, one next-2 MTP head, corrected speculative verification, and
+optional two-rank expert parallelism. It does not load `mimo_v2` weights or
+claim 310B/1.02T-scale behavior.
+
+All new benchmarks emit a validated `ExperimentReport` only after correctness
+gates pass. Every supplied prompt/output/sequence/draft/batch value is measured
+as a distinct report row; plural CLI arguments are not sampling hints:
+
+```bash
+.venv-prototype/bin/python scripts/benchmark_hybrid_attention.py \
+  --config configs/model/hybrid_swa_moe_tiny.yaml \
+  --attention-modes full swa --prompt-lengths 128 \
+  --output-lengths 32 \
+  --dtype float32 --device cpu
+
+.venv-prototype/bin/python scripts/benchmark_moe.py \
+  --config configs/model/hybrid_swa_moe_tiny.yaml \
+  --experts 8 --top-k 2 --sequence-lengths 128
+
+.venv-prototype/bin/python scripts/benchmark_mtp.py \
+  --config configs/model/hybrid_swa_moe_tiny.yaml \
+  --prompt-sources natural random --draft-lengths 1 3 --batch-sizes 1
+
+.venv-prototype/bin/python scripts/benchmark_legacy_deltanet.py \
+  --config configs/model/legacy_deltanet_tiny_benchmark.yaml \
+  --sequence-lengths 128 --dtype float32 --device cpu
+```
+
+The ordinary full/SWA rows have different KV projection shapes, and the
+legacy DeltaNet row uses another class with independently initialized weights;
+both are absolute engineering baselines. Only a separate attention run with
+`--paired-kv-heads 4` copies an exact name/shape parameter inventory and may be
+interpreted as a tied-weight mechanism ablation. These reports are not MiMo
+quality, checkpoint, or production-speed reproductions. The MTP field named
+`end_to_end_speedup` is explicitly dimensioned as
+`verification-only-synthetic` with `real_end_to_end_claim=false`; it is an
+overhead sanity check, not a model-serving speed claim.
 
 ## Stage-2 media behavior
 
@@ -361,9 +464,11 @@ repository code; these are independent opt-ins.
 
 ## Next architecture milestones
 
-1. Integrate the sequence-preserving prefill layer with explicit experimental
-   profile runtimes using the typed decoder/cache contracts.
-2. Establish an official-structure-compatible Thinker baseline.
-3. Implement Talker, codec MTP, Code2Wav, and their typed state partitions.
-4. Evaluate Qwen3.5-style Hybrid Attention/ARIA and MiMo-style SWA/GA as
-   separate experimental branches.
+1. Extend the sequence-preserving prefill layer from the Qwen3.5-inspired
+   runtime into the remaining text-only MiMo training and evaluation flows.
+2. Replace paper-inspired media and predecessor-codec proxies only when exact
+   official Qwen3.5-Omni artifacts become available.
+3. Scale MiMo-style context, experts, and MTP depth only after correctness-
+   gated quality, memory, and end-to-end speed reports justify each change.
+4. Add production paging, encoder cache, DeepEP, and serving schedulers without
+   weakening the profile identity or checkpoint-compatibility boundaries.

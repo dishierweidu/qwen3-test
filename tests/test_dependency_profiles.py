@@ -27,3 +27,22 @@ def test_reference_profile_is_separate_and_qwen_capable():
     assert pins["torchaudio"] == "2.10.0"
     assert pins["transformers"] == "5.2.0"
     assert pins["qwen-omni-utils"] == "0.0.9"
+
+
+def test_qwen35_backbone_profile_is_separate_and_exactly_pinned():
+    pins = _pins("constraints/qwen35-backbone-py310.txt")
+    assert pins == {
+        "torch": "2.10.0",
+        "torchvision": "0.25.0",
+        "torchaudio": "2.10.0",
+        "transformers": "5.2.0",
+        "qwen-omni-utils": "0.0.9",
+    }
+    requirements = Path("requirements-qwen35-backbone.txt").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert requirements == [
+        "-r requirements.txt",
+        "-c constraints/qwen35-backbone-py310.txt",
+        "qwen-omni-utils==0.0.9",
+    ]

@@ -670,17 +670,20 @@ def test_reference_factory_rejects_custom_processor_source():
 
 
 @pytest.mark.parametrize(
-    "profile",
+    ("profile", "factory_name"),
     [
-        ArchitectureProfile.QWEN35_OMNI_INSPIRED,
-        ArchitectureProfile.MIMO_V25_EXPERIMENTAL,
+        (
+            ArchitectureProfile.QWEN35_OMNI_INSPIRED,
+            "Qwen35InspiredFactory",
+        ),
+        (
+            ArchitectureProfile.MIMO_V25_EXPERIMENTAL,
+            "MimoV25ExperimentalFactory",
+        ),
     ],
 )
-def test_planned_profiles_are_not_registered_to_nonexistent_factories(
-    profile,
-):
-    with pytest.raises(ValueError, match="is not registered"):
-        get_profile_factory(profile)
+def test_completed_profiles_are_registered_lazily(profile, factory_name):
+    assert type(get_profile_factory(profile)).__name__ == factory_name
 
 
 def test_unknown_profile_fails_before_model_construction():

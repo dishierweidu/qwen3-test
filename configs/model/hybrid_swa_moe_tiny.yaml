@@ -1,0 +1,32 @@
+model_type: hybrid_swa_moe_experimental
+architecture_profile: mimo_v25_experimental
+vocab_size: 256
+hidden_size: 128
+num_hidden_layers: 6
+num_attention_heads: 8
+full_num_key_value_heads: 2
+swa_num_key_value_heads: 4
+qk_head_dim: 24
+v_head_dim: 16
+rotary_dim: 8
+attention_layer_types: [swa, swa, swa, swa, swa, full]
+ffn_layer_types: [dense, routed_moe, routed_moe, routed_moe, routed_moe, routed_moe]
+swa_window_size: 128
+full_rope_theta: 10000000.0
+swa_rope_theta: 10000.0
+attention_sink: true
+value_scale: null
+num_experts: 8
+num_experts_per_token: 2
+expert_intermediate_size: 128
+dense_intermediate_size: 512
+router_aux_loss_weight: 0.01
+mtp_num_predictors: 1
+mtp_loss_weight: 0.1
+rms_norm_eps: 0.000001
+initializer_range: 0.02
+max_position_embeddings: 4096
+bos_token_id: 1
+eos_token_id: 2
+pad_token_id: 0
+tie_word_embeddings: false

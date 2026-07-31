@@ -2,6 +2,7 @@ import torch
 
 from qwen3_omni_pretrain.models.qwen3_omni_moe.modules.moe import Qwen3OmniMoeMLP
 from qwen3_omni_pretrain.utils.model_stats import collect_parameter_stats
+from qwen3_omni_pretrain.models.hybrid_swa_moe.moe import RoutedSwiGLUMoE
 
 
 class ToyModel(torch.nn.Module):
@@ -35,3 +36,22 @@ def test_parameter_stats_count_unique_total_and_active_moe_parameters():
     assert stats.dense_parameters == dense + gate
     assert stats.routed_modules == 1
     assert stats.is_estimate is True
+
+
+def test_parameter_stats_use_routed_parameter_protocol_for_hybrid_moe():
+    model = torch.nn.Sequential(
+        torch.nn.Linear(4, 4, bias=False),
+        RoutedSwiGLUMoE(
+            hidden_size=4,
+            intermediate_size=8,
+            num_experts=4,
+            num_experts_per_token=2,
+        ),
+    )
+    stats = collect_parameter_stats(model)
+    one_expert = (4 * 8) + (4 * 8) + (8 * 4)
+
+    assert stats.routed_modules == 1
+    assert stats.routed_parameters == 4 * one_expert
+    assert stats.total_parameters > stats.estimated_active_parameters_per_token
+    assert stats.dense_parameters == stats.total_parameters - 4 * one_expert

@@ -275,6 +275,17 @@ class ArchitectureSummary:
 
 def _describe_attention(module: torch.nn.Module) -> tuple[str, str]:
     class_name = type(module).__name__
+    declared_type = getattr(module, "attention_type", None)
+    declared_cache = getattr(module, "cache_type", None)
+    if declared_type in {"full", "swa"} and isinstance(
+        declared_cache, str
+    ):
+        return (
+            "full-attention"
+            if declared_type == "full"
+            else "sliding-window-attention",
+            declared_cache,
+        )
     if class_name == "GatedDeltaNetAttention":
         return "gated-deltanet", "recurrent-state"
     if class_name in {
@@ -291,6 +302,25 @@ def _describe_layer(
 ) -> LayerArchitecture:
     attention_type, cache_type = _describe_attention(layer.self_attn)
     moe = getattr(layer, "moe_mlp", None)
+    hybrid_ffn = getattr(layer, "ffn", None)
+    if (
+        moe is None
+        and callable(getattr(hybrid_ffn, "expert_parameter_groups", None))
+    ):
+        moe = hybrid_ffn
+        routed_experts = int(moe.num_experts)
+        experts_value = getattr(moe, "num_experts_per_token", None)
+        if experts_value is None:
+            experts_value = getattr(moe, "num_experts_per_tok")
+        experts_per_token = int(experts_value)
+        return LayerArchitecture(
+            index=index,
+            attention_type=attention_type,
+            cache_type=cache_type,
+            ffn_type="routed-moe-only",
+            routed_experts=routed_experts,
+            experts_per_token=experts_per_token,
+        )
     if moe is None:
         ffn_type = "dense"
         routed_experts = 0
@@ -351,6 +381,17 @@ def summarize_model(
         and callable(getattr(cache_support, "as_dict", None))
         else {}
     )
+    architecture_capabilities = getattr(
+        model, "architecture_capabilities", {}
+    )
+    if not isinstance(architecture_capabilities, Mapping) or any(
+        not isinstance(key, str) or type(value) is not bool
+        for key, value in architecture_capabilities.items()
+    ):
+        raise TypeError(
+            "architecture_capabilities must map strings to booleans"
+        )
+    capabilities.update(architecture_capabilities)
     return ArchitectureSummary(
         profile=manifest.architecture_profile.value,
         compatibility_level=manifest.compatibility_level.value,

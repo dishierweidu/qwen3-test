@@ -22,6 +22,7 @@ Thumbs.db
 venv/
 .venv-prototype/
 .venv-qwen-reference/
+.venv-qwen35-backbone/
 __pycache__/
 
 # Dataset files

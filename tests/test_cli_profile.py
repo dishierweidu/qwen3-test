@@ -453,7 +453,7 @@ def test_checked_in_legacy_inspect_example_executes_offline():
     )
 
 
-def test_cli_rejects_planned_profile_without_factory(capsys):
+def test_cli_routes_completed_qwen35_profile_to_factory(capsys):
     with pytest.raises(SystemExit) as raised:
         cli_profile.main(
             [
@@ -466,4 +466,49 @@ def test_cli_rejects_planned_profile_without_factory(capsys):
         )
 
     assert raised.value.code == 2
-    assert "is not registered" in capsys.readouterr().err
+    assert "Qwen3.5-inspired config does not exist" in capsys.readouterr().err
+
+
+def test_qwen35_inspection_uses_allocation_free_config_contract(capsys):
+    result = cli_profile.main(
+        [
+            "inspect",
+            "--profile",
+            "qwen35_omni_inspired",
+            "--config-or-checkpoint",
+            "configs/model/qwen35_omni_inspired_tiny.yaml",
+            "--capability",
+            "speech_talker",
+            "--json",
+        ]
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    summary = output["architecture_summary"]
+    assert result == 0
+    assert output["artifact_type"] == "Qwen35ConfigArtifact"
+    assert summary["model_type"] == "qwen35_omni_inspired"
+    assert summary["total_parameters"] == 0
+    assert summary["capabilities"]["model_runtime"] is True
+    assert summary["capabilities"]["speech_talker"] is True
+    assert summary["capabilities"]["allocation_free_inspection"] is True
+    assert summary["unsupported_capabilities"] == []
+
+
+def test_mimo_inspection_builds_only_meta_tensors(capsys):
+    result = cli_profile.main(
+        [
+            "inspect",
+            "--profile",
+            "mimo_v25_experimental",
+            "--config-or-checkpoint",
+            "configs/model/hybrid_swa_moe_tiny.yaml",
+            "--json",
+        ]
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert output["artifact_type"] == "HybridSwaMoeForCausalLM"
+    assert output["architecture_summary"]["total_parameters"] > 0
+    assert output["manifest"]["exact_official_checkpoint_compatible"] is False

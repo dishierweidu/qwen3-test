@@ -209,6 +209,16 @@ register_profile_factory(
     "qwen3_omni_pretrain.profiles.qwen3_omni_reference.factory",
     "Qwen3ReferenceFactory",
 )
+register_profile_factory(
+    ArchitectureProfile.QWEN35_OMNI_INSPIRED,
+    "qwen3_omni_pretrain.profiles.qwen35_omni_inspired.factory",
+    "Qwen35InspiredFactory",
+)
+register_profile_factory(
+    ArchitectureProfile.MIMO_V25_EXPERIMENTAL,
+    "qwen3_omni_pretrain.profiles.mimo_v25_experimental.factory",
+    "MimoV25ExperimentalFactory",
+)
 
 
 __all__ = [

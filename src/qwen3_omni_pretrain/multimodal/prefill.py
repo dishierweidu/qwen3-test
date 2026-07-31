@@ -280,7 +280,7 @@ class MultimodalPrefillPipeline(nn.Module):
         tokens: ResolvedMultimodalTokens,
         image_encoder: PatchVisionEncoder,
         video_encoder: TemporalVideoEncoder,
-        audio_encoder: AudioWindowEncoder,
+        audio_encoder: nn.Module,
         assembler: SequenceAssembler,
         expansion_policy: MediaExpansionPolicy,
         position_builder: PositionBuilder,
@@ -304,13 +304,24 @@ class MultimodalPrefillPipeline(nn.Module):
             raise TypeError("image_encoder must be a PatchVisionEncoder")
         if not isinstance(video_encoder, TemporalVideoEncoder):
             raise TypeError("video_encoder must be a TemporalVideoEncoder")
-        if not isinstance(audio_encoder, AudioWindowEncoder):
-            raise TypeError("audio_encoder must be an AudioWindowEncoder")
+        if not isinstance(audio_encoder, nn.Module) or not callable(
+            getattr(audio_encoder, "forward", None)
+        ):
+            raise TypeError(
+                "audio_encoder must be a registered media nn.Module"
+            )
+        audio_hidden_size = getattr(audio_encoder, "hidden_size", None)
+        if type(audio_hidden_size) is not int or audio_hidden_size <= 0:
+            raise TypeError(
+                "audio_encoder must expose a positive integer hidden_size"
+            )
         hidden_sizes = (
             image_encoder.hidden_size,
             video_encoder.hidden_size,
-            audio_encoder.hidden_size,
+            audio_hidden_size,
         )
+        if any(type(size) is not int or size <= 0 for size in hidden_sizes):
+            raise TypeError("all media encoders must expose positive hidden_size")
         if len(set(hidden_sizes)) != 1:
             raise ValueError("all media encoder hidden sizes must match")
         if not isinstance(assembler, SequenceAssembler):

@@ -3,13 +3,22 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import json
 import math
-from typing import Dict, Iterable, Set
+from typing import Dict, Iterable, Protocol, Sequence, Set
 
 import torch
 
-from qwen3_omni_pretrain.models.qwen3_omni_moe.modules.moe import (
-    Qwen3OmniMoeMLP,
-)
+
+
+class RoutedParameterInfo(Protocol):
+    """Structural interface used to classify routed expert parameters."""
+
+    num_experts: int
+    num_experts_per_token: int
+
+    def expert_parameter_groups(
+        self,
+    ) -> Sequence[Sequence[torch.nn.Parameter]]:
+        ...
 
 
 @dataclass(frozen=True)
@@ -66,8 +75,9 @@ def collect_parameter_stats(model: torch.nn.Module) -> ParameterStats:
     """
     Count unique parameters and estimate parameters active for one token.
 
-    The active estimate treats each ``Qwen3OmniMoeMLP`` router as active and
-    replaces all routed-expert parameters with the average size of
+    The active estimate treats every module implementing
+    ``RoutedParameterInfo`` as routed and replaces all expert parameters with
+    the average size of
     ``num_experts_per_tok`` experts. It does not model capacity drops, expert
     parallel padding, sequence-dependent routing, or activation memory.
     """
@@ -93,22 +103,47 @@ def collect_parameter_stats(model: torch.nn.Module) -> ParameterStats:
                 for parameter in _unique_parameters(module.parameters())
             )
 
-        if not (
-            isinstance(module, Qwen3OmniMoeMLP)
-            or (
-                hasattr(module, "experts")
-                and hasattr(module, "num_experts")
-                and hasattr(module, "num_experts_per_tok")
-                and hasattr(module, "gate")
-            )
-        ):
+        expert_groups_method = getattr(
+            module, "expert_parameter_groups", None
+        )
+        if not callable(expert_groups_method):
             continue
+        num_experts = getattr(module, "num_experts", None)
+        num_experts_per_token = getattr(
+            module,
+            "num_experts_per_token",
+            getattr(module, "num_experts_per_tok", None),
+        )
+        if type(num_experts) is not int or num_experts <= 0:
+            raise ValueError("routed module has no valid num_experts")
+        if (
+            type(num_experts_per_token) is not int
+            or not 0 < num_experts_per_token <= num_experts
+        ):
+            raise ValueError("routed module has invalid experts-per-token")
+        expert_groups = tuple(tuple(group) for group in expert_groups_method())
+        local_num_experts = getattr(
+            module, "local_num_experts", num_experts
+        )
+        if type(local_num_experts) is not int or not (
+            0 < local_num_experts <= num_experts
+        ):
+            raise ValueError("routed module has invalid local expert count")
+        if len(expert_groups) != local_num_experts:
+            raise ValueError(
+                "expert_parameter_groups must return one group per local expert"
+            )
+        if any(
+            any(not isinstance(parameter, torch.nn.Parameter) for parameter in group)
+            for group in expert_groups
+        ):
+            raise TypeError("expert parameter groups must contain Parameters")
         routed_modules += 1
         expert_parameters = list(
             _unique_parameters(
                 parameter
-                for expert in module.experts
-                for parameter in expert.parameters()
+                for group in expert_groups
+                for parameter in group
             )
         )
         new_expert_parameters = [
@@ -123,13 +158,22 @@ def collect_parameter_stats(model: torch.nn.Module) -> ParameterStats:
             _parameter_numel(parameter)
             for parameter in new_expert_parameters
         )
-        if module.num_experts <= 0:
-            raise ValueError("MoE module has no experts")
         average_expert_parameters = (
-            all_expert_parameters / module.num_experts
+            all_expert_parameters / local_num_experts
+        )
+        selected_local_experts = min(
+            local_num_experts,
+            max(
+                1,
+                round(
+                    num_experts_per_token
+                    * local_num_experts
+                    / num_experts
+                ),
+            ),
         )
         selected_expert_parameters = round(
-            average_expert_parameters * module.num_experts_per_tok
+            average_expert_parameters * selected_local_experts
         )
         active_parameters -= all_expert_parameters
         active_parameters += selected_expert_parameters
@@ -184,3 +228,11 @@ def format_parameter_stats(stats: ParameterStats) -> str:
             "Note: active parameters/token is a routing estimate, not measured FLOPs.",
         ]
     )
+
+
+__all__ = [
+    "ParameterStats",
+    "RoutedParameterInfo",
+    "collect_parameter_stats",
+    "format_parameter_stats",
+]

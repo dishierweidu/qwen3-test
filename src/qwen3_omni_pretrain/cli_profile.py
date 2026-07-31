@@ -126,7 +126,11 @@ def _request_from_args(
         "meta"
         if (
             args.command == "inspect"
-            and profile is ArchitectureProfile.LEGACY_PROTOTYPE
+            and profile
+            in {
+                ArchitectureProfile.LEGACY_PROTOTYPE,
+                ArchitectureProfile.MIMO_V25_EXPERIMENTAL,
+            }
         )
         else None
     )
@@ -172,7 +176,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "validate":
             payload = factory.validate(request).to_dict()
         else:
-            result = factory.build(request)
+            config_contract_builder = getattr(
+                factory, "build_config_contract", None
+            )
+            result = (
+                config_contract_builder(request)
+                if callable(config_contract_builder)
+                else factory.build(request)
+            )
             payload = {
                 "artifact_type": type(result.artifact).__name__,
                 "manifest": result.manifest.to_dict(),

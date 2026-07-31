@@ -4,6 +4,11 @@
 
 **Goal:** 在独立 `mimo_v25_experimental` profile 中实现可归因的小规模 SWA/GA、routed-only SwiGLU MoE、expert parallel 和 speculative MTP 实验。
 
+**Implementation status (2026-08-01):** Complete and regression-tested. Per
+the final delivery instruction, the task-level commit commands below are
+historical execution notes; all changes are delivered in one consolidated
+commit.
+
 **Architecture:** 新建通用 `hybrid_swa_moe` 模型树，不修改 legacy Qwen 模型类。显式 per-layer attention/FFN lists 取代相互覆盖的 boolean/index 配置。SWA/GA 复用公共 immutable cache；MoE 层与 dense FFN 互斥；MTP correctness 与 speculative verification 先于性能优化。
 
 **Tech Stack:** Python 3.10, PyTorch 2.10.0 SDPA/eager attention, torch.distributed Gloo/NCCL, dataclasses, PyYAML, pytest, JSON benchmark reports.

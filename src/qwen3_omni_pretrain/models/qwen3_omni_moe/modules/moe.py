@@ -98,6 +98,15 @@ class Qwen3OmniMoeMLP(nn.Module):
             "MoE router probabilities or auxiliary loss are non-finite"
         )
 
+    @property
+    def num_experts_per_token(self) -> int:
+        return self.num_experts_per_tok
+
+    def expert_parameter_groups(
+        self,
+    ) -> tuple[tuple[nn.Parameter, ...], ...]:
+        return tuple(tuple(expert.parameters()) for expert in self.experts)
+
     def _dispatch_tokens(
         self, gate_probs: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

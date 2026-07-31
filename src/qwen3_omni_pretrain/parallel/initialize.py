@@ -6,18 +6,23 @@ This module handles the initialization of process groups for:
 - Tensor Model Parallelism (TP): splits model parameters across GPUs
 - Data Parallelism (DP): splits data batches across GPUs
 - Pipeline Parallelism (PP): splits model layers across GPUs (optional)
+- Expert Parallelism (EP): shards routed experts (optional, first version EP=2)
 
-The parallelism follows a 3D decomposition:
-    world_size = tensor_model_parallel_size * data_parallel_size * pipeline_model_parallel_size
+The logical decomposition is ``[DP, PP, EP, TP]``.
 
 Example with 8 GPUs, TP=2, DP=4, PP=1:
     GPU 0,1 form TP group 0, GPU 2,3 form TP group 1, ...
     GPU 0,2,4,6 form DP group 0, GPU 1,3,5,7 form DP group 1
 """
 
+from datetime import timedelta
 from typing import Optional
 import torch
 import torch.distributed as dist
+
+from qwen3_omni_pretrain.parallel.expert_parallel import (
+    validate_parallel_topology,
+)
 
 
 # Global state for model parallelism
@@ -25,6 +30,7 @@ _MODEL_PARALLEL_GROUP: Optional[dist.ProcessGroup] = None
 _TENSOR_MODEL_PARALLEL_GROUP: Optional[dist.ProcessGroup] = None
 _DATA_PARALLEL_GROUP: Optional[dist.ProcessGroup] = None
 _PIPELINE_MODEL_PARALLEL_GROUP: Optional[dist.ProcessGroup] = None
+_EXPERT_MODEL_PARALLEL_GROUP: Optional[dist.ProcessGroup] = None
 
 _TENSOR_MODEL_PARALLEL_WORLD_SIZE: int = 1
 _TENSOR_MODEL_PARALLEL_RANK: int = 0
@@ -32,6 +38,8 @@ _DATA_PARALLEL_WORLD_SIZE: int = 1
 _DATA_PARALLEL_RANK: int = 0
 _PIPELINE_MODEL_PARALLEL_WORLD_SIZE: int = 1
 _PIPELINE_MODEL_PARALLEL_RANK: int = 0
+_EXPERT_MODEL_PARALLEL_WORLD_SIZE: int = 1
+_EXPERT_MODEL_PARALLEL_RANK: int = 0
 
 _MODEL_PARALLEL_INITIALIZED: bool = False
 
@@ -49,6 +57,7 @@ def model_parallel_is_initialized() -> bool:
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
+    expert_model_parallel_size: int = 1,
     *,
     backend: str = "nccl",
     timeout_minutes: int = 30,
@@ -81,12 +90,15 @@ def initialize_model_parallel(
     global _TENSOR_MODEL_PARALLEL_GROUP
     global _DATA_PARALLEL_GROUP
     global _PIPELINE_MODEL_PARALLEL_GROUP
+    global _EXPERT_MODEL_PARALLEL_GROUP
     global _TENSOR_MODEL_PARALLEL_WORLD_SIZE
     global _TENSOR_MODEL_PARALLEL_RANK
     global _DATA_PARALLEL_WORLD_SIZE
     global _DATA_PARALLEL_RANK
     global _PIPELINE_MODEL_PARALLEL_WORLD_SIZE
     global _PIPELINE_MODEL_PARALLEL_RANK
+    global _EXPERT_MODEL_PARALLEL_WORLD_SIZE
+    global _EXPERT_MODEL_PARALLEL_RANK
     global _MODEL_PARALLEL_INITIALIZED
     
     if _MODEL_PARALLEL_INITIALIZED:
@@ -98,8 +110,8 @@ def initialize_model_parallel(
         dist.init_process_group(
             backend=backend,
             timeout=torch.distributed.distributed_c10d._DEFAULT_PG_TIMEOUT
-            if timeout_minutes <= 0 else 
-            torch.distributed.timedelta(minutes=timeout_minutes)
+            if timeout_minutes <= 0
+            else timedelta(minutes=timeout_minutes),
         )
     
     world_size = dist.get_world_size()
@@ -108,31 +120,42 @@ def initialize_model_parallel(
     # Validate parallelism sizes
     tp_size = tensor_model_parallel_size
     pp_size = pipeline_model_parallel_size
+    ep_size = expert_model_parallel_size
     
-    if tp_size <= 0 or pp_size <= 0:
+    if tp_size <= 0 or pp_size <= 0 or ep_size <= 0:
         raise ValueError(
             f"tensor_model_parallel_size ({tp_size}) and "
-            f"pipeline_model_parallel_size ({pp_size}) must be positive"
+            f"pipeline_model_parallel_size ({pp_size}) and "
+            f"expert_model_parallel_size ({ep_size}) must be positive"
         )
     
-    model_parallel_size = tp_size * pp_size
+    model_parallel_size = tp_size * ep_size * pp_size
     if world_size % model_parallel_size != 0:
         raise ValueError(
             f"world_size ({world_size}) must be divisible by "
-            f"tensor_model_parallel_size * pipeline_model_parallel_size = {model_parallel_size}"
+            "tensor_model_parallel_size * expert_model_parallel_size * "
+            f"pipeline_model_parallel_size = {model_parallel_size}"
         )
     
     dp_size = world_size // model_parallel_size
+    validate_parallel_topology(
+        world_size=world_size,
+        data_parallel_size=dp_size,
+        pipeline_parallel_size=pp_size,
+        expert_parallel_size=ep_size,
+        tensor_parallel_size=tp_size,
+    )
     
     if rank == 0:
         print(f">> Initializing Model Parallel:")
         print(f"   - World Size: {world_size}")
         print(f"   - Tensor Model Parallel Size (TP): {tp_size}")
         print(f"   - Pipeline Model Parallel Size (PP): {pp_size}")
+        print(f"   - Expert Model Parallel Size (EP): {ep_size}")
         print(f"   - Data Parallel Size (DP): {dp_size}")
     
     # Build process groups
-    # Layout: [DP, PP, TP] - innermost dimension is TP
+    # Layout: [DP, PP, EP, TP] - innermost dimension is TP
     # Example with world_size=8, tp=2, pp=2, dp=2:
     #   GPU 0: dp=0, pp=0, tp=0
     #   GPU 1: dp=0, pp=0, tp=1
@@ -144,11 +167,8 @@ def initialize_model_parallel(
     #   GPU 7: dp=1, pp=1, tp=1
     
     num_tensor_model_parallel_groups = world_size // tp_size
-    num_pipeline_model_parallel_groups = world_size // pp_size
-    num_data_parallel_groups = world_size // dp_size
-    
     # Create tensor model parallel groups
-    # Each group contains GPUs that share the same (dp_rank, pp_rank)
+    # Each group contains ranks sharing (dp, pp, ep).
     for i in range(num_tensor_model_parallel_groups):
         start = i * tp_size
         end = start + tp_size
@@ -159,36 +179,54 @@ def initialize_model_parallel(
             _TENSOR_MODEL_PARALLEL_WORLD_SIZE = tp_size
             _TENSOR_MODEL_PARALLEL_RANK = rank - start
     
+    # Create expert groups: ranks varying EP with fixed (dp, pp, tp).
+    for dp in range(dp_size):
+        for pp in range(pp_size):
+            for tp in range(tp_size):
+                ranks = [
+                    (((dp * pp_size + pp) * ep_size + ep) * tp_size + tp)
+                    for ep in range(ep_size)
+                ]
+                group = dist.new_group(ranks)
+                if rank in ranks:
+                    _EXPERT_MODEL_PARALLEL_GROUP = group
+                    _EXPERT_MODEL_PARALLEL_WORLD_SIZE = ep_size
+                    _EXPERT_MODEL_PARALLEL_RANK = ranks.index(rank)
+
     # Create data parallel groups
-    # Each group contains GPUs that share the same (pp_rank, tp_rank)
+    # Each group contains ranks sharing (pp, ep, tp).
     for pp in range(pp_size):
-        for tp in range(tp_size):
-            ranks = []
-            for dp in range(dp_size):
-                ranks.append(dp * model_parallel_size + pp * tp_size + tp)
-            group = dist.new_group(ranks)
-            if rank in ranks:
-                _DATA_PARALLEL_GROUP = group
-                _DATA_PARALLEL_WORLD_SIZE = dp_size
-                _DATA_PARALLEL_RANK = ranks.index(rank)
+        for ep in range(ep_size):
+            for tp in range(tp_size):
+                ranks = [
+                    (((dp * pp_size + pp) * ep_size + ep) * tp_size + tp)
+                    for dp in range(dp_size)
+                ]
+                group = dist.new_group(ranks)
+                if rank in ranks:
+                    _DATA_PARALLEL_GROUP = group
+                    _DATA_PARALLEL_WORLD_SIZE = dp_size
+                    _DATA_PARALLEL_RANK = ranks.index(rank)
     
     # Create pipeline model parallel groups (if PP > 1)
     if pp_size > 1:
         for dp in range(dp_size):
-            for tp in range(tp_size):
-                ranks = []
-                for pp in range(pp_size):
-                    ranks.append(dp * model_parallel_size + pp * tp_size + tp)
-                group = dist.new_group(ranks)
-                if rank in ranks:
-                    _PIPELINE_MODEL_PARALLEL_GROUP = group
-                    _PIPELINE_MODEL_PARALLEL_WORLD_SIZE = pp_size
-                    _PIPELINE_MODEL_PARALLEL_RANK = ranks.index(rank)
+            for ep in range(ep_size):
+                for tp in range(tp_size):
+                    ranks = [
+                        (((dp * pp_size + pp) * ep_size + ep) * tp_size + tp)
+                        for pp in range(pp_size)
+                    ]
+                    group = dist.new_group(ranks)
+                    if rank in ranks:
+                        _PIPELINE_MODEL_PARALLEL_GROUP = group
+                        _PIPELINE_MODEL_PARALLEL_WORLD_SIZE = pp_size
+                        _PIPELINE_MODEL_PARALLEL_RANK = ranks.index(rank)
     else:
         _PIPELINE_MODEL_PARALLEL_WORLD_SIZE = 1
         _PIPELINE_MODEL_PARALLEL_RANK = 0
     
-    # Model parallel group (TP + PP combined)
+    # Model parallel group (TP + EP + PP combined)
     for dp in range(dp_size):
         start = dp * model_parallel_size
         end = start + model_parallel_size
@@ -212,24 +250,30 @@ def destroy_model_parallel() -> None:
     global _TENSOR_MODEL_PARALLEL_GROUP
     global _DATA_PARALLEL_GROUP
     global _PIPELINE_MODEL_PARALLEL_GROUP
+    global _EXPERT_MODEL_PARALLEL_GROUP
     global _TENSOR_MODEL_PARALLEL_WORLD_SIZE
     global _TENSOR_MODEL_PARALLEL_RANK
     global _DATA_PARALLEL_WORLD_SIZE
     global _DATA_PARALLEL_RANK
     global _PIPELINE_MODEL_PARALLEL_WORLD_SIZE
     global _PIPELINE_MODEL_PARALLEL_RANK
+    global _EXPERT_MODEL_PARALLEL_WORLD_SIZE
+    global _EXPERT_MODEL_PARALLEL_RANK
     global _MODEL_PARALLEL_INITIALIZED
     
     _MODEL_PARALLEL_GROUP = None
     _TENSOR_MODEL_PARALLEL_GROUP = None
     _DATA_PARALLEL_GROUP = None
     _PIPELINE_MODEL_PARALLEL_GROUP = None
+    _EXPERT_MODEL_PARALLEL_GROUP = None
     _TENSOR_MODEL_PARALLEL_WORLD_SIZE = 1
     _TENSOR_MODEL_PARALLEL_RANK = 0
     _DATA_PARALLEL_WORLD_SIZE = 1
     _DATA_PARALLEL_RANK = 0
     _PIPELINE_MODEL_PARALLEL_WORLD_SIZE = 1
     _PIPELINE_MODEL_PARALLEL_RANK = 0
+    _EXPERT_MODEL_PARALLEL_WORLD_SIZE = 1
+    _EXPERT_MODEL_PARALLEL_RANK = 0
     _MODEL_PARALLEL_INITIALIZED = False
 
 
@@ -294,6 +338,25 @@ def get_pipeline_model_parallel_rank() -> int:
     return _PIPELINE_MODEL_PARALLEL_RANK
 
 
+def get_expert_model_parallel_group() -> Optional[dist.ProcessGroup]:
+    """Get the expert-parallel process group."""
+    return _EXPERT_MODEL_PARALLEL_GROUP
+
+
+def get_expert_model_parallel_world_size() -> int:
+    """Get the expert-parallel group size."""
+    if not _MODEL_PARALLEL_INITIALIZED:
+        return 1
+    return _EXPERT_MODEL_PARALLEL_WORLD_SIZE
+
+
+def get_expert_model_parallel_rank() -> int:
+    """Get this rank within its expert-parallel group."""
+    if not _MODEL_PARALLEL_INITIALIZED:
+        return 0
+    return _EXPERT_MODEL_PARALLEL_RANK
+
+
 def get_model_parallel_group() -> Optional[dist.ProcessGroup]:
-    """Get the model parallel process group (TP + PP combined)."""
+    """Get the model parallel process group (TP + EP + PP combined)."""
     return _MODEL_PARALLEL_GROUP
