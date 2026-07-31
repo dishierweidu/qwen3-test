@@ -5,11 +5,15 @@ Research implementation of a Qwen3-Omni-style pretraining pipeline.
 ## Project status
 
 The current repository contains a custom Thinker, MoE experiments, distributed
-training utilities, and a Stage-2 image/audio adapter. It is **not yet an
+training utilities, a legacy Stage-2 image/audio adapter, and an experimental
+sequence-preserving multimodal prefill layer. It is **not yet an
 architecture-faithful reproduction of the official Qwen3-Omni model**:
 
-- the current image and audio adapters each produce one token;
-- video/TM-RoPE are not implemented;
+- the unchanged legacy Stage-2 path still maps each image/audio item to one
+  token;
+- the reusable experimental path now has strict image, video, and audio
+  sequence encoders, sequence assembly, Qwen3-disjoint positions, and an
+  experimental TM-RoPE builder, but is not yet wired into the legacy Thinker;
 - Talker and Code2Wav are configuration placeholders;
 - the experimental DeltaNet block is not an official Qwen3.5-Omni
   implementation.
@@ -173,9 +177,10 @@ ambient interpreter.
 ## Tests
 
 The tests cover Stage-2 target masking, strict media decoding, multimodal
-attention masks, MoE routing scale, numerical fail-fast behavior, and parameter
-statistics. Run the profile-specific commands above so test collection uses the
-intended dependency set.
+sequence assembly and positions, multimodal prefill orchestration, MoE routing
+scale, numerical fail-fast behavior, and parameter statistics. Run the
+profile-specific commands above so test collection uses the intended
+dependency set.
 
 ## Stage-2 media behavior
 
@@ -192,6 +197,52 @@ collator = OmniStage2Collator(tokenizer, skip_bad_media=True)
 The collator then sets that modality's presence flag to zero and records a
 structured entry in `_media_errors`. Underscore-prefixed keys are training
 metadata and are removed before calling `model.forward`.
+
+## Sequence-preserving multimodal prefill
+
+New experimental profile runtimes should use
+`MultimodalPrefillPipeline`. It owns only the image, video, and audio encoders;
+the caller continues to own the text embedding and eventual decoder. A matched
+expansion-policy/position-builder pair is an explicit caller choice:
+
+- Qwen3-disjoint experiments pair `IdentityMediaExpansion` with
+  `Qwen3DisjointPositionBuilder`;
+- the 160 ms experiment pairs `TimestampInterleaveExpansion` with
+  `TMRoPEPositionBuilder` configured with the same literal `0.16` second
+  quantum.
+
+Pass only the four model fields from `ProfileStage2Collator`. Diagnostics stay
+with the data pipeline, so do not forward the complete mapping with
+`**batch`:
+
+```python
+batch = profile_collator(samples)
+
+pipeline = pipeline.to(device=device, dtype=dtype)
+text_embedding = text_embedding.to(device=device, dtype=dtype)
+
+output = pipeline.encode_and_assemble(
+    input_ids=batch["input_ids"].to(device),
+    attention_mask=batch["attention_mask"].to(device),
+    labels=batch["labels"].to(device),
+    decoded_media=batch["decoded_media"],
+    text_embedding=text_embedding,
+)
+media_errors = batch["_media_errors"]
+```
+
+The orchestration boundary performs no implicit cast or device transfer for
+text tensors, text embeddings, or encoded media sequences. All registered
+encoder parameters and the external text embedding must already share one
+device and floating dtype. The encoders alone may convert decoded floating
+payloads to their parameter placement.
+
+The common Qwen3-disjoint position implementation is guarded by pinned source
+hashes and fixed-vector numerical tests. Full official joint audio/video
+runtime parity still belongs to the separate Qwen3 reference-runtime adapter;
+the cached official processor is an additional integration oracle. Passing the
+common prefill tests demonstrates sequence semantics only—it does not imply
+Qwen3, Qwen3.5, or MiMo checkpoint compatibility.
 
 ## Numerical correctness
 
@@ -248,9 +299,9 @@ repository code; these are independent opt-ins.
 
 ## Next architecture milestones
 
-1. Replace one-token adapters with sequence-preserving vision/audio encoders.
-2. Add video and timestamp-aware TM-RoPE sequence construction.
-3. Establish an official-structure-compatible Thinker baseline.
-4. Implement Talker, codec MTP, Code2Wav, and streaming caches.
-5. Evaluate Qwen3.5-style Hybrid Attention/ARIA and MiMo-style SWA/GA as
+1. Integrate the sequence-preserving prefill layer with explicit experimental
+   profile runtimes and decoder/cache contracts.
+2. Establish an official-structure-compatible Thinker baseline.
+3. Implement Talker, codec MTP, Code2Wav, and streaming caches.
+4. Evaluate Qwen3.5-style Hybrid Attention/ARIA and MiMo-style SWA/GA as
    separate experimental branches.
