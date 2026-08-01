@@ -30,13 +30,22 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from transformers import PreTrainedModel
 
+from qwen3_omni_pretrain.architecture.config_validation import (
+    parse_layer_indices,
+)
+from qwen3_omni_pretrain.runtime.state import AttentionKV
+
 from .configuration_qwen3_omni_moe import Qwen3OmniMoeConfig, Qwen3OmniMoeThinkerConfig
 from .modeling_thinker_text import (
     RMSNorm,
     RotaryEmbedding,
     CausalConv1d,
     GatedDeltaNetAttention,
+    LegacyIncrementalDecodeMixin,
+    _build_rectangular_causal_bias,
+    _require_boolean_2d_mask,
 )
+from .modules.moe import select_topk_routes
 
 # Import parallel components
 from qwen3_omni_pretrain.parallel import (
@@ -145,11 +154,43 @@ class TensorParallelMultiHeadSelfAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_bias: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         rotary_emb: Optional[RotaryEmbedding] = None,
-    ) -> torch.Tensor:
+        past_key_value: AttentionKV | None = None,
+        current_key_valid_mask: torch.Tensor | None = None,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, AttentionKV | None]:
         B, T, _ = hidden_states.size()
+        if type(use_cache) is not bool:
+            raise TypeError("use_cache must be a boolean")
+        if current_key_valid_mask is None:
+            current_key_valid_mask = torch.ones(
+                (B, T),
+                dtype=torch.bool,
+                device=hidden_states.device,
+            )
+        current_key_valid_mask = _require_boolean_2d_mask(
+            current_key_valid_mask,
+            "current_key_valid_mask",
+        )
+        if current_key_valid_mask.shape != (B, T):
+            raise ValueError("current_key_valid_mask must have shape [B, Q]")
+        if current_key_valid_mask.device != hidden_states.device:
+            raise ValueError("current mask and hidden states must share a device")
+        if past_key_value is not None:
+            if not isinstance(past_key_value, AttentionKV):
+                raise TypeError("past_key_value must be AttentionKV or None")
+            if (
+                past_key_value.batch_size != B
+                or past_key_value.key.shape[1]
+                != self.num_kv_heads_per_partition
+                or past_key_value.key.shape[3] != self.head_dim
+                or past_key_value.value.shape[3] != self.head_dim
+                or past_key_value.key.dtype != hidden_states.dtype
+                or past_key_value.key.device != hidden_states.device
+            ):
+                raise ValueError("past_key_value topology does not match attention")
         
         # Compute output gate
         gate = None
@@ -179,16 +220,45 @@ class TensorParallelMultiHeadSelfAttention(nn.Module):
         if rotary_emb is not None and position_ids is not None:
             q = rotary_emb(q, position_ids)
             k = rotary_emb(k, position_ids)
+
+        current_k = k
+        current_v = v
+        if past_key_value is None:
+            combined_k = current_k
+            combined_v = current_v
+            combined_mask = current_key_valid_mask
+        else:
+            combined_k = torch.cat((past_key_value.key, current_k), dim=2)
+            combined_v = torch.cat((past_key_value.value, current_v), dim=2)
+            combined_mask = torch.cat(
+                (
+                    past_key_value.key_valid_mask,
+                    current_key_valid_mask,
+                ),
+                dim=1,
+            )
+        expected_bias_shape = (B, 1, T, combined_k.shape[2])
+        if attention_bias is None or attention_bias.shape != expected_bias_shape:
+            raise ValueError(
+                "attention_bias must have shape [B, 1, Q, P+Q]"
+            )
+        if attention_bias.device != hidden_states.device:
+            raise ValueError("attention_bias and hidden states must share a device")
+        if not attention_bias.is_floating_point():
+            raise TypeError("attention_bias must have a floating dtype")
         
         # Repeat KV for GQA
         if self.num_kv_heads_per_partition != self.num_heads_per_partition:
             n_rep = self.num_heads_per_partition // self.num_kv_heads_per_partition
-            k = self._repeat_kv(k, n_rep)
-            v = self._repeat_kv(v, n_rep)
+            k = self._repeat_kv(combined_k, n_rep)
+            v = self._repeat_kv(combined_v, n_rep)
+        else:
+            k = combined_k
+            v = combined_v
         
         # Attention computation
         if self.use_flash_attention:
-            attn_mask = attention_mask
+            attn_mask = attention_bias
             if attn_mask is not None and attn_mask.dtype != q.dtype:
                 attn_mask = attn_mask.to(q.dtype)
             
@@ -203,10 +273,10 @@ class TensorParallelMultiHeadSelfAttention(nn.Module):
             k_f = k.float()
             v_f = v.float()
             scores = torch.matmul(q_f, k_f.transpose(-1, -2)) / math.sqrt(self.head_dim)
-            if attention_mask is not None:
-                if attention_mask.dtype != scores.dtype:
-                    attention_mask = attention_mask.to(scores.dtype)
-                scores = scores + attention_mask
+            if attention_bias is not None:
+                if attention_bias.dtype != scores.dtype:
+                    attention_bias = attention_bias.to(scores.dtype)
+                scores = scores + attention_bias
             attn = torch.softmax(scores, dim=-1)
             out = torch.matmul(attn, v_f)
             out = out.to(v.dtype)
@@ -219,8 +289,16 @@ class TensorParallelMultiHeadSelfAttention(nn.Module):
         out = out.transpose(1, 2).contiguous()
         out = out.view(B, T, self.num_heads_per_partition * self.head_dim)
         out = self.o_proj(out)
-        
-        return out
+        out = out.masked_fill(~current_key_valid_mask.unsqueeze(-1), 0)
+
+        present = None
+        if use_cache:
+            present = AttentionKV(
+                key=combined_k,
+                value=combined_v,
+                key_valid_mask=combined_mask,
+            )
+        return out, present
 
 
 class TensorParallelMLP(nn.Module):
@@ -337,7 +415,11 @@ class TensorParallelMoeMLP(nn.Module):
         
         # Top-k selection
         k = self.num_experts_per_tok
-        topk_vals, topk_idx = gate_probs.topk(k=k, dim=-1)
+        topk_vals, topk_idx = select_topk_routes(
+            gate_probs,
+            k=self.num_experts_per_tok,
+            renormalize=self.renormalize_topk,
+        )
         
         # Expand indices
         topk_vals_flat = topk_vals.reshape(-1)
@@ -465,15 +547,33 @@ class TensorParallelThinkerDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
         position_ids: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        *,
+        past_key_value: AttentionKV | None = None,
+        current_key_valid_mask: torch.Tensor | None = None,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], AttentionKV | None]:
         residual = hidden_states
         hidden_states = self.attn_norm(hidden_states)
-        attn_out = self.self_attn(
-            hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            rotary_emb=self.rotary_emb,
-        )
+        if isinstance(self.self_attn, TensorParallelMultiHeadSelfAttention):
+            attn_out, present_key_value = self.self_attn(
+                hidden_states,
+                attention_bias=attention_mask,
+                position_ids=position_ids,
+                rotary_emb=self.rotary_emb,
+                past_key_value=past_key_value,
+                current_key_valid_mask=current_key_valid_mask,
+                use_cache=use_cache,
+            )
+        else:
+            if use_cache or past_key_value is not None:
+                raise ValueError("DeltaNet does not implement decoder cache")
+            attn_out = self.self_attn(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                rotary_emb=self.rotary_emb,
+            )
+            present_key_value = None
         hidden_states = residual + attn_out
         
         # FFN
@@ -491,10 +591,13 @@ class TensorParallelThinkerDecoderLayer(nn.Module):
             mlp_out = shared_out
         
         hidden_states = residual + mlp_out
-        return hidden_states, aux_loss
+        return hidden_states, aux_loss, present_key_value
 
 
-class Qwen3OmniMoeThinkerTextModelTP(PreTrainedModel):
+class Qwen3OmniMoeThinkerTextModelTP(
+    LegacyIncrementalDecodeMixin,
+    PreTrainedModel,
+):
     """
     Tensor Parallel version of Qwen3OmniMoeThinkerTextModel.
     
@@ -503,6 +606,7 @@ class Qwen3OmniMoeThinkerTextModelTP(PreTrainedModel):
     """
     
     config_class = Qwen3OmniMoeConfig
+    _tp_local_shard_cache_validated = True
     
     def __init__(self, config: Qwen3OmniMoeConfig):
         super().__init__(config)
@@ -552,22 +656,21 @@ class Qwen3OmniMoeThinkerTextModelTP(PreTrainedModel):
         
         self.use_flash_attention = getattr(thinker_cfg, "use_flash_attention", False)
         
-        # Parse layer indices
-        moe_layer_set = None
-        if getattr(thinker_cfg, "use_moe", False) and getattr(thinker_cfg, "moe_layer_indices", None):
-            indices_str = thinker_cfg.moe_layer_indices
-            if isinstance(indices_str, str) and indices_str.strip():
-                moe_layer_set = set(
-                    int(x) for x in indices_str.split(",") if x.strip().isdigit()
-                )
-        
-        deltanet_layer_set = None
-        if getattr(thinker_cfg, "deltanet_layer_indices", None) is not None:
-            indices_str = thinker_cfg.deltanet_layer_indices
-            if isinstance(indices_str, str) and indices_str.strip():
-                deltanet_layer_set = set(
-                    int(x) for x in indices_str.split(",") if x.strip().isdigit()
-                )
+        moe_layers = parse_layer_indices(
+            thinker_cfg.moe_layer_indices,
+            layer_count=thinker_cfg.num_hidden_layers,
+            field="moe_layer_indices",
+        )
+        moe_layer_set = set(moe_layers) if moe_layers else None
+
+        deltanet_layers = parse_layer_indices(
+            thinker_cfg.deltanet_layer_indices,
+            layer_count=thinker_cfg.num_hidden_layers,
+            field="deltanet_layer_indices",
+        )
+        deltanet_layer_set = (
+            set(deltanet_layers) if deltanet_layers else None
+        )
         
         use_deltanet_global = getattr(thinker_cfg, "use_deltanet", False)
         self.gradient_checkpointing = getattr(thinker_cfg, "gradient_checkpointing", False)
@@ -612,21 +715,22 @@ class Qwen3OmniMoeThinkerTextModelTP(PreTrainedModel):
         attention_mask: Optional[torch.Tensor],
         input_shape: Tuple[int, int],
         device: torch.device,
+        *,
+        dtype: torch.dtype = torch.float32,
+        past_key_valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         bsz, tgt_len = input_shape
         if attention_mask is None:
-            attention_mask = torch.ones((bsz, tgt_len), device=device)
-        
-        causal_mask = torch.full(
-            (tgt_len, tgt_len),
-            fill_value=-float("inf"),
-            device=device,
+            attention_mask = torch.ones(
+                (bsz, tgt_len),
+                dtype=torch.bool,
+                device=device,
+            )
+        return _build_rectangular_causal_bias(
+            past_key_valid_mask=past_key_valid_mask,
+            current_key_valid_mask=attention_mask,
+            dtype=dtype,
         )
-        causal_mask = torch.triu(causal_mask, diagonal=1)
-        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
-        
-        padding_mask = (1.0 - attention_mask[:, None, None, :]) * -1e4
-        return causal_mask + padding_mask
     
     def forward(
         self,
@@ -656,8 +760,30 @@ class Qwen3OmniMoeThinkerTextModelTP(PreTrainedModel):
         if dist.is_initialized() and dist.get_rank() == 0:
             print("[model] after embed", flush=True)
         
+        if attention_mask is None:
+            current_key_valid_mask = torch.ones(
+                (bsz, seq_len),
+                dtype=torch.bool,
+                device=device,
+            )
+        else:
+            if not isinstance(attention_mask, torch.Tensor):
+                raise TypeError("attention_mask must be a torch.Tensor")
+            if attention_mask.shape != (bsz, seq_len):
+                raise ValueError("attention_mask must have shape [B, T]")
+            if attention_mask.device != device:
+                raise ValueError("attention_mask and inputs must share a device")
+            if not bool(
+                ((attention_mask == 0) | (attention_mask == 1)).all().item()
+            ):
+                raise ValueError("attention_mask values must be 0 or 1")
+            current_key_valid_mask = attention_mask.to(dtype=torch.bool)
+
         attention_mask_full = self._prepare_attention_mask(
-            attention_mask, (bsz, seq_len), device
+            current_key_valid_mask,
+            (bsz, seq_len),
+            device,
+            dtype=hidden_states.dtype,
         )
         
         all_hidden_states = [] if output_hidden_states else None
@@ -669,7 +795,13 @@ class Qwen3OmniMoeThinkerTextModelTP(PreTrainedModel):
             
             if self.gradient_checkpointing and self.training:
                 def layer_forward(x, pos_ids):
-                    return layer(x, attention_mask_full, pos_ids)
+                    layer_hidden, layer_aux, _ = layer(
+                        x,
+                        attention_mask_full,
+                        pos_ids,
+                        current_key_valid_mask=current_key_valid_mask,
+                    )
+                    return layer_hidden, layer_aux
                 try:
                     hidden_states, layer_aux = torch.utils.checkpoint.checkpoint(
                         layer_forward,
@@ -680,12 +812,18 @@ class Qwen3OmniMoeThinkerTextModelTP(PreTrainedModel):
                     )
                 except torch.utils.checkpoint.CheckpointError:
                     # Fallback: disable checkpoint for this layer to avoid mismatch errors
-                    hidden_states, layer_aux = layer(
-                        hidden_states, attention_mask_full, position_ids
+                    hidden_states, layer_aux, _ = layer(
+                        hidden_states,
+                        attention_mask_full,
+                        position_ids,
+                        current_key_valid_mask=current_key_valid_mask,
                     )
             else:
-                hidden_states, layer_aux = layer(
-                    hidden_states, attention_mask_full, position_ids
+                hidden_states, layer_aux, _ = layer(
+                    hidden_states,
+                    attention_mask_full,
+                    position_ids,
+                    current_key_valid_mask=current_key_valid_mask,
                 )
             if dist.is_initialized() and dist.get_rank() == 0 and layer_aux is not None:
                 print("[model] layer aux ok", flush=True)

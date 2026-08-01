@@ -20,10 +20,13 @@ Thumbs.db
 # Environment files
 .env
 venv/
+.venv-prototype/
+.venv-qwen-reference/
+.venv-qwen35-backbone/
 __pycache__/
 
 # Dataset files
-data/
+/data/
 mobvoi_seq_monkey_general_open_corpus.jsonl
 
 outputs/

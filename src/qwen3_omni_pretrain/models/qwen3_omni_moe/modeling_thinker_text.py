@@ -1,5 +1,6 @@
 # src/qwen3_omni_pretrain/models/qwen3_omni_moe/modeling_thinker_text.py
 
+import hashlib
 import math
 from typing import Optional, Tuple
 
@@ -8,8 +9,107 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PreTrainedModel
 
+from qwen3_omni_pretrain.architecture.config_validation import (
+    parse_layer_indices,
+)
+from qwen3_omni_pretrain.runtime.capabilities import (
+    CacheCapabilityError,
+    CacheErrorCode,
+    cache_support_for_legacy_layers,
+    require_incremental_decode_support,
+)
+from qwen3_omni_pretrain.runtime.protocols import (
+    CausalLMOutput,
+    ModelDecodeInputs,
+    ModelPrefillInputs,
+    legacy_position_ids,
+)
+from qwen3_omni_pretrain.runtime.state import (
+    AttentionKV,
+    DecoderPositionState,
+    DecoderState,
+    LegacyPositionCursor,
+    StateOwner,
+)
+
 from .configuration_qwen3_omni_moe import Qwen3OmniMoeConfig, Qwen3OmniMoeThinkerConfig
 from .modules.moe import Qwen3OmniMoeMLP
+
+
+def _require_boolean_2d_mask(
+    value: torch.Tensor,
+    name: str,
+) -> torch.Tensor:
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if value.dtype is not torch.bool:
+        raise TypeError(f"{name} must have dtype torch.bool")
+    if value.ndim != 2 or value.shape[0] == 0 or value.shape[1] == 0:
+        raise ValueError(f"{name} must have non-empty shape [B, S]")
+    return value
+
+
+def _build_rectangular_causal_bias(
+    *,
+    past_key_valid_mask: torch.Tensor | None,
+    current_key_valid_mask: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Build one final additive [B,1,Q,P+Q] causal/key-valid bias."""
+
+    current = _require_boolean_2d_mask(
+        current_key_valid_mask,
+        "current_key_valid_mask",
+    )
+    if not dtype.is_floating_point:
+        raise TypeError("attention bias dtype must be floating")
+    batch_size, query_length = current.shape
+    if past_key_valid_mask is None:
+        past = torch.empty(
+            (batch_size, 0),
+            dtype=torch.bool,
+            device=current.device,
+        )
+    else:
+        past = _require_boolean_2d_mask(
+            past_key_valid_mask,
+            "past_key_valid_mask",
+        )
+        if past.shape[0] != batch_size:
+            raise ValueError("past and current masks must share batch size")
+        if past.device != current.device:
+            raise ValueError("past and current masks must share a device")
+
+    past_length = past.shape[1]
+    key_mask = torch.cat((past, current), dim=1)
+    key_indices = torch.arange(
+        key_mask.shape[1],
+        device=current.device,
+    )
+    query_limits = past_length + torch.arange(
+        query_length,
+        device=current.device,
+    )
+    causal = key_indices.unsqueeze(0) <= query_limits.unsqueeze(1)
+    allowed = key_mask.unsqueeze(1) & causal.unsqueeze(0)
+    missing = current & ~allowed.any(dim=-1)
+    if bool(missing.any().item()):
+        raise ValueError("a valid query must have at least one valid key")
+
+    # Invalid queries never enter state as valid keys and are zeroed after the
+    # output projection. Giving them a finite attention row avoids all-masked
+    # softmax NaNs without changing their observable output.
+    allowed = torch.where(
+        current.unsqueeze(-1),
+        allowed,
+        torch.ones_like(allowed),
+    )
+    bias = torch.zeros(
+        (batch_size, 1, query_length, key_mask.shape[1]),
+        dtype=dtype,
+        device=current.device,
+    )
+    return bias.masked_fill(~allowed.unsqueeze(1), torch.finfo(dtype).min)
 
 
 class RMSNorm(nn.Module):
@@ -103,8 +203,8 @@ class RotaryEmbedding(nn.Module):
             bsz, seq_len, dim = x.size()
             assert dim == self.total_dim
 
-            cos = self.cos_cached[position_ids]  # [B, T, rope_dim]
-            sin = self.sin_cached[position_ids]  # [B, T, rope_dim]
+            cos = self.cos_cached[position_ids].to(dtype=x.dtype)
+            sin = self.sin_cached[position_ids].to(dtype=x.dtype)
 
             # 拆分前 rope_dim 和剩余部分
             x_rope = x[..., :self.rope_dim]      # [B, T, rope_dim]
@@ -124,8 +224,8 @@ class RotaryEmbedding(nn.Module):
             bsz, nh, seq_len, dim = x.size()
             assert dim == self.total_dim
 
-            cos = self.cos_cached[position_ids]  # [B, T, rope_dim]
-            sin = self.sin_cached[position_ids]  # [B, T, rope_dim]
+            cos = self.cos_cached[position_ids].to(dtype=x.dtype)
+            sin = self.sin_cached[position_ids].to(dtype=x.dtype)
             cos = cos.unsqueeze(1)               # [B, 1, T, rope_dim]
             sin = sin.unsqueeze(1)               # [B, 1, T, rope_dim]
 
@@ -206,11 +306,42 @@ class MultiHeadSelfAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_bias: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         rotary_emb: Optional[RotaryEmbedding] = None,
-    ) -> torch.Tensor:
+        past_key_value: AttentionKV | None = None,
+        current_key_valid_mask: torch.Tensor | None = None,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, AttentionKV | None]:
         B, T, _ = hidden_states.size()
+        if type(use_cache) is not bool:
+            raise TypeError("use_cache must be a boolean")
+        if current_key_valid_mask is None:
+            current_key_valid_mask = torch.ones(
+                (B, T),
+                dtype=torch.bool,
+                device=hidden_states.device,
+            )
+        current_key_valid_mask = _require_boolean_2d_mask(
+            current_key_valid_mask,
+            "current_key_valid_mask",
+        )
+        if current_key_valid_mask.shape != (B, T):
+            raise ValueError("current_key_valid_mask must have shape [B, Q]")
+        if current_key_valid_mask.device != hidden_states.device:
+            raise ValueError("current mask and hidden states must share a device")
+        if past_key_value is not None:
+            if not isinstance(past_key_value, AttentionKV):
+                raise TypeError("past_key_value must be AttentionKV or None")
+            if (
+                past_key_value.batch_size != B
+                or past_key_value.key.shape[1] != self.num_kv_heads
+                or past_key_value.key.shape[3] != self.head_dim
+                or past_key_value.value.shape[3] != self.head_dim
+                or past_key_value.key.dtype != hidden_states.dtype
+                or past_key_value.key.device != hidden_states.device
+            ):
+                raise ValueError("past_key_value topology does not match attention")
         
         # --- NEW: compute query-dependent gate from pre-norm hidden_states ---
         gate = None
@@ -246,15 +377,44 @@ class MultiHeadSelfAttention(nn.Module):
             q = rotary_emb(q, position_ids)  # [B, nh, T, hd]
             k = rotary_emb(k, position_ids)
 
+        current_k = k
+        current_v = v
+        if past_key_value is None:
+            combined_k = current_k
+            combined_v = current_v
+            combined_mask = current_key_valid_mask
+        else:
+            combined_k = torch.cat((past_key_value.key, current_k), dim=2)
+            combined_v = torch.cat((past_key_value.value, current_v), dim=2)
+            combined_mask = torch.cat(
+                (
+                    past_key_value.key_valid_mask,
+                    current_key_valid_mask,
+                ),
+                dim=1,
+            )
+        expected_bias_shape = (B, 1, T, combined_k.shape[2])
+        if attention_bias is None or attention_bias.shape != expected_bias_shape:
+            raise ValueError(
+                "attention_bias must have shape [B, 1, Q, P+Q]"
+            )
+        if attention_bias.device != hidden_states.device:
+            raise ValueError("attention_bias and hidden states must share a device")
+        if not attention_bias.is_floating_point():
+            raise TypeError("attention_bias must have a floating dtype")
+
         # 4) 如果 num_kv_heads < num_heads，则复制 KV 以实现 GQA/MQA
         if self.num_kv_heads != self.num_heads:
             n_rep = self.num_heads // self.num_kv_heads
-            k = self._repeat_kv(k, n_rep)  # [B, nh, T, hd]
-            v = self._repeat_kv(v, n_rep)  # [B, nh, T, hd]
+            k = self._repeat_kv(combined_k, n_rep)
+            v = self._repeat_kv(combined_v, n_rep)
+        else:
+            k = combined_k
+            v = combined_v
             
         # 5) SDPA/FlashAttention
         if self.use_flash_attention:
-            attn_mask = attention_mask
+            attn_mask = attention_bias
             
             # [FIX 1] Dtype 修正：必须让 bias (mask) 的类型匹配 query 的类型 (bf16/fp16)
             if attn_mask is not None and attn_mask.dtype != q.dtype:
@@ -269,15 +429,21 @@ class MultiHeadSelfAttention(nn.Module):
                 is_causal=False,
             )
         else:
-            scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)
-            if attention_mask is not None:
+            q_float = q.float()
+            k_float = k.float()
+            value_float = v.float()
+            scores = torch.matmul(
+                q_float,
+                k_float.transpose(-1, -2),
+            ) / math.sqrt(self.head_dim)
+            if attention_bias is not None:
                 # [FIX 1] 这里也加上 dtype 转换更安全
-                if attention_mask.dtype != scores.dtype:
-                    attention_mask = attention_mask.to(scores.dtype)
-                scores = scores + attention_mask
+                if attention_bias.dtype != scores.dtype:
+                    attention_bias = attention_bias.to(scores.dtype)
+                scores = scores + attention_bias
 
             attn = torch.softmax(scores, dim=-1)
-            out = torch.matmul(attn, v)  # [B, nh, T, hd]
+            out = torch.matmul(attn, value_float).to(dtype=v.dtype)
             
         # 6) Gate & Output
         if gate is not None:
@@ -286,7 +452,16 @@ class MultiHeadSelfAttention(nn.Module):
         # 6) 合并 heads + 输出投影
         out = out.transpose(1, 2).contiguous().view(B, T, self.num_heads * self.head_dim)
         out = self.o_proj(out) # [B, T, hidden_size]
-        return out
+        out = out.masked_fill(~current_key_valid_mask.unsqueeze(-1), 0)
+
+        present = None
+        if use_cache:
+            present = AttentionKV(
+                key=combined_k,
+                value=combined_v,
+                key_valid_mask=combined_mask,
+            )
+        return out, present
 
 
 class CausalConv1d(nn.Module):
@@ -529,15 +704,33 @@ class ThinkerDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
         position_ids: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        *,
+        past_key_value: AttentionKV | None = None,
+        current_key_valid_mask: torch.Tensor | None = None,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], AttentionKV | None]:
         residual = hidden_states
         hidden_states = self.attn_norm(hidden_states)
-        attn_out = self.self_attn(
-            hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            rotary_emb=self.rotary_emb,
-        )
+        if isinstance(self.self_attn, MultiHeadSelfAttention):
+            attn_out, present_key_value = self.self_attn(
+                hidden_states,
+                attention_bias=attention_mask,
+                position_ids=position_ids,
+                rotary_emb=self.rotary_emb,
+                past_key_value=past_key_value,
+                current_key_valid_mask=current_key_valid_mask,
+                use_cache=use_cache,
+            )
+        else:
+            if use_cache or past_key_value is not None:
+                raise ValueError("DeltaNet does not implement decoder cache")
+            attn_out = self.self_attn(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                rotary_emb=self.rotary_emb,
+            )
+            present_key_value = None
         hidden_states = residual + attn_out
 
         # FFN: Shared Dense + Optional MoE
@@ -555,11 +748,565 @@ class ThinkerDecoderLayer(nn.Module):
             mlp_out = shared_out
 
         hidden_states = residual + mlp_out
-        return hidden_states, aux_loss
+        return hidden_states, aux_loss, present_key_value
 
 
-class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
+class LegacyIncrementalDecodeMixin:
+    """Typed legacy-only prefill/decode adapter shared by standard and TP."""
+
+    _tp_local_shard_cache_validated = False
+
+    @property
+    def cache_support(self):
+        return cache_support_for_legacy_layers(
+            self.layers,
+            protocol_implemented=True,
+            tp_local_shard_validated=self._tp_local_shard_cache_validated,
+        )
+
+    def _require_cache_runtime(self) -> tuple[int, ...]:
+        scan = require_incremental_decode_support(
+            self.layers,
+            protocol_implemented=True,
+            tp_local_shard_validated=self._tp_local_shard_cache_validated,
+        )
+        if self.training:
+            raise RuntimeError(
+                "incremental decode requires model.eval() inference mode"
+            )
+        return scan.cacheable_layer_indices
+
+    def _model_device_dtype(self) -> tuple[torch.device, torch.dtype]:
+        weight = self.embed_tokens.weight
+        return weight.device, weight.dtype
+
+    def create_state_owner(self, display_request_id: str) -> StateOwner:
+        """Create one request owner, synchronized across a TP group."""
+
+        local_owner: StateOwner | None = None
+        validation_error: Exception | None = None
+        try:
+            local_owner = StateOwner.fresh(display_request_id)
+        except Exception as error:
+            validation_error = error
+        self._synchronize_precompute_error(validation_error)
+        assert local_owner is not None
+
+        if not self._tp_local_shard_cache_validated:
+            return local_owner
+
+        import torch.distributed as dist
+
+        if not dist.is_available() or not dist.is_initialized():
+            return local_owner
+        from qwen3_omni_pretrain.parallel import (
+            get_tensor_model_parallel_group,
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
+
+        if get_tensor_model_parallel_world_size() <= 1:
+            return local_owner
+        device, _ = self._model_device_dtype()
+        nonce_values = (
+            tuple(local_owner.nonce)
+            if get_tensor_model_parallel_rank() == 0
+            else (0,) * len(local_owner.nonce)
+        )
+        nonce = torch.tensor(
+            nonce_values,
+            dtype=torch.int32,
+            device=device,
+        )
+        dist.all_reduce(
+            nonce,
+            op=dist.ReduceOp.SUM,
+            group=get_tensor_model_parallel_group(),
+        )
+        synchronized = StateOwner(
+            display_request_id,
+            bytes(int(value) for value in nonce.cpu().tolist()),
+        )
+        self._synchronize_precompute_error(None, owner=synchronized)
+        return synchronized
+
+    def _synchronize_precompute_error(
+        self,
+        error: Exception | None,
+        *,
+        owner: StateOwner | None = None,
+    ) -> None:
+        """Make TP validation and owner identity collective before compute."""
+
+        if self._tp_local_shard_cache_validated:
+            import torch.distributed as dist
+
+            if dist.is_available() and dist.is_initialized():
+                from qwen3_omni_pretrain.parallel import (
+                    get_tensor_model_parallel_group,
+                    get_tensor_model_parallel_world_size,
+                )
+
+                if get_tensor_model_parallel_world_size() > 1:
+                    device, _ = self._model_device_dtype()
+                    failed = torch.tensor(
+                        [int(error is not None)],
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    dist.all_reduce(
+                        failed,
+                        op=dist.ReduceOp.MAX,
+                        group=get_tensor_model_parallel_group(),
+                    )
+                    if bool(failed.item()):
+                        if error is not None:
+                            raise error
+                        raise RuntimeError(
+                            "a tensor-parallel peer failed cache preflight"
+                        )
+                    if owner is not None:
+                        digest = hashlib.sha256(
+                            owner.display_request_id.encode("utf-8")
+                            + b"\0"
+                            + owner.nonce
+                        ).digest()
+                        local_digest = torch.tensor(
+                            tuple(digest),
+                            dtype=torch.int32,
+                            device=device,
+                        )
+                        gathered = [
+                            torch.empty_like(local_digest)
+                            for _ in range(
+                                get_tensor_model_parallel_world_size()
+                            )
+                        ]
+                        dist.all_gather(
+                            gathered,
+                            local_digest,
+                            group=get_tensor_model_parallel_group(),
+                        )
+                        if any(
+                            not torch.equal(gathered[0], candidate)
+                            for candidate in gathered[1:]
+                        ):
+                            raise CacheCapabilityError(
+                                CacheErrorCode.STATE_OWNER_MISMATCH,
+                                "tensor-parallel ranks must share one state owner",
+                            )
+        if error is not None:
+            raise error
+
+    def _validate_query_boundary(
+        self,
+        *,
+        key_valid_mask: torch.Tensor,
+        position_batch,
+        require_position: bool,
+        past_storage_length: int,
+    ) -> torch.Tensor:
+        device, _ = self._model_device_dtype()
+        if key_valid_mask.device != device:
+            raise ValueError("model inputs and parameters must share a device")
+        if bool((~key_valid_mask.any(dim=1)).any().item()):
+            raise ValueError("every batch row must contain a valid token")
+        total_storage_length = past_storage_length + key_valid_mask.shape[1]
+        max_positions = self.thinker_cfg.max_position_embeddings
+        if total_storage_length > max_positions:
+            raise CacheCapabilityError(
+                CacheErrorCode.CONTEXT_OVERFLOW,
+                "cached storage length exceeds max_position_embeddings",
+            )
+        if position_batch is None:
+            if require_position:
+                raise ValueError("cache runtime requires an explicit PositionBatch")
+            return torch.arange(
+                key_valid_mask.shape[1],
+                dtype=torch.long,
+                device=device,
+            ).unsqueeze(0).expand(key_valid_mask.shape[0], -1)
+        try:
+            return legacy_position_ids(
+                position_batch,
+                key_valid_mask,
+                max_position_embeddings=max_positions,
+            )
+        except (TypeError, ValueError) as error:
+            if "max_position_embeddings" in str(error):
+                raise CacheCapabilityError(
+                    CacheErrorCode.CONTEXT_OVERFLOW,
+                    str(error),
+                ) from error
+            raise
+
+    def _validate_payload_device_dtype(
+        self,
+        inputs: ModelPrefillInputs,
+    ) -> None:
+        device, dtype = self._model_device_dtype()
+        payload = (
+            inputs.input_ids
+            if inputs.input_ids is not None
+            else inputs.inputs_embeds
+        )
+        assert payload is not None
+        if payload.device != device:
+            raise ValueError("model input and parameters must share a device")
+        if inputs.inputs_embeds is not None and inputs.inputs_embeds.dtype != dtype:
+            raise ValueError("inputs_embeds dtype must match model parameters")
+        if inputs.inputs_embeds is not None and inputs.inputs_embeds.shape[2] != (
+            self.thinker_cfg.hidden_size
+        ):
+            raise ValueError("inputs_embeds hidden size does not match the model")
+        if inputs.input_ids is not None and bool(
+            (inputs.input_ids >= self.vocab_size).any().item()
+        ):
+            raise ValueError("input_ids contain an ID outside the model vocabulary")
+        if inputs.media is not None:
+            raise ValueError(
+                "text Thinker does not accept raw media; use the vision/audio wrapper"
+            )
+
+    def _validate_cache_topology(
+        self,
+        state: DecoderState,
+        expected_layers: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        for layer_index in expected_layers:
+            cache = state.full_attention_kv[layer_index]
+            attention = self.layers[layer_index].self_attn
+            expected_heads = getattr(
+                attention,
+                "num_kv_heads_per_partition",
+                getattr(attention, "num_kv_heads", None),
+            )
+            expected_head_dim = getattr(attention, "head_dim", None)
+            if (
+                type(expected_heads) is not int
+                or type(expected_head_dim) is not int
+            ):
+                raise TypeError("cacheable attention topology is unavailable")
+            if (
+                cache.key.shape[1] != expected_heads
+                or cache.key.shape[3] != expected_head_dim
+                or cache.value.shape[3] != expected_head_dim
+                or cache.key.dtype != dtype
+                or cache.key.device != device
+            ):
+                raise ValueError(
+                    f"cache topology for layer {layer_index} does not match the model"
+                )
+
+    def _run_typed_layers(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        current_key_valid_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        past_key_values: dict[int, AttentionKV] | None,
+        use_cache: bool,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        dict[int, AttentionKV],
+    ]:
+        past_mask = None
+        if past_key_values:
+            past_mask = next(iter(past_key_values.values())).key_valid_mask
+        attention_bias = _build_rectangular_causal_bias(
+            past_key_valid_mask=past_mask,
+            current_key_valid_mask=current_key_valid_mask,
+            dtype=hidden_states.dtype,
+        )
+        total_aux_loss = None
+        candidates: dict[int, AttentionKV] = {}
+        for layer_index, layer in enumerate(self.layers):
+            past = (
+                None
+                if past_key_values is None
+                else past_key_values.get(layer_index)
+            )
+            hidden_states, layer_aux, present = layer(
+                hidden_states,
+                attention_bias,
+                position_ids,
+                past_key_value=past,
+                current_key_valid_mask=current_key_valid_mask,
+                use_cache=use_cache,
+            )
+            if use_cache:
+                if present is None:
+                    raise RuntimeError(
+                        f"cacheable layer {layer_index} returned no KV state"
+                    )
+                candidates[layer_index] = present
+            if layer_aux is not None:
+                total_aux_loss = (
+                    layer_aux
+                    if total_aux_loss is None
+                    else total_aux_loss + layer_aux
+                )
+        hidden_states = self.norm(hidden_states)
+        logits = self.lm_head(hidden_states)
+        return logits, total_aux_loss, candidates
+
+    @staticmethod
+    def _prefill_cursor(
+        position_ids: torch.Tensor,
+        key_valid_mask: torch.Tensor,
+    ) -> LegacyPositionCursor:
+        batch_size, query_length = key_valid_mask.shape
+        next_positions = torch.full(
+            (batch_size,),
+            query_length,
+            dtype=torch.long,
+            device=position_ids.device,
+        )
+        for row in range(batch_size):
+            valid = position_ids[row].masked_select(key_valid_mask[row])
+            next_positions[row] = torch.maximum(
+                next_positions[row],
+                valid.max() + 1,
+            )
+        return LegacyPositionCursor(next_positions)
+
+    @staticmethod
+    def _decode_cursor(
+        old: LegacyPositionCursor,
+        position_ids: torch.Tensor,
+        key_valid_mask: torch.Tensor,
+    ) -> LegacyPositionCursor:
+        query_length = key_valid_mask.shape[1]
+        next_positions = old.next_storage_position + query_length
+        for row in range(key_valid_mask.shape[0]):
+            valid = position_ids[row].masked_select(key_valid_mask[row])
+            next_positions[row] = torch.maximum(
+                next_positions[row],
+                valid.max() + 1,
+            )
+        return LegacyPositionCursor(next_positions)
+
+    @staticmethod
+    def _validate_decode_positions(
+        cursor: LegacyPositionCursor,
+        position_ids: torch.Tensor,
+        key_valid_mask: torch.Tensor,
+    ) -> None:
+        for row in range(key_valid_mask.shape[0]):
+            valid = position_ids[row].masked_select(key_valid_mask[row])
+            if valid[0] < cursor.next_storage_position[row]:
+                raise ValueError(
+                    "decode positions cannot move before the storage cursor"
+                )
+            if valid.numel() > 1 and bool((valid[1:] <= valid[:-1]).any().item()):
+                raise ValueError("valid legacy decode positions must increase")
+
+    def prefill(
+        self,
+        *,
+        inputs: ModelPrefillInputs,
+        owner: StateOwner,
+        use_cache: bool,
+    ) -> CausalLMOutput:
+        validation_error: Exception | None = None
+        expected_layers: tuple[int, ...] = ()
+        position_ids: torch.Tensor | None = None
+        try:
+            if not isinstance(inputs, ModelPrefillInputs):
+                raise TypeError("inputs must be ModelPrefillInputs")
+            if not isinstance(owner, StateOwner):
+                raise TypeError("owner must be StateOwner")
+            if type(use_cache) is not bool:
+                raise TypeError("use_cache must be a boolean")
+            if use_cache:
+                expected_layers = self._require_cache_runtime()
+            self._validate_payload_device_dtype(inputs)
+            position_ids = self._validate_query_boundary(
+                key_valid_mask=inputs.key_valid_mask,
+                position_batch=inputs.position_batch,
+                require_position=use_cache,
+                past_storage_length=0,
+            )
+            if use_cache and tuple(range(len(self.layers))) != expected_layers:
+                raise RuntimeError("cache layer scan did not cover every layer")
+        except Exception as error:
+            validation_error = error
+        self._synchronize_precompute_error(
+            validation_error,
+            owner=owner if isinstance(owner, StateOwner) else None,
+        )
+        assert isinstance(inputs, ModelPrefillInputs)
+        assert isinstance(owner, StateOwner)
+        assert position_ids is not None
+
+        with torch.inference_mode():
+            hidden_states = (
+                self.embed_tokens(inputs.input_ids)
+                if inputs.input_ids is not None
+                else inputs.inputs_embeds
+            )
+            assert hidden_states is not None
+            logits, aux_loss, candidates = self._run_typed_layers(
+                hidden_states=hidden_states,
+                current_key_valid_mask=inputs.key_valid_mask,
+                position_ids=position_ids,
+                past_key_values=None,
+                use_cache=use_cache,
+            )
+            state = None
+            if use_cache:
+                assert inputs.position_batch is not None
+                position = DecoderPositionState(
+                    cached=inputs.position_batch,
+                    key_valid_mask=inputs.key_valid_mask,
+                    continuation=self._prefill_cursor(
+                        position_ids,
+                        inputs.key_valid_mask,
+                    ),
+                )
+                state = DecoderState(
+                    owner=owner,
+                    seen_tokens=inputs.key_valid_mask.sum(dim=1).to(torch.long),
+                    position=position,
+                    full_attention_kv=candidates,
+                    swa_kv={},
+                    processed_media=None,
+                    gdn_state=None,
+                    talker_state=None,
+                    mtp_state=None,
+                    codec_state=None,
+                )
+            return CausalLMOutput(
+                logits=logits,
+                loss=None,
+                ce_loss=None,
+                aux_loss=aux_loss,
+                decoder_state=state,
+                hidden_states=None,
+            )
+
+    def decode(
+        self,
+        *,
+        inputs: ModelDecodeInputs,
+        owner: StateOwner,
+    ) -> CausalLMOutput:
+        validation_error: Exception | None = None
+        state: DecoderState | None = None
+        expected_layers: tuple[int, ...] = ()
+        position_ids: torch.Tensor | None = None
+        try:
+            if not isinstance(inputs, ModelDecodeInputs):
+                raise TypeError("inputs must be ModelDecodeInputs")
+            if not isinstance(owner, StateOwner):
+                raise TypeError("owner must be StateOwner")
+            state = inputs.decoder_state
+            state.assert_owner(owner)
+            expected_layers = self._require_cache_runtime()
+            state.validate_full_attention_layers(expected_layers)
+            if state.position is None:
+                raise ValueError("decode state requires complete position history")
+            if not isinstance(
+                state.position.continuation,
+                LegacyPositionCursor,
+            ):
+                raise ValueError("legacy Thinker requires a LegacyPositionCursor")
+            if not torch.equal(
+                state.seen_tokens,
+                state.position.key_valid_mask.sum(dim=1).to(torch.long),
+            ):
+                raise ValueError("seen_tokens and cached valid positions disagree")
+            device, dtype = self._model_device_dtype()
+            if inputs.token_ids.device != device:
+                raise ValueError("model input and parameters must share a device")
+            if bool((inputs.token_ids >= self.vocab_size).any().item()):
+                raise ValueError("token_ids contain an ID outside the model vocabulary")
+            legacy_position_ids(
+                state.position.cached,
+                state.position.key_valid_mask,
+                max_position_embeddings=self.thinker_cfg.max_position_embeddings,
+            )
+            self._validate_cache_topology(
+                state,
+                expected_layers,
+                dtype,
+                device,
+            )
+            position_ids = self._validate_query_boundary(
+                key_valid_mask=inputs.current_key_valid_mask,
+                position_batch=inputs.position_batch,
+                require_position=True,
+                past_storage_length=state.position.sequence_length,
+            )
+            self._validate_decode_positions(
+                state.position.continuation,
+                position_ids,
+                inputs.current_key_valid_mask,
+            )
+        except Exception as error:
+            validation_error = error
+        self._synchronize_precompute_error(
+            validation_error,
+            owner=owner if isinstance(owner, StateOwner) else None,
+        )
+        assert isinstance(inputs, ModelDecodeInputs)
+        assert isinstance(owner, StateOwner)
+        assert state is not None and state.position is not None
+        assert position_ids is not None
+
+        with torch.inference_mode():
+            hidden_states = self.embed_tokens(inputs.token_ids)
+            logits, aux_loss, candidates = self._run_typed_layers(
+                hidden_states=hidden_states,
+                current_key_valid_mask=inputs.current_key_valid_mask,
+                position_ids=position_ids,
+                past_key_values=dict(state.full_attention_kv),
+                use_cache=True,
+            )
+            continuation = self._decode_cursor(
+                state.position.continuation,
+                position_ids,
+                inputs.current_key_valid_mask,
+            )
+            position = state.position.append(
+                current=inputs.position_batch,
+                current_key_valid_mask=inputs.current_key_valid_mask,
+                continuation=continuation,
+            )
+            candidate = DecoderState(
+                owner=state.owner,
+                seen_tokens=(
+                    state.seen_tokens
+                    + inputs.current_key_valid_mask.sum(dim=1).to(torch.long)
+                ),
+                position=position,
+                full_attention_kv=candidates,
+                swa_kv=state.swa_kv,
+                processed_media=state.processed_media,
+                gdn_state=state.gdn_state,
+                talker_state=state.talker_state,
+                mtp_state=state.mtp_state,
+                codec_state=state.codec_state,
+            )
+            return CausalLMOutput(
+                logits=logits,
+                loss=None,
+                ce_loss=None,
+                aux_loss=aux_loss,
+                decoder_state=candidate,
+                hidden_states=None,
+            )
+
+
+class Qwen3OmniMoeThinkerTextModel(
+    LegacyIncrementalDecodeMixin,
+    PreTrainedModel,
+):
     config_class = Qwen3OmniMoeConfig
+    _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config: Qwen3OmniMoeConfig):
         super().__init__(config)
@@ -596,23 +1343,21 @@ class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
 
         self.use_flash_attention = getattr(thinker_cfg, "use_flash_attention", False)
 
-        # 解析 moe_layer_indices: 例如 "0,2,4" -> {0,2,4}
-        moe_layer_set = None
-        if getattr(thinker_cfg, "moe_layer_indices", None) is not None:
-            indices_str = thinker_cfg.moe_layer_indices
-            if isinstance(indices_str, str) and indices_str.strip():
-                moe_layer_set = set(
-                    int(x) for x in indices_str.split(",") if x.strip().isdigit()
-                )
-                
-        # 解析 deltanet_layer_indices: 例如 "0,1,2,4,5,6"
-        deltanet_layer_set = None
-        if getattr(thinker_cfg, "deltanet_layer_indices", None) is not None:
-            indices_str = thinker_cfg.deltanet_layer_indices
-            if isinstance(indices_str, str) and indices_str.strip():
-                deltanet_layer_set = set(
-                    int(x) for x in indices_str.split(",") if x.strip().isdigit()
-                )
+        moe_layers = parse_layer_indices(
+            thinker_cfg.moe_layer_indices,
+            layer_count=thinker_cfg.num_hidden_layers,
+            field="moe_layer_indices",
+        )
+        moe_layer_set = set(moe_layers) if moe_layers else None
+
+        deltanet_layers = parse_layer_indices(
+            thinker_cfg.deltanet_layer_indices,
+            layer_count=thinker_cfg.num_hidden_layers,
+            field="deltanet_layer_indices",
+        )
+        deltanet_layer_set = (
+            set(deltanet_layers) if deltanet_layers else None
+        )
 
         use_deltanet_global = getattr(thinker_cfg, "use_deltanet", False)
         self.gradient_checkpointing = getattr(thinker_cfg, "gradient_checkpointing", False)
@@ -660,22 +1405,22 @@ class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
         attention_mask: Optional[torch.Tensor],
         input_shape: Tuple[int, int],
         device: torch.device,
+        *,
+        dtype: torch.dtype = torch.float32,
+        past_key_valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         bsz, tgt_len = input_shape
         if attention_mask is None:
-            attention_mask = torch.ones((bsz, tgt_len), device=device)
-        # causal mask [1, 1, T, T]
-        causal_mask = torch.full(
-            (tgt_len, tgt_len),
-            fill_value=-float("inf"),
-            device=device,
+            attention_mask = torch.ones(
+                (bsz, tgt_len),
+                dtype=torch.bool,
+                device=device,
+            )
+        return _build_rectangular_causal_bias(
+            past_key_valid_mask=past_key_valid_mask,
+            current_key_valid_mask=attention_mask,
+            dtype=dtype,
         )
-        causal_mask = torch.triu(causal_mask, diagonal=1)
-        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
-
-        # padding mask [B, 1, 1, T]
-        padding_mask = (1.0 - attention_mask[:, None, None, :]) * -1e4
-        return causal_mask + padding_mask
 
     def forward(
         self,
@@ -708,8 +1453,30 @@ class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
                 seq_len, dtype=torch.long, device=device
             ).unsqueeze(0).expand(bsz, -1)  # [B, T]
 
+        if attention_mask is None:
+            current_key_valid_mask = torch.ones(
+                (bsz, seq_len),
+                dtype=torch.bool,
+                device=device,
+            )
+        else:
+            if not isinstance(attention_mask, torch.Tensor):
+                raise TypeError("attention_mask must be a torch.Tensor")
+            if attention_mask.shape != (bsz, seq_len):
+                raise ValueError("attention_mask must have shape [B, T]")
+            if attention_mask.device != device:
+                raise ValueError("attention_mask and inputs must share a device")
+            if not bool(
+                ((attention_mask == 0) | (attention_mask == 1)).all().item()
+            ):
+                raise ValueError("attention_mask values must be 0 or 1")
+            current_key_valid_mask = attention_mask.to(dtype=torch.bool)
+
         attention_mask_full = self._prepare_attention_mask(
-            attention_mask, (bsz, seq_len), device
+            current_key_valid_mask,
+            (bsz, seq_len),
+            device,
+            dtype=hidden_states.dtype,
         )
 
         all_hidden_states = [] if output_hidden_states else None
@@ -722,7 +1489,13 @@ class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
 
             if self.gradient_checkpointing and self.training:
                 def layer_forward(x, pos_ids):
-                    return layer(x, attention_mask_full, pos_ids)
+                    layer_hidden, layer_aux, _ = layer(
+                        x,
+                        attention_mask_full,
+                        pos_ids,
+                        current_key_valid_mask=current_key_valid_mask,
+                    )
+                    return layer_hidden, layer_aux
 
                 hidden_states, layer_aux = torch.utils.checkpoint.checkpoint(
                     layer_forward,
@@ -731,8 +1504,11 @@ class Qwen3OmniMoeThinkerTextModel(PreTrainedModel):
                     use_reentrant=False,
                 )
             else:
-                hidden_states, layer_aux = layer(
-                    hidden_states, attention_mask_full, position_ids
+                hidden_states, layer_aux, _ = layer(
+                    hidden_states,
+                    attention_mask_full,
+                    position_ids,
+                    current_key_valid_mask=current_key_valid_mask,
                 )
             if layer_aux is not None:
                 if total_aux_loss is None:

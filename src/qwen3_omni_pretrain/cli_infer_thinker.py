@@ -1,7 +1,7 @@
 import argparse
 import json
 import os
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Mapping
 
 import torch
 from transformers import AutoTokenizer
@@ -12,7 +12,32 @@ from qwen3_omni_pretrain.models.qwen3_omni_moe.modeling_thinker_text import (
 from qwen3_omni_pretrain.models.qwen3_omni_moe.modeling_thinker_vision_audio import (
     Qwen3OmniMoeThinkerVisionAudioModel,
 )
-from qwen3_omni_pretrain.data.collators import OmniStage2Collator
+from qwen3_omni_pretrain.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+    Qwen3OmniMoeConfig,
+)
+from qwen3_omni_pretrain.multimodal.tokenization.special_tokens import (
+    reconcile_multimodal_token_ids,
+)
+from qwen3_omni_pretrain.data.collators import Stage2MediaLoader
+from qwen3_omni_pretrain.architecture.checkpoint_metadata import (
+    CheckpointArtifactKind,
+    describe_model_topology,
+    load_checkpoint_metadata,
+    tokenizer_identity_sha256,
+)
+from qwen3_omni_pretrain.architecture.summary import summarize_model
+from qwen3_omni_pretrain.multimodal.types import PositionBatch
+from qwen3_omni_pretrain.runtime import (
+    CacheCapableModel,
+    CacheCapabilityError,
+    CacheErrorCode,
+    GenerationRequest,
+    LegacyGreedyPrefillDecodeEngine,
+    LegacyMediaPrefillInputs,
+    ModelPrefillInputs,
+    require_incremental_decode_support,
+    validate_generation_operations,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,6 +83,20 @@ def parse_args() -> argparse.Namespace:
         help="Max tokens to autoregressively generate.",
     )
     parser.add_argument(
+        "--num-beams",
+        type=int,
+        default=1,
+        help="Beam count; the cache runtime currently supports exactly 1.",
+    )
+    parser.add_argument(
+        "--allow-uncached-fallback",
+        action="store_true",
+        help=(
+            "Allow the legacy full-history loop when the concrete model "
+            "does not support incremental decode state."
+        ),
+    )
+    parser.add_argument(
         "--dtype",
         choices=["auto", "float16", "bfloat16", "float32"],
         default="auto",
@@ -78,6 +117,14 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=2048,
         help="Tokenization max length for prompts.",
+    )
+    parser.add_argument(
+        "--skip_bad_media",
+        action="store_true",
+        help=(
+            "Treat referenced invalid media as absent and report "
+            "structured errors."
+        ),
     )
     parser.add_argument(
         "--chat",
@@ -147,13 +194,259 @@ def _ensure_tokenizer(tokenizer_name_or_path: Optional[str], checkpoint: str):
     return tokenizer
 
 
+def _inference_bootstrap_checkpoint(checkpoint: str) -> str:
+    """Choose a directory that can supply config/tokenizer before weight I/O."""
+    backup = checkpoint + ".backup"
+    if not os.path.isdir(checkpoint) and os.path.isdir(backup):
+        return backup
+    if (
+        os.path.isdir(backup)
+        and not os.path.isfile(os.path.join(checkpoint, "config.json"))
+        and os.path.isfile(os.path.join(backup, "config.json"))
+    ):
+        return backup
+    return checkpoint
+
+
+def _preflight_inference_identity(
+    *,
+    checkpoint: str,
+    model_config: Qwen3OmniMoeConfig,
+    tokenizer: object,
+    artifact_kind: CheckpointArtifactKind,
+    model_class,
+) -> tuple[str, ...]:
+    with torch.device("meta"):
+        graph = model_class(model_config)
+    thinker = graph.thinker if hasattr(graph, "thinker") else graph
+    manifest = thinker.config.profile_manifest
+    backup = checkpoint + ".backup"
+    expected_tokenizer_sha256 = None
+    if any(
+        os.path.isfile(os.path.join(candidate, "architecture.json"))
+        for candidate in (checkpoint, backup)
+    ):
+        expected_tokenizer_sha256 = tokenizer_identity_sha256(tokenizer)
+    expected = {
+        "expected_profile": manifest.architecture_profile,
+        "expected_compatibility": manifest.compatibility_level,
+        "expected_architecture": summarize_model(
+            thinker,
+            manifest,
+            tokenizer_vocab_size=len(tokenizer),  # type: ignore[arg-type]
+        ),
+        "expected_artifact_kind": artifact_kind,
+        "expected_topology": describe_model_topology(graph),
+        "expected_tokenizer_sha256": expected_tokenizer_sha256,
+        "legacy_config": model_config.to_dict(),
+    }
+    candidates = [checkpoint]
+    if os.path.isdir(backup):
+        primary_sidecar = os.path.isfile(
+            os.path.join(checkpoint, "architecture.json")
+        )
+        backup_sidecar = os.path.isfile(
+            os.path.join(backup, "architecture.json")
+        )
+        if backup_sidecar and not primary_sidecar:
+            candidates = [backup, checkpoint]
+        else:
+            candidates.append(backup)
+    compatible: list[str] = []
+    last_error: BaseException | None = None
+    for candidate in candidates:
+        try:
+            if not os.path.isdir(candidate) and any(
+                os.path.isdir(path) for path in candidates
+            ):
+                continue
+            load_checkpoint_metadata(candidate, **expected)
+            compatible.append(candidate)
+        except (ValueError, TypeError, OSError) as exc:
+            last_error = exc
+    if compatible:
+        return tuple(compatible)
+    raise ValueError(
+        f"no compatible inference checkpoint: {last_error}"
+    ) from last_error
+
+
+def _strict_from_pretrained_with_backup(
+    model_class,
+    candidates: tuple[str, ...],
+    *,
+    config: Qwen3OmniMoeConfig,
+    load_kwargs: Mapping[str, Any],
+):
+    last_error: BaseException | None = None
+    for candidate in candidates:
+        try:
+            loaded = model_class.from_pretrained(
+                candidate,
+                config=config,
+                output_loading_info=True,
+                **dict(load_kwargs),
+            )
+            if not isinstance(loaded, tuple) or len(loaded) != 2:
+                return loaded
+            model, loading_info = loaded
+            if any(
+                loading_info.get(key)
+                for key in (
+                    "missing_keys",
+                    "unexpected_keys",
+                    "mismatched_keys",
+                    "error_msgs",
+                )
+            ):
+                raise RuntimeError(
+                    "checkpoint failed strict inference loading: "
+                    f"{loading_info}"
+                )
+            return model
+        # Tensor readers use backend-specific exception types (for example,
+        # safetensors.SafetensorError).  This is the candidate recovery
+        # boundary, so retry every ordinary load failure while still allowing
+        # BaseException subclasses such as KeyboardInterrupt to propagate.
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(
+        "no identity-compatible inference checkpoint has a complete "
+        "tensor payload"
+    ) from last_error
+
+
+def _load_reconciled_stage2_model(
+    checkpoint: str,
+    tokenizer: Any,
+    *,
+    load_kwargs: Optional[Mapping[str, Any]] = None,
+) -> Qwen3OmniMoeThinkerVisionAudioModel:
+    bootstrap = _inference_bootstrap_checkpoint(checkpoint)
+    model_config = Qwen3OmniMoeConfig.from_legacy_pretrained_config(
+        bootstrap
+    )
+    reconcile_multimodal_token_ids(model_config, tokenizer)
+    candidates = _preflight_inference_identity(
+        checkpoint=checkpoint,
+        model_config=model_config,
+        tokenizer=tokenizer,
+        artifact_kind=CheckpointArtifactKind.STAGE2_TRAINING,
+        model_class=Qwen3OmniMoeThinkerVisionAudioModel,
+    )
+    return _strict_from_pretrained_with_backup(
+        Qwen3OmniMoeThinkerVisionAudioModel,
+        candidates or (checkpoint,),
+        config=model_config,
+        load_kwargs=dict(load_kwargs or {}),
+    )
+
+
+def _build_stage2_media_loader(
+    args: argparse.Namespace,
+) -> Stage2MediaLoader:
+    return Stage2MediaLoader(skip_bad_media=args.skip_bad_media)
+
+
+def _emit_stage2_media_errors(
+    errors: List[Dict[str, str]],
+) -> None:
+    for error in errors:
+        print(json.dumps({"media_error": error}, ensure_ascii=False))
+
+
+def _select_incremental_runtime(
+    model: object,
+) -> CacheCapabilityError | None:
+    if not isinstance(model, CacheCapableModel):
+        return CacheCapabilityError(
+            CacheErrorCode.PROFILE_RUNTIME_UNSUPPORTED,
+            "the concrete model does not implement the cache protocol",
+        )
+    thinker = getattr(model, "thinker", model)
+    layers = getattr(thinker, "layers", None)
+    if layers is None:
+        return CacheCapabilityError(
+            CacheErrorCode.PROFILE_RUNTIME_UNSUPPORTED,
+            "the concrete model does not expose decoder layers",
+        )
+    try:
+        require_incremental_decode_support(
+            layers,
+            protocol_implemented=True,
+            tp_local_shard_validated=bool(
+                getattr(
+                    thinker,
+                    "_tp_local_shard_cache_validated",
+                    False,
+                )
+            ),
+        )
+    except CacheCapabilityError as error:
+        return error
+    return None
+
+
+def _emit_uncached_fallback_warning(
+    *,
+    model: object,
+    display_request_id: str,
+    error: CacheCapabilityError,
+) -> None:
+    config = getattr(model, "config", None)
+    profile = getattr(config, "architecture_profile", "unknown")
+    print(
+        json.dumps(
+            {
+                "cache_warning": {
+                    "code": error.code.value,
+                    "profile": profile,
+                    "display_request_id": display_request_id,
+                    "reason": error.reason,
+                    "semantic_change": False,
+                }
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
+def _legacy_text_positions(
+    attention_mask: torch.Tensor,
+) -> PositionBatch:
+    mask = attention_mask.to(dtype=torch.bool)
+    position_ids = (mask.to(torch.long).cumsum(dim=1) - 1).clamp_min(0)
+    position_ids = position_ids.masked_fill(~mask, 0)
+    return PositionBatch(
+        position_ids=position_ids.unsqueeze(0),
+        rope_deltas=torch.zeros(
+            (mask.shape[0], 1),
+            dtype=torch.long,
+            device=mask.device,
+        ),
+        axis_names=("sequence",),
+    )
+
+
 def greedy_decode_stage1(
     model: Qwen3OmniMoeThinkerTextModel,
     tokenizer: AutoTokenizer,
     device: torch.device,
     prompt: str,
     max_new_tokens: int,
+    num_beams: int = 1,
+    allow_uncached_fallback: bool = False,
 ) -> Dict[str, Any]:
+    validate_generation_operations(num_beams=num_beams)
+    fallback_error = _select_incremental_runtime(model)
+    if fallback_error is not None:
+        if not allow_uncached_fallback:
+            raise fallback_error
+        _emit_uncached_fallback_warning(
+            model=model,
+            display_request_id=prompt,
+            error=fallback_error,
+        )
     model.eval()
     encoded = tokenizer(
         prompt,
@@ -164,28 +457,49 @@ def greedy_decode_stage1(
     input_ids = encoded["input_ids"].to(device)
     attention_mask = encoded.get("attention_mask", torch.ones_like(input_ids)).to(device)
 
-    generated = input_ids
-    input_len = generated.size(1)
+    input_len = input_ids.size(1)
     eos_id = tokenizer.eos_token_id
 
     import time
     t_start = time.perf_counter()
-    with torch.no_grad():
-        for _ in range(max_new_tokens):
-            out = model(
-                input_ids=generated,
-                attention_mask=attention_mask,
-                labels=None,
+    if fallback_error is None:
+        mask = attention_mask.to(dtype=torch.bool)
+        result = LegacyGreedyPrefillDecodeEngine(model).generate(
+            GenerationRequest(
+                display_request_id=prompt or "stage1-request",
+                prefill_inputs=ModelPrefillInputs(
+                    input_ids=input_ids,
+                    inputs_embeds=None,
+                    key_valid_mask=mask,
+                    position_batch=_legacy_text_positions(mask),
+                ),
+                max_new_tokens=max_new_tokens,
+                eos_token_id=eos_id,
+                num_beams=num_beams,
             )
-            logits = out["logits"]
-            next_token = torch.argmax(logits[:, -1, :], dim=-1)
-            generated = torch.cat([generated, next_token.unsqueeze(-1)], dim=-1)
-            attention_mask = torch.ones_like(generated, device=device)
-            if eos_id is not None and next_token.item() == eos_id:
-                break
+        )
+        new_tokens = result.generated_ids[0]
+    else:
+        generated = input_ids
+        with torch.inference_mode():
+            for _ in range(max_new_tokens):
+                out = model(
+                    input_ids=generated,
+                    attention_mask=attention_mask,
+                    labels=None,
+                )
+                logits = out["logits"]
+                next_token = torch.argmax(logits[:, -1, :], dim=-1)
+                generated = torch.cat(
+                    [generated, next_token.unsqueeze(-1)],
+                    dim=-1,
+                )
+                attention_mask = torch.ones_like(generated, device=device)
+                if eos_id is not None and next_token.item() == eos_id:
+                    break
+        new_tokens = generated[0, input_len:]
 
     elapsed = time.perf_counter() - t_start
-    new_tokens = generated[0, input_len:]
     completion = tokenizer.decode(new_tokens, skip_special_tokens=True)
     stats = {
         "input_tokens": input_len,
@@ -201,14 +515,27 @@ def greedy_decode_stage1(
 def greedy_decode_stage2(
     model: Qwen3OmniMoeThinkerVisionAudioModel,
     tokenizer: AutoTokenizer,
-    collator: OmniStage2Collator,
+    media_loader: Stage2MediaLoader,
     device: torch.device,
     sample: Dict[str, Any],
     max_new_tokens: int,
     image_root: str,
     audio_root: str,
     max_seq_length: int,
+    num_beams: int = 1,
+    allow_uncached_fallback: bool = False,
 ) -> Dict[str, Any]:
+    validate_generation_operations(num_beams=num_beams)
+    sample_id = str(sample.get("id", "inference-sample"))
+    fallback_error = _select_incremental_runtime(model)
+    if fallback_error is not None:
+        if not allow_uncached_fallback:
+            raise fallback_error
+        _emit_uncached_fallback_warning(
+            model=model,
+            display_request_id=sample_id,
+            error=fallback_error,
+        )
     model.eval()
     prompt_text = sample.get("input_text") or sample.get("text") or ""
 
@@ -222,61 +549,96 @@ def greedy_decode_stage2(
     input_ids = encoded["input_ids"].to(device)
     attention_mask = encoded.get("attention_mask", torch.ones_like(input_ids)).to(device)
 
-    # multimodal pieces
-    image_path = _resolve_path(sample.get("image"), image_root)
-    audio_path = _resolve_path(sample.get("audio"), audio_root)
+    image_result = media_loader.load_optional(
+        modality="image",
+        path=_resolve_path(sample.get("image"), image_root),
+        sample_id=sample_id,
+    )
+    audio_result = media_loader.load_optional(
+        modality="audio",
+        path=_resolve_path(sample.get("audio"), audio_root),
+        sample_id=sample_id,
+    )
+    media_errors = [
+        error
+        for error in (image_result.error, audio_result.error)
+        if error is not None
+    ]
 
-    pixel = torch.zeros(3, collator.image_size, collator.image_size)
-    has_image = torch.tensor([0], dtype=torch.long)
-    if image_path and os.path.exists(image_path):
-        try:
-            pixel = collator._load_image(image_path)
-            has_image = torch.tensor([1], dtype=torch.long)
-        except Exception:
-            pixel = torch.zeros(3, collator.image_size, collator.image_size)
-            has_image = torch.tensor([0], dtype=torch.long)
-    pixel_values = pixel.unsqueeze(0).to(device)
+    pixel_values = image_result.tensor.unsqueeze(0).to(device)
+    audio_values = audio_result.tensor.unsqueeze(0).to(device)
+    has_image = torch.tensor(
+        [image_result.present], dtype=torch.long, device=device
+    )
+    has_audio = torch.tensor(
+        [audio_result.present], dtype=torch.long, device=device
+    )
 
-    audio = torch.zeros(collator.max_audio_len)
-    has_audio = torch.tensor([0], dtype=torch.long)
-    if audio_path and os.path.exists(audio_path):
-        try:
-            audio = collator._load_audio(audio_path)
-            has_audio = torch.tensor([1], dtype=torch.long)
-        except Exception:
-            audio = torch.zeros(collator.max_audio_len)
-            has_audio = torch.tensor([0], dtype=torch.long)
-    audio_values = audio.unsqueeze(0).to(device)
-
-    has_image = has_image.to(device)
-    has_audio = has_audio.to(device)
-
-    generated = input_ids
-    input_len = generated.size(1)
+    input_len = input_ids.size(1)
     eos_id = tokenizer.eos_token_id
 
     import time
     t_start = time.perf_counter()
-    with torch.no_grad():
-        for _ in range(max_new_tokens):
-            out = model(
-                input_ids=generated,
-                attention_mask=attention_mask,
-                labels=None,
-                pixel_values=pixel_values,
-                audio_values=audio_values,
-                has_image=has_image,
-                has_audio=has_audio,
+    if fallback_error is None:
+        model_dtype = model.thinker.embed_tokens.weight.dtype
+        mask = attention_mask.to(dtype=torch.bool)
+        media = LegacyMediaPrefillInputs(
+            pixel_values=(
+                pixel_values.to(dtype=model_dtype)
+                if image_result.present
+                else None
+            ),
+            audio_values=(
+                audio_values.to(dtype=model_dtype)
+                if audio_result.present
+                else None
+            ),
+            has_image=has_image.to(dtype=torch.bool),
+            has_audio=has_audio.to(dtype=torch.bool),
+        )
+        result = LegacyGreedyPrefillDecodeEngine(model).generate(
+            GenerationRequest(
+                display_request_id=sample_id,
+                prefill_inputs=ModelPrefillInputs(
+                    input_ids=input_ids,
+                    inputs_embeds=None,
+                    key_valid_mask=mask,
+                    position_batch=_legacy_text_positions(mask),
+                    media=media,
+                ),
+                max_new_tokens=max_new_tokens,
+                eos_token_id=eos_id,
+                num_beams=num_beams,
             )
-            logits = out["logits"]
-            next_token = torch.argmax(logits[:, -1, :], dim=-1)
-            generated = torch.cat([generated, next_token.unsqueeze(-1)], dim=-1)
-            attention_mask = torch.ones_like(generated, device=device)
-            if eos_id is not None and next_token.item() == eos_id:
-                break
+        )
+        new_tokens = result.generated_ids[0]
+    else:
+        generated = input_ids
+        with torch.inference_mode():
+            for _ in range(max_new_tokens):
+                out = model(
+                    input_ids=generated,
+                    attention_mask=attention_mask,
+                    labels=None,
+                    pixel_values=pixel_values,
+                    audio_values=audio_values,
+                    has_image=has_image,
+                    has_audio=has_audio,
+                )
+                logits = out["logits"]
+                next_token = torch.argmax(
+                    logits[:, -1, :], dim=-1
+                ).to(generated.device)
+                generated = torch.cat(
+                    [generated, next_token.unsqueeze(-1)],
+                    dim=-1,
+                )
+                attention_mask = torch.ones_like(generated, device=device)
+                if eos_id is not None and next_token.item() == eos_id:
+                    break
+        new_tokens = generated[0, input_len:]
 
     elapsed = time.perf_counter() - t_start
-    new_tokens = generated[0, input_len:]
     completion = tokenizer.decode(new_tokens, skip_special_tokens=True)
     stats = {
         "input_tokens": input_len,
@@ -286,7 +648,11 @@ def greedy_decode_stage2(
         "output_toks_per_sec": (new_tokens.numel() / elapsed) if elapsed > 0 else float("inf"),
         "total_toks_per_sec": ((input_len + new_tokens.numel()) / elapsed) if elapsed > 0 else float("inf"),
     }
-    return {"text": completion, "stats": stats}
+    return {
+        "text": completion,
+        "stats": stats,
+        "media_errors": media_errors,
+    }
 
 
 def _print_stats(prefix: str, stats: Dict[str, Any]):
@@ -298,15 +664,37 @@ def _print_stats(prefix: str, stats: Dict[str, Any]):
 
 
 def run_stage1(args: argparse.Namespace):
+    validate_generation_operations(
+        num_beams=getattr(args, "num_beams", 1)
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = _get_dtype(args.dtype)
-    tokenizer = _ensure_tokenizer(args.tokenizer_name_or_path, args.checkpoint)
+    bootstrap = _inference_bootstrap_checkpoint(args.checkpoint)
+    tokenizer = _ensure_tokenizer(
+        args.tokenizer_name_or_path,
+        bootstrap,
+    )
 
     load_kwargs: Dict[str, Any] = {}
     if dtype is not None:
         load_kwargs["torch_dtype"] = dtype
     try:
-        model = Qwen3OmniMoeThinkerTextModel.from_pretrained(args.checkpoint, **load_kwargs)
+        model_config = Qwen3OmniMoeConfig.from_legacy_pretrained_config(
+            bootstrap
+        )
+        candidates = _preflight_inference_identity(
+            checkpoint=args.checkpoint,
+            model_config=model_config,
+            tokenizer=tokenizer,
+            artifact_kind=CheckpointArtifactKind.STAGE1_TRAINING,
+            model_class=Qwen3OmniMoeThinkerTextModel,
+        )
+        model = _strict_from_pretrained_with_backup(
+            Qwen3OmniMoeThinkerTextModel,
+            candidates or (args.checkpoint,),
+            config=model_config,
+            load_kwargs=load_kwargs,
+        )
     except ValueError as exc:
         msg = str(exc)
         if "torch.load" in msg or "CVE-2025-32434" in msg:
@@ -324,6 +712,8 @@ def run_stage1(args: argparse.Namespace):
             device=device,
             prompt=prompt,
             max_new_tokens=args.max_new_tokens,
+            num_beams=args.num_beams,
+            allow_uncached_fallback=args.allow_uncached_fallback,
         )
         print("=" * 40)
         print(f"[Stage1 Sample {idx}] Prompt: {prompt}")
@@ -359,16 +749,23 @@ def run_stage1(args: argparse.Namespace):
 
 
 def run_stage2(args: argparse.Namespace):
+    validate_generation_operations(
+        num_beams=getattr(args, "num_beams", 1)
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = _get_dtype(args.dtype)
     tokenizer = _ensure_tokenizer(args.tokenizer_name_or_path, args.checkpoint)
-    collator = OmniStage2Collator(tokenizer=tokenizer, max_seq_length=args.max_seq_length)
+    media_loader = _build_stage2_media_loader(args)
 
     load_kwargs: Dict[str, Any] = {}
     if dtype is not None:
         load_kwargs["torch_dtype"] = dtype
     try:
-        model = Qwen3OmniMoeThinkerVisionAudioModel.from_pretrained(args.checkpoint, **load_kwargs)
+        model = _load_reconciled_stage2_model(
+            args.checkpoint,
+            tokenizer,
+            load_kwargs=load_kwargs,
+        )
     except ValueError as exc:
         msg = str(exc)
         if "torch.load" in msg or "CVE-2025-32434" in msg:
@@ -383,14 +780,17 @@ def run_stage2(args: argparse.Namespace):
         result = greedy_decode_stage2(
             model=model,
             tokenizer=tokenizer,
-            collator=collator,
+            media_loader=media_loader,
             device=device,
             sample=sample,
             max_new_tokens=args.max_new_tokens,
             image_root=args.image_root,
             audio_root=args.audio_root,
             max_seq_length=args.max_seq_length,
+            num_beams=args.num_beams,
+            allow_uncached_fallback=args.allow_uncached_fallback,
         )
+        _emit_stage2_media_errors(result["media_errors"])
         target = sample.get("target_text") or ""
         print("=" * 40)
         print(f"[Stage2 Sample {idx}] input_text: {sample.get('input_text') or sample.get('text')}")

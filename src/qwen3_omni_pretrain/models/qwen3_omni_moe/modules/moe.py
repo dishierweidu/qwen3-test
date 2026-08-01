@@ -1,4 +1,4 @@
-# src/qwen3_omni_pretrain/models/qwen3_omni_moe/modules/moe.py
+from __future__ import annotations
 
 from typing import Tuple
 
@@ -6,8 +6,20 @@ import torch
 import torch.nn as nn
 
 
+def select_topk_routes(
+    router_probs: torch.Tensor,
+    *,
+    k: int,
+    renormalize: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    values, indices = router_probs.float().topk(k=int(k), dim=-1)
+    if renormalize:
+        values = values / values.sum(dim=-1, keepdim=True)
+    return values, indices
+
+
 class ExpertMLP(nn.Module):
-    """单个 Expert，用最简单的 SiLU-MLP。"""
+    """Two-layer SiLU expert used by the routed MoE block."""
 
     def __init__(self, hidden_size: int, intermediate_size: int):
         super().__init__()
@@ -21,14 +33,11 @@ class ExpertMLP(nn.Module):
 
 class Qwen3OmniMoeMLP(nn.Module):
     """
-    稀疏 Top-k MoE MLP + 负载均衡 aux loss。
+    Sparse top-k routed experts plus a Switch-style load-balancing loss.
 
-    - Router: Linear(H -> E)，softmax 后对每个 token 选 top-k expert
-    - 只对被选中的 (token, expert) 做前向，其他 expert 不算
-    - aux_loss: Switch/Mixtral 风格的负载均衡项
-      importance_i = mean(g_i)        # gate 概率在所有 token 上的均值
-      load_i       = fraction(token i 被路由到 expert i)
-      aux_loss = E * sum_i importance_i * load_i  ~ O(1)
+    The enclosing decoder layer already executes ``shared_mlp`` on every
+    token. This module intentionally contains routed experts only; enabling a
+    second internal shared expert would double-count the dense FFN path.
     """
 
     def __init__(
@@ -38,126 +47,140 @@ class Qwen3OmniMoeMLP(nn.Module):
         num_experts: int,
         num_experts_per_tok: int,
         *,
-        use_shared_expert: bool = True,
+        use_shared_expert: bool = False,
         shared_intermediate_size: int | None = None,
         router_init_std: float = 1e-3,
         router_normalize_init: bool = True,
         renormalize_topk: bool = True,
-    ):
+    ) -> None:
         super().__init__()
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.num_experts = num_experts
-        self.num_experts_per_tok = max(1, min(num_experts_per_tok, num_experts))
-        self.use_shared_expert = use_shared_expert
-        self.shared_intermediate_size = shared_intermediate_size
-        self.renormalize_topk = renormalize_topk
+        if num_experts <= 0:
+            raise ValueError("num_experts must be positive")
+        if use_shared_expert:
+            raise ValueError(
+                "Qwen3OmniMoeMLP must not create an internal shared expert: "
+                "the decoder shared_mlp already supplies the shared dense path. "
+                "Set use_shared_expert=false in the model config."
+            )
+        if shared_intermediate_size is not None:
+            raise ValueError(
+                "shared_intermediate_size is invalid when the decoder shared_mlp "
+                "owns the shared dense path"
+            )
 
-        self.gate = nn.Linear(hidden_size, num_experts, bias=False)
+        self.hidden_size = int(hidden_size)
+        self.intermediate_size = int(intermediate_size)
+        self.num_experts = int(num_experts)
+        self.num_experts_per_tok = max(
+            1, min(int(num_experts_per_tok), self.num_experts)
+        )
+        self.renormalize_topk = bool(renormalize_topk)
+
+        self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
         with torch.no_grad():
             self.gate.weight.normal_(mean=0.0, std=float(router_init_std))
             if router_normalize_init:
-                self.gate.weight.div_(torch.norm(self.gate.weight, dim=-1, keepdim=True) + 1e-6)
+                norms = torch.norm(self.gate.weight, dim=-1, keepdim=True)
+                self.gate.weight.div_(norms + 1e-6)
+
         self.experts = nn.ModuleList(
-            [ExpertMLP(hidden_size, intermediate_size) for _ in range(num_experts)]
+            [
+                ExpertMLP(self.hidden_size, self.intermediate_size)
+                for _ in range(self.num_experts)
+            ]
         )
+        # Kept for compatibility with parameter-inspection code and old callers.
         self.shared_expert = None
-        if self.use_shared_expert:
-            shared_int = shared_intermediate_size or intermediate_size
-            self.shared_expert = ExpertMLP(hidden_size, shared_int)
+        self.register_buffer(
+            "_nonfinite_diagnostic", torch.tensor(False), persistent=False
+        )
+        self._nonfinite_diagnostic_reason = (
+            "MoE router probabilities or auxiliary loss are non-finite"
+        )
+
+    @property
+    def num_experts_per_token(self) -> int:
+        return self.num_experts_per_tok
+
+    def expert_parameter_groups(
+        self,
+    ) -> tuple[tuple[nn.Parameter, ...], ...]:
+        return tuple(tuple(expert.parameters()) for expert in self.experts)
 
     def _dispatch_tokens(
-        self,
-        gate_probs: torch.Tensor,
+        self, gate_probs: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        根据 gate_probs 做 top-k，返回：
-        - token_indices_flat: [Nsel] 被选中的 token 在 flatten 后的 index
-        - expert_indices_flat: [Nsel] 对应的 expert id
-        - scores_flat: [Nsel] 对应的 gate 权重
-        """
-        nt, E = gate_probs.shape
-        k = self.num_experts_per_tok
+        if gate_probs.dim() != 2 or gate_probs.size(-1) != self.num_experts:
+            raise ValueError(
+                "gate_probs must have shape [num_tokens, num_experts]"
+            )
+        num_tokens = gate_probs.size(0)
+        topk_values, topk_indices = select_topk_routes(
+            gate_probs,
+            k=self.num_experts_per_tok,
+            renormalize=self.renormalize_topk,
+        )
 
-        # top-k: [NT, k]
-        topk_vals, topk_idx = gate_probs.topk(k=k, dim=-1)
-
-        # 展平
-        topk_vals_flat = topk_vals.reshape(-1)  # [NT * k]
-        topk_idx_flat = topk_idx.reshape(-1)    # [NT * k]
-
-        # 每个 (token, expert) 的 token 索引
         token_indices = (
-            torch.arange(nt, device=gate_probs.device)
+            torch.arange(num_tokens, device=gate_probs.device)
             .unsqueeze(1)
-            .expand(nt, k)
+            .expand(num_tokens, self.num_experts_per_tok)
             .reshape(-1)
-        )  # [NT * k]
-
-        return token_indices, topk_idx_flat, topk_vals_flat
+        )
+        return (
+            token_indices,
+            topk_indices.reshape(-1),
+            topk_values.reshape(-1),
+        )
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        x: [B, T, H]
-        return:
-          - y: [B, T, H]
-          - aux_loss: 标量 Tensor，用于负载均衡
-        """
-        B, T, H = x.shape
-        nt = B * T
-        x_flat = x.view(nt, H)  # [NT, H]
+        batch_size, sequence_length, hidden_size = x.shape
+        if hidden_size != self.hidden_size:
+            raise ValueError(
+                f"expected hidden size {self.hidden_size}, got {hidden_size}"
+            )
+        x_flat = x.reshape(batch_size * sequence_length, hidden_size)
+        gate_logits = self.gate(x_flat)
+        gate_probs = torch.softmax(gate_logits.float(), dim=-1)
+        token_indices, expert_indices, scores = self._dispatch_tokens(gate_probs)
 
-        # router logits & probs
-        gate_logits = self.gate(x_flat)                     # [NT, E]
-        gate_probs = torch.softmax(gate_logits, dim=-1)     # [NT, E]
-
-        # 计算 top-k token 分派
-        token_idx_flat, expert_idx_flat, scores_flat = self._dispatch_tokens(gate_probs)
-
-        # ----- 负载均衡 aux loss -----
-        E = self.num_experts
-        # importance_i: gate 概率在所有 token 上的均值
-        importance = gate_probs.mean(dim=0)  # [E]
-
-        # load_i: 实际被分配到 expert i 的 (token, expert) 对占比
-        load = torch.zeros(E, device=x_flat.device, dtype=gate_probs.dtype)
-        ones = torch.ones_like(expert_idx_flat, dtype=gate_probs.dtype)
-        load.index_add_(0, expert_idx_flat, ones)
-        load = load / expert_idx_flat.numel()  # 归一化到 [0,1], sum(load) = 1
-
-        aux_loss = (importance * load).sum() * E  # ~ O(1)
-
-        # ----- 稀疏前向：只算被选中的 (token, expert) -----
-        y_flat = torch.zeros_like(x_flat)  # [NT, H]
-
-        for e_id, expert in enumerate(self.experts):
-            # 找到属于该 expert 的 (token, gate) 条目
-            mask = (expert_idx_flat == e_id)  # [NT * k]
-            has_tokens = mask.any()
-            
-            # 重要：在 ZeRO-3 环境下，所有 rank 必须一起调用专家的前向传播
-            # 因为 ZeRO-3 需要在前向传播时收集参数，跳过会导致死锁
+        importance = gate_probs.mean(dim=0)
+        load = torch.zeros(
+            self.num_experts,
+            device=x_flat.device,
+            dtype=gate_probs.dtype,
+        )
+        load.index_add_(
+            0,
+            expert_indices,
+            torch.ones_like(expert_indices, dtype=gate_probs.dtype),
+        )
+        load = load / max(1, expert_indices.numel())
+        aux_loss = (importance * load).sum() * self.num_experts
+        self._nonfinite_diagnostic = (
+            (~torch.isfinite(gate_probs).all()) | (~torch.isfinite(aux_loss))
+        ).detach()
+        y_flat = torch.zeros_like(x_flat)
+        for expert_id, expert in enumerate(self.experts):
+            selected = expert_indices == expert_id
+            has_tokens = bool(selected.any().item())
             if has_tokens:
-                sel_token_idx = token_idx_flat[mask]  # [N_sel]
-                sel_scores = scores_flat[mask]        # [N_sel]
-                x_sel = x_flat[sel_token_idx]         # [N_sel, H]
+                selected_token_indices = token_indices[selected]
+                selected_scores = scores[selected]
+                expert_input = x_flat[selected_token_indices]
             else:
-                # Dummy forward to keep ZeRO-3 in sync across all ranks
-                sel_token_idx = None
-                sel_scores = None
-                x_sel = x_flat[:1]  # 使用一个 dummy token
+                # DeepSpeed ZeRO-3 ranks must execute every expert consistently.
+                selected_token_indices = None
+                selected_scores = None
+                expert_input = x_flat[:1]
 
-            out_sel = expert(x_sel)               # [N_sel, H]
-
-            # 只有实际有 token 的情况下才累加结果
+            expert_output = expert(expert_input)
             if has_tokens:
-                # gate 权重加权，然后 scatter 回 y_flat
-                weighted_out = out_sel * sel_scores.unsqueeze(-1)  # [N_sel, H]
-                # 一个 token 可能被多个 expert 选中，因此用 index_add_ 累加
-                y_flat.index_add_(0, sel_token_idx, weighted_out)
+                weighted_output = expert_output * selected_scores.to(
+                    expert_output.dtype
+                ).unsqueeze(-1)
+                y_flat.index_add_(
+                    0, selected_token_indices, weighted_output
+                )
 
-        if self.shared_expert is not None:
-            shared_out = self.shared_expert(x_flat)  # [NT, H]
-            y_flat = y_flat + shared_out
-
-        return y_flat.view(B, T, H), aux_loss
+        return y_flat.view(batch_size, sequence_length, hidden_size), aux_loss

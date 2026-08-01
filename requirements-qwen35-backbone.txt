@@ -1,0 +1,3 @@
+-r requirements.txt
+-c constraints/qwen35-backbone-py310.txt
+qwen-omni-utils==0.0.9

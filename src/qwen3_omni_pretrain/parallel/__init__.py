@@ -1,6 +1,6 @@
 # src/qwen3_omni_pretrain/parallel/__init__.py
 """
-3D Parallelism Module (TP + ZeRO + optional PP)
+Parallelism Module (TP + ZeRO + optional PP/EP)
 
 This module provides Tensor Parallelism (TP) support that can be combined with
 DeepSpeed ZeRO for 3D parallel training. It is designed as an optional feature
@@ -34,8 +34,24 @@ from qwen3_omni_pretrain.parallel.initialize import (
     get_data_parallel_group,
     get_data_parallel_rank,
     get_data_parallel_world_size,
+    get_expert_model_parallel_group,
+    get_expert_model_parallel_rank,
+    get_expert_model_parallel_world_size,
+    get_pipeline_model_parallel_group,
+    get_pipeline_model_parallel_rank,
+    get_pipeline_model_parallel_world_size,
     is_model_parallel_initialized,
     model_parallel_is_initialized,
+)
+
+from qwen3_omni_pretrain.parallel.expert_parallel import (
+    DispatchedTokens,
+    ExpertParallelContext,
+    ParallelTopology,
+    combine_from_experts,
+    create_expert_parallel_context,
+    dispatch_to_experts,
+    validate_parallel_topology,
 )
 
 from qwen3_omni_pretrain.parallel.tensor_parallel import (
@@ -72,6 +88,12 @@ __all__ = [
     "get_data_parallel_group",
     "get_data_parallel_rank",
     "get_data_parallel_world_size",
+    "get_expert_model_parallel_group",
+    "get_expert_model_parallel_rank",
+    "get_expert_model_parallel_world_size",
+    "get_pipeline_model_parallel_group",
+    "get_pipeline_model_parallel_rank",
+    "get_pipeline_model_parallel_world_size",
     "is_model_parallel_initialized",
     "model_parallel_is_initialized",
     # Tensor Parallel Layers
@@ -93,4 +115,12 @@ __all__ = [
     "gather_from_tensor_model_parallel_region",
     "reduce_from_tensor_model_parallel_region",
     "scatter_to_tensor_model_parallel_region",
+    # Expert parallelism
+    "DispatchedTokens",
+    "ExpertParallelContext",
+    "ParallelTopology",
+    "combine_from_experts",
+    "create_expert_parallel_context",
+    "dispatch_to_experts",
+    "validate_parallel_topology",
 ]

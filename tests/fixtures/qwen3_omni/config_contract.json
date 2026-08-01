@@ -1,0 +1,151 @@
+{
+  "audio_encoder": {
+    "conv_hidden_size": 480,
+    "conv_kernel_size": 3,
+    "conv_layers": 3,
+    "conv_stride": 2,
+    "hidden_size": 1280,
+    "input_sample_rate_hz": 16000,
+    "intermediate_size": 5120,
+    "num_attention_heads": 20,
+    "num_hidden_layers": 32,
+    "num_mel_bins": 128,
+    "projector_dimensions": [
+      1280,
+      1280,
+      2048
+    ]
+  },
+  "code2wav": {
+    "codebook_size": 2048,
+    "hidden_size": 1024,
+    "num_attention_heads": 16,
+    "num_hidden_layers": 8,
+    "num_quantizers": 16,
+    "num_semantic_quantizers": 1,
+    "output_sample_rate_hz": 24000,
+    "samples_per_code": 1920,
+    "sliding_window": 72,
+    "upsample_rates": [
+      8,
+      5,
+      4,
+      3
+    ],
+    "upsampling_ratios": [
+      2,
+      2
+    ]
+  },
+  "code_predictor": {
+    "hidden_size": 1024,
+    "intermediate_size": 3072,
+    "num_attention_heads": 16,
+    "num_code_groups": 16,
+    "num_hidden_layers": 5,
+    "num_key_value_heads": 8,
+    "vocab_size": 2048
+  },
+  "schema_version": 1,
+  "source": {
+    "artifacts": {
+      "README.md": {
+        "revision": "26291f793822fb6be9555850f06dfe95f2d7e695",
+        "sha256": "0e44065c4c4a27071f7239afd5b5a33af5bc2e437dd7ea9950e51aafabfde3df"
+      },
+      "config.json": {
+        "revision": "26291f793822fb6be9555850f06dfe95f2d7e695",
+        "sha256": "eab5093d47807aaf894119506b238b2b1cee70d08456e894fee9a012d88f2e0d"
+      },
+      "preprocessor_config.json": {
+        "revision": "26291f793822fb6be9555850f06dfe95f2d7e695",
+        "sha256": "b10e27fd4542cf89ec7145942b87f3e65408d4e9f9d031a29acdd293c15fb3fc"
+      },
+      "vocab.json": {
+        "revision": "26291f793822fb6be9555850f06dfe95f2d7e695",
+        "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+      }
+    },
+    "derived_fields": {
+      "audio_conv_kernel_and_stride": {
+        "artifact": "src/transformers/models/qwen3_omni_moe/modeling_qwen3_omni_moe.py",
+        "extraction": "AST of Qwen3OmniMoeAudioEncoder.__init__ conv2d1/2/3 assignments",
+        "revision": "7d9754a05193eb79b1d86aa744b622b8068008cd",
+        "sha256": "0b6e9a6e9d88814de3e25b1ca65c49d0677be7331b8118b6a0cd022c6c1dd270"
+      },
+      "output_sample_rate_hz": {
+        "artifact": "README.md",
+        "extraction": "samplerate used to serialize audio returned by model.generate",
+        "locator": "lines 257-277; samplerate=24000 at line 277",
+        "revision": "26291f793822fb6be9555850f06dfe95f2d7e695",
+        "sha256": "0e44065c4c4a27071f7239afd5b5a33af5bc2e437dd7ea9950e51aafabfde3df",
+        "url": "https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/resolve/26291f793822fb6be9555850f06dfe95f2d7e695/README.md"
+      },
+      "regular_vocab_size": {
+        "artifact": "vocab.json",
+        "extraction": "len(top-level token-to-id mapping)",
+        "revision": "26291f793822fb6be9555850f06dfe95f2d7e695",
+        "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+        "url": "https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/resolve/26291f793822fb6be9555850f06dfe95f2d7e695/vocab.json",
+        "validation": "IDs are contiguous from 0 through 151642"
+      }
+    },
+    "model_id": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+    "revision": "26291f793822fb6be9555850f06dfe95f2d7e695",
+    "transformers_version": "5.2.0"
+  },
+  "talker": {
+    "hidden_size": 1024,
+    "moe_intermediate_size": 384,
+    "num_attention_heads": 16,
+    "num_experts": 128,
+    "num_experts_per_tok": 6,
+    "num_hidden_layers": 20,
+    "num_key_value_heads": 2,
+    "shared_expert_intermediate_size": 768
+  },
+  "thinker": {
+    "hidden_size": 2048,
+    "moe_intermediate_size": 768,
+    "num_attention_heads": 32,
+    "num_experts": 128,
+    "num_experts_per_tok": 8,
+    "num_hidden_layers": 48,
+    "num_key_value_heads": 4
+  },
+  "tm_rope": {
+    "interleaved": true,
+    "mrope_section": [
+      24,
+      20,
+      20
+    ],
+    "rope_theta": 1000000
+  },
+  "vision_encoder": {
+    "deepstack_visual_indexes": [
+      8,
+      16,
+      24
+    ],
+    "hidden_size": 1152,
+    "intermediate_size": 4304,
+    "merger_dimensions": [
+      4608,
+      4608,
+      2048
+    ],
+    "num_attention_heads": 16,
+    "num_hidden_layers": 27,
+    "patch_kernel": [
+      2,
+      16,
+      16
+    ],
+    "spatial_merge_size": 2
+  },
+  "vocabulary": {
+    "embedding_vocab_size": 152064,
+    "regular_vocab_size": 151643
+  }
+}
